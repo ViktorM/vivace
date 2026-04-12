@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training outputs
+runs/
+wandb/
+
+# Checkpoints and model artifacts
+*.pt
+*.bin
+*.safetensors
+adapter_sync/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Claude session artifacts
+docs/superpowers/

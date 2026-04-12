@@ -1,0 +1,73 @@
+# GRPO on GSM8K with Qwen2.5-0.5B — FULL fine-tuning (no LoRA).
+#
+# Differs from the LoRA config:
+#   - use_lora: false
+#   - learning_rate: 1.0e-6 (full FT needs much smaller LR than LoRA)
+#   - kl_coef: 0.04 (full FT drifts faster, slightly stronger KL)
+#   - micro_batch_size: 1, grad_accum_steps: 16 (more memory pressure)
+#
+# IMPORTANT: with full FT, the `disable_adapter` reference-model trick
+# does NOT work (there's no adapter to disable). The trainer must keep
+# a separate frozen copy of the model in memory — roughly 2x model VRAM.
+# On a single 4090 with Qwen2.5-0.5B (1B params bf16 = ~2GB) this is
+# fine. For larger models, switch back to LoRA or use FSDP.
+
+model_name: Qwen/Qwen2.5-0.5B
+env_name: gsm8k
+algo_name: grpo
+
+mode: colocated
+trainer_gpus: [0, 1]
+rollout_gpus: [0, 1]
+
+use_lora: false
+
+rollout_batch_size: 32
+group_size: 8
+max_new_tokens: 768              # max response length
+temperature: 0.7
+top_p: 0.95
+top_k: -1
+
+learning_rate: 1.0e-6
+kl_coef: 0.04
+num_steps: 500
+micro_batch_size: 1
+grad_accum_steps: 16
+max_grad_norm: 1.0
+
+# ----- composable PG -----
+loss_type: grpo
+adv_type: grpo
+clip_low: 0.2
+clip_high: 0.2
+clip_ratio: 0.25
+clip_cispo: 5.0
+optim_epochs: 2
+adv_eps: 1.0e-4
+dg_eta: 1.0
+
+# ----- adaptive sampling / LR (off by default) -----
+adaptive_sampling: false
+oversample_factor: 2.0
+min_reward_spread: 0.5
+use_adaptive_lr: false
+kl_target: 0.05
+kl_factor: 1.5
+kl_ema: 0.2
+lr_factor: 1.5
+min_lr: 1.0e-7
+max_lr: 2.0e-5
+
+# ----- SFT warmup (optional) -----
+sft_warmup: false
+sft_warmup_steps: 0
+
+# ----- logging -----
+wandb_project: vivace
+log_interval: 1
+eval_interval: 50
+checkpoint_interval: 100
+run_dir: runs/grpo_gsm8k_0.5b_full
+
+seed: 42
