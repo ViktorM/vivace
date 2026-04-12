@@ -746,19 +746,30 @@ class Trainer:
                         step=self.cfg.num_steps)
             finish_wandb()
 
-        # --- Save stats + show plots (works without wandb) ---
+        # --- Save stats + plots ---
+        from datetime import datetime
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from vivace.utils.stats import plot_stats, plot_perf, plot_health, plot_wallclock
+
         os.makedirs(self.cfg.run_dir, exist_ok=True)
-        stats_path = os.path.join(self.cfg.run_dir, "stats.pt")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_label = f"{self.cfg.loss_type}_{self.cfg.adv_type}_{self.cfg.num_steps}steps"
+        stats_path = os.path.join(self.cfg.run_dir, f"stats_{run_label}_{timestamp}.pt")
         torch.save(self.stats, stats_path)
         print(f"\nStats saved to {stats_path}")
-        print("To view plots later:")
-        print(f"  stats = torch.load('{stats_path}')")
+
+        # Save plots as PNGs (always works, no GUI needed)
+        title = f"{self.stats.method} — {self.cfg.num_steps} steps"
+        for plot_fn, name in [(plot_stats, "stats"), (plot_perf, "perf"), (plot_health, "health"), (plot_wallclock, "wallclock")]:
+            plot_fn(self.stats, title=title)
+            plot_path = os.path.join(self.cfg.run_dir, f"plot_{name}_{run_label}_{timestamp}.png")
+            plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+            plt.close()
+        print(f"Plots saved to {self.cfg.run_dir}/plot_*_{timestamp}.png")
+
+        print("To view stats interactively:")
+        print(f"  stats = torch.load('{stats_path}', weights_only=False)")
         print(f"  from vivace.utils.stats import plot_stats, plot_perf, plot_health")
         print(f"  plot_stats(stats)")
-
-        # Auto-show plots if running interactively (not in a headless job)
-        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-            from vivace.utils.stats import plot_stats, plot_perf, plot_health
-            plot_stats(self.stats, title=f"{self.stats.method} — {self.cfg.num_steps} steps")
-            plot_perf(self.stats)
-            plot_health(self.stats)

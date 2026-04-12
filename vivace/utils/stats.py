@@ -365,3 +365,87 @@ def plot_health(stats: TrainingStats, title: str = "") -> None:
 
     plt.tight_layout()
     plt.show()
+
+
+def _cumulative_time_minutes(stats: TrainingStats) -> list[float]:
+    """Build a cumulative wall-clock axis in minutes from step_time."""
+    if not stats.step_time:
+        return []
+    cum = []
+    total = 0.0
+    for dt in stats.step_time:
+        total += dt
+        cum.append(total / 60.0)
+    return cum
+
+
+def plot_wallclock(stats: TrainingStats, title: str = "") -> None:
+    """Key metrics plotted against wall-clock time (minutes) instead of step.
+
+    Shows reward, loss, KL, and format rate over real time — useful for
+    comparing runs with different step times (e.g. HF sampler vs vLLM).
+    """
+    import matplotlib.pyplot as plt
+
+    time_min = _cumulative_time_minutes(stats)
+    if not time_min:
+        print("No step_time data — cannot plot wall-clock. Run with perf timing enabled.")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    fig.suptitle(f"{title or stats.method} — wall clock", fontsize=13, fontweight="bold")
+
+    plots = [
+        (axes[0, 0], "rewards", "Reward", "tab:green"),
+        (axes[0, 1], "losses", "Loss", "tab:red"),
+        (axes[1, 0], "kl_values", "KL", "tab:blue"),
+        (axes[1, 1], "format_rates", "Format Rate", "tab:purple"),
+    ]
+
+    for ax, attr, label, color in plots:
+        vals = getattr(stats, attr, [])
+        n = min(len(vals), len(time_min))
+        if n > 0:
+            ax.plot(time_min[:n], vals[:n], alpha=0.3, color=color, linewidth=0.8)
+            if n > 5:
+                ax.plot(time_min[:n], smooth(vals[:n]), color=color, linewidth=2)
+        ax.set_title(label)
+        ax.set_xlabel("Time (min)")
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_wallclock_comparison(stats_dict: dict[str, TrainingStats]) -> None:
+    """Overlay multiple runs on wall-clock x-axis — the HF vs vLLM view."""
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    fig.suptitle("Wall Clock Comparison", fontsize=13, fontweight="bold")
+    colors = {name: plt.cm.tab10(i) for i, name in enumerate(stats_dict)}
+
+    panels = [
+        (axes[0, 0], "rewards", "Reward"),
+        (axes[0, 1], "losses", "Loss"),
+        (axes[1, 0], "kl_values", "KL"),
+        (axes[1, 1], "format_rates", "Format Rate"),
+    ]
+
+    for ax, attr, label in panels:
+        for name, st in stats_dict.items():
+            time_min = _cumulative_time_minutes(st)
+            vals = getattr(st, attr, [])
+            n = min(len(vals), len(time_min))
+            if n > 0:
+                ax.plot(time_min[:n], vals[:n], alpha=0.15, color=colors[name])
+                if n > 5:
+                    ax.plot(time_min[:n], smooth(vals[:n]), label=name,
+                            color=colors[name], linewidth=2)
+        ax.set_title(label)
+        ax.set_xlabel("Time (min)")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
