@@ -136,18 +136,6 @@ def init_distributed() -> tuple[int, int, int]:
       env vars are missing. Detect this and return (0, 0, 1) without
       calling init_process_group at all.
 
-    HINTS
-    -----
-    - If "RANK" not in os.environ: return (0, 0, 1)
-    - rank = int(os.environ["RANK"])
-    - local_rank = int(os.environ["LOCAL_RANK"])
-    - world_size = int(os.environ["WORLD_SIZE"])
-    - import torch; import torch.distributed as dist
-    - torch.cuda.set_device(local_rank)
-    - dist.init_process_group(
-          backend="nccl",
-          device_id=torch.device(f"cuda:{local_rank}"),
-      )
     - return rank, local_rank, world_size
 
     REFERENCES
@@ -155,22 +143,27 @@ def init_distributed() -> tuple[int, int, int]:
     - https://pytorch.org/docs/stable/distributed.html
     - PyTorch DDP tutorial: pytorch.org/tutorials/intermediate/ddp_tutorial.html
     """
-    # TODO: implement.
-    pass
+    if "RANK" not in os.environ:
+        return 0, 0, 1
+    
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
+
+    return rank, local_rank, world_size
 
 
 def is_main_process() -> bool:
     """True if this is rank 0 (or single-process). Used to gate logging/eval/saves.
-
-    HINTS
-    -----
-    - import torch.distributed as dist
-    - if not dist.is_available() or not dist.is_initialized(): return True
-    - return dist.get_rank() == 0
     """
     if not dist.is_available() or not dist.is_initialized():
         return True
-    return dist.get_rank() == 0
+    return dist.get_rank() == 0 # Might need to update this for a cluster run
 
 def get_rank() -> int:
     """This process's global rank. 0 if not distributed.
@@ -182,14 +175,11 @@ def get_rank() -> int:
 
 def get_world_size() -> int:
     """Total number of distributed processes. 1 if not distributed.
-
-    HINTS
-    -----
-    - if not dist.is_initialized(): return 1
-    - return dist.get_world_size()
     """
-    # TODO: implement.
-    raise NotImplementedError
+    if not dist.is_initialized():
+        return 1
+    
+    return dist.get_world_size()
 
 
 def barrier() -> None:
@@ -203,14 +193,11 @@ def barrier() -> None:
 
     Cheap but not free — barrier is a NCCL collective. Don't sprinkle them
     inside hot loops.
-
-    HINTS
-    -----
-    - if not dist.is_initialized(): return
-    - dist.barrier()
     """
-    # TODO: implement.
-    raise NotImplementedError
+    if not dist.is_initialized():
+        return
+    
+    dist.barrier()
 
 
 def all_reduce_mean(tensor):
@@ -219,14 +206,6 @@ def all_reduce_mean(tensor):
     Used for logging — when you want the displayed loss to be the average
     across all ranks, not just rank 0's view.
 
-    HINTS
-    -----
-    - import torch.distributed as dist
-    - if not dist.is_initialized(): return tensor
-    - dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    - tensor /= dist.get_world_size()
-    - return tensor
-
     GOTCHAS
     -------
     - all_reduce is IN-PLACE. The argument is mutated. Pass a clone if
@@ -234,8 +213,13 @@ def all_reduce_mean(tensor):
     - Float tensors only. For int tensors you'd use ReduceOp.AVG which
       is supported in newer NCCL.
     """
-    # TODO: implement.
-    raise NotImplementedError
+    if not dist.is_initialized():
+        return tensor
+
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= dist.get_world_size()
+
+    return tensor
 
 
 def make_weight_sync_group(
@@ -263,18 +247,13 @@ def make_weight_sync_group(
     - Returned group is opaque (a ProcessGroup object). Pass it through
       to vllm_worker as-is.
 
-    HINTS
-    -----
-    - if set(trainer_ranks) & set(rollout_ranks):
-          return None  # colocated, no subgroup needed
-    - all_ranks = sorted(set(trainer_ranks) | set(rollout_ranks))
-    - import torch.distributed as dist
-    - return dist.new_group(ranks=all_ranks, backend="nccl")
-
     REFERENCES
     ----------
     - https://pytorch.org/docs/stable/distributed.html#torch.distributed.new_group
     - OpenRLHF / verl / slime weight-sync references in vllm_worker.py
     """
-    # TODO: implement.
-    raise NotImplementedError
+    if set(trainer_ranks) & set(rollout_ranks):
+        return None # colocated, no subgroup needed
+    
+    all_ranks = sorted(set(trainer_ranks) | set(rollout_ranks))
+    return dist.new_group(rank=all_ranks, backend="nccl")

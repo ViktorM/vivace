@@ -224,6 +224,8 @@ def compute_token_logprobs(
 
     return token_log_prob, mask, entropy
 
+    return token_log_prob, mask, entropy
+
 
 # =============================================================================
 # 3. KL DIVERGENCE — Schulman k3 (default) or k1 naive estimator

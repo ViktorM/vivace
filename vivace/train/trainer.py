@@ -45,6 +45,7 @@ from vivace.algos.policy_gradient import (
 from vivace.envs.base import Env, Example
 from vivace.envs.gsm8k import GSM8KEnv
 from vivace.rollout.hf_sampler import sample_responses
+from vivace.rollout.vllm_worker import VLLMRolloutWorker
 from vivace.rewards import extract_answer
 from vivace.eval.runner import evaluate_model, compare_metrics
 from vivace.utils.stats import TrainingStats
@@ -66,7 +67,7 @@ DTYPE_MAP = {
     "fp32": torch.float32,
     "float8_e4m3fn": torch.float8_e4m3fn,      # FP8 (Hopper/Ada) — forward pass only for now
     "fp8": torch.float8_e4m3fn,
-    "float8_e5m2": torch.float8_e5m2,           # FP8 alternate format (wider range, less precision)
+    "float8_e5m2": torch.float8_e5m2,          # FP8 alternate format (wider range, less precision)
 }
 
 
@@ -94,7 +95,6 @@ class TrainerConfig:
     lora_target_modules: tuple = ("q_proj", "k_proj", "v_proj", "o_proj")
 
     # ----- rollout -----
-    rollout_batch_size: int = 64
     group_size: int = 8
     max_new_tokens: int = 1024      # max response length (HF generate / vLLM max_tokens)
     temperature: float = 0.7
@@ -108,6 +108,9 @@ class TrainerConfig:
     micro_batch_size: int = 4
     grad_accum_steps: int = 4
     max_grad_norm: float = 1.0
+    use_vllm: bool = True
+    gpu_memory_utilization: float = 0.4  # only used when use_vllm = True
+    enforce_eager: bool = False          # disable CUDA graphs in vLLM (safer for weight updates, slower)
 
     # ----- composable PG (mirrors RLConfig) -----
     loss_type: str = "grpo"
@@ -203,7 +206,7 @@ def _print_training_info(
         print(f"  Layer types:     {model.config.layer_types}")
     print(f"  Env:             {cfg.env_name}")
     print(f"  Algo:            {cfg.loss_type} / {cfg.adv_type}")
-    print(f"  Batch:           {cfg.rollout_batch_size} prompts x {cfg.group_size} group x {cfg.grad_accum_steps} accum")
+    print(f"  Batch:           {cfg.micro_batch_size} prompts x {cfg.group_size} group x {cfg.grad_accum_steps} accum")
     print(f"  LR:              {cfg.learning_rate}")
     print(f"  KL coef:         {cfg.kl_coef}")
     print(f"  Steps:           {cfg.num_steps}")
@@ -358,6 +361,18 @@ class Trainer:
         else:
             self.compiled_ref = None  # LoRA: use compiled_model with disable_adapter()
 
+        if cfg.use_vllm:
+            self.rollout_worker = VLLMRolloutWorker(
+                model_name=cfg.model_name,
+                gpu_ids=cfg.rollout_gpus,
+                gpu_memory_utilization=cfg.gpu_memory_utilization,
+                enable_lora=cfg.use_lora,
+                colocated=(cfg.mode == "colocated"),
+                enforce_eager=cfg.enforce_eager,
+            )
+        else:
+            self.rollout_worker = None  # HF sampler path
+
         # --- RLConfig (built from TrainerConfig fields) ---
         self.rl_cfg = RLConfig(
             loss_type=cfg.loss_type,
@@ -486,20 +501,72 @@ class Trainer:
             #idxs = np.random.choice(len(self.train_data), size=n_prompts, replace=False)
             #batch_ex = [self.train_data[i] for i in idxs]
 
-            # Flatten: each prompt repeated G times, each answer repeated G times
-            # TODO: investigate vectorizing format_prompt — would need Env.format_prompt_batch(examples)
-            # or a batched string template. Current per-example call is ~microseconds so low priority,
-            # but at large batch sizes (256+ prompts) the Python loop may show up in profiles.
-            prompts = [self.env.format_prompt(ex) for ex in batch_ex for _ in range(G)]
-            examples = [ex for ex in batch_ex for _ in range(G)]
-            # TODO: vectorized repeat via np.repeat instead of nested comprehension
-            # prompts = np.repeat([self.env.format_prompt(ex) for ex in batch_ex], G).tolist()
+            if self.rollout_worker is not None:
+                # --- vLLM path ---
+                # 1. Build unique_prompts (B, no G-repeat — vLLM handles n=G internally)
+                unique_prompts = [self.env.format_prompt(ex) for ex in batch_ex]
 
-            full_ids, responses, plen = sample_responses(self.model, self.tokenizer, prompts, 
-                                                        max_new_tokens=self.cfg.max_new_tokens,
-                                                        temperature=self.cfg.temperature, top_p=self.cfg.top_p,
-                                                        device=str(self.device))
-            torch.cuda.empty_cache()
+                # 2. Tokenize with HF tokenizer for consistent token IDs
+                prompt_enc = self.tokenizer(unique_prompts, return_tensors="pt", padding=True)
+                prompt_ids_batch = prompt_enc.input_ids.tolist()
+                plen = prompt_enc.input_ids.shape[1]
+
+                # 3. Generate via the worker (handles lora_request, tqdm, etc.)
+                vllm_outputs, _ = self.rollout_worker.generate(
+                    prompt_token_ids=prompt_ids_batch,
+                    temperature=self.cfg.temperature, top_p=self.cfg.top_p,
+                    max_tokens=self.cfg.max_new_tokens, n=G,
+                )
+
+                # 4. Build full_ids + responses from vLLM output.
+                # Pad all responses to the same length so plen works as a
+                # single int (same structure as HF generate output).
+                pad_id = self.tokenizer.pad_token_id
+                all_resp_ids = []
+                responses = []
+                for req_output in vllm_outputs:
+                    for completion in req_output.outputs:
+                        all_resp_ids.append(list(completion.token_ids))
+                        responses.append(completion.text)
+
+                max_resp_len = max(len(r) for r in all_resp_ids)
+                # Right-pad responses to uniform length (prompt is already uniform)
+                all_resp_ids = [r + [pad_id] * (max_resp_len - len(r)) for r in all_resp_ids]
+
+                # 5. Build full_ids: [left_pad_prompt | prompt | response | right_pad_response]
+                # prompt_ids_batch has shape [B, plen] — repeat each G times
+                all_ids = []
+                for b_idx, req_output in enumerate(vllm_outputs):
+                    p_ids = prompt_ids_batch[b_idx]  # already left-padded to plen
+                    for g_idx in range(len(req_output.outputs)):
+                        flat_idx = b_idx * len(req_output.outputs) + g_idx
+                        all_ids.append(p_ids + all_resp_ids[flat_idx])
+
+                full_ids = torch.tensor(all_ids, device=self.device)
+                # plen is correct: all prompts padded to same length, all responses
+                # padded to same length, total = plen + max_resp_len for every sequence.
+
+                # 6. Build examples (same as HF path)
+                examples = [ex for ex in batch_ex for _ in range(G)]
+
+            else:
+                # --- HF path ---
+
+                # Flatten: each prompt repeated G times, each answer repeated G times
+                # TODO: investigate vectorizing format_prompt — would need Env.format_prompt_batch(examples)
+                # or a batched string template. Current per-example call is ~microseconds so low priority,
+                # but at large batch sizes (256+ prompts) the Python loop may show up in profiles.
+                prompts = [self.env.format_prompt(ex) for ex in batch_ex for _ in range(G)]
+                examples = [ex for ex in batch_ex for _ in range(G)]
+                # TODO: vectorized repeat via np.repeat instead of nested comprehension
+                # prompts = np.repeat([self.env.format_prompt(ex) for ex in batch_ex], G).tolist()
+
+                full_ids, responses, plen = sample_responses(self.model, self.tokenizer, prompts, 
+                                                            max_new_tokens=self.cfg.max_new_tokens,
+                                                            temperature=self.cfg.temperature, top_p=self.cfg.top_p,
+                                                            device=str(self.device))
+                torch.cuda.empty_cache()
+
 
             if self.cfg.adaptive_sampling:
                 # TODO: to implement
@@ -578,18 +645,28 @@ class Trainer:
         model IS the sampler's model — they share weights by reference).
         Skip the whole thing in that mode.
         """
-        # HF sampler shares model by reference — weights already in sync.
-        if not hasattr(self, 'rollout_worker') or self.rollout_worker is None:
+        # No rollout worker (HF sampler) — model shared by reference, nothing to sync.
+        if self.rollout_worker is None:
             return
 
+        # Colocated mode: vLLM loaded the same model on the same GPU.
+        # For LoRA, the optimizer updates the adapter weights in-place —
+        # vLLM sees the same tensors. No sync needed.
+        # For full FT in colocated: same — weights are shared by reference.
+        if self.cfg.mode == "colocated":
+            return
+
+        # Disaggregated mode: vLLM is on a different GPU, separate model copy.
+        # Need to push updated weights.
         adapter_path = os.path.join(self.cfg.run_dir, "adapter_sync")
         if self.cfg.use_lora:
+            os.makedirs(adapter_path, exist_ok=True)
             if is_main_process():
                 self.model.save_pretrained(adapter_path)
             barrier()
             self.rollout_worker.update_lora(adapter_path)
         else:
-            # full FT: in-place NCCL broadcast (much later)
+            # full FT: in-place NCCL broadcast (TODO)
             raise NotImplementedError("full FT weight sync not yet implemented")
 
     def train(self) -> None:
@@ -621,6 +698,11 @@ class Trainer:
         if is_main_process():
             log_metrics({"eval/" + k: v for k, v in baseline_metrics.items()}, step=0)
 
+        # --- Initial weight sync ---
+        # vLLM starts with the base model only. Sync the initial LoRA adapter
+        # so vLLM and the trainer use the same policy from step 0.
+        self.sync_weights()
+
         # --- Training loop ---
         self.kl_ema = self.cfg.kl_target
         for step in range(self.cfg.num_steps):
@@ -628,7 +710,13 @@ class Trainer:
 
             with Timer() as step_t:
                 with Timer() as rollout_t:
+                    # In colocated mode: wake vLLM before rollout, sleep after.
+                    # Skip wake_up on step 0 — vLLM starts awake after construction.
+                    if self.rollout_worker and self.rollout_worker.colocated and step > 0:
+                        self.rollout_worker.wake_up()
                     micro_batches = self.rollout_phase()
+                    if self.rollout_worker and self.rollout_worker.colocated:
+                        self.rollout_worker.sleep()
                 with Timer() as train_t:
                     metrics = self.train_phase(micro_batches)
                 self.sync_weights()
@@ -724,7 +812,7 @@ class Trainer:
                         self.model, self.tokenizer, eval_data, self.env, n=200,
                         device=str(self.device),
                     )
-                    print(f"  [eval] Step {step:04d} | accuracy={eval_metrics['accuracy_pct']:.1f}%")
+                    print(f"  [eval] Step {step:04d} | accuracy={eval_metrics['accuracy_pct']:.1f}%  format={eval_metrics['format_rate_pct']:.1f}%  reward={eval_metrics['avg_reward']:.3f}")
                     log_metrics({"eval/" + k: v for k, v in eval_metrics.items()}, step)
 
                 # --- Periodic checkpoint (stub — save_checkpoint not implemented yet) ---
@@ -773,3 +861,11 @@ class Trainer:
         print(f"  stats = torch.load('{stats_path}', weights_only=False)")
         print(f"  from vivace.utils.stats import plot_stats, plot_perf, plot_health")
         print(f"  plot_stats(stats)")
+
+        # --- Cleanup ---
+        if self.rollout_worker is not None:
+            del self.rollout_worker.llm  # shut down vLLM engine + subprocess
+            self.rollout_worker = None
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()

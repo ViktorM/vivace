@@ -62,12 +62,13 @@ class VLLMRolloutWorker:
     def __init__(
         self,
         model_name: str,
-        tensor_parallel_size: int = 1,
+        gpu_ids: list[int] | None = None,
         gpu_memory_utilization: float = 0.4,
         dtype: str = "bfloat16",
         enable_lora: bool = False,
         max_lora_rank: int = 64,
         colocated: bool = True,
+        enforce_eager: bool = False,
     ):
         """Build the vllm.LLM.
 
@@ -103,16 +104,6 @@ class VLLMRolloutWorker:
           at init (vLLM pre-allocates LoRA buffers). Set max_lora_rank to
           the largest rank you'll use across all training runs.
 
-        HINTS
-        -----
-        - from vllm import LLM, SamplingParams
-        - self.llm = LLM(model=model_name, tensor_parallel_size=...,
-                         gpu_memory_utilization=..., dtype=dtype,
-                         enable_lora=enable_lora, max_lora_rank=max_lora_rank,
-                         enforce_eager=True)  # remove enforce_eager once stable
-        - self.colocated = colocated
-        - self._lora_counter = 0   # used by update_lora to bump lora_int_id
-
         REFERENCES
         ----------
         - vLLM docs: https://docs.vllm.ai/en/latest/
@@ -120,41 +111,83 @@ class VLLMRolloutWorker:
         - verl: verl/workers/rollout/vllm_rollout/
         - slime (ByteDance): slime/backends/vllm/  - very clean reference
         """
-        # TODO: implement.
-        raise NotImplementedError
+        # Pin vLLM to the specified GPU(s). vLLM spawns a subprocess
+        # (EngineCore) that inherits CUDA_VISIBLE_DEVICES — this is the
+        # ONLY way to control which GPU the subprocess uses.
+        # torch.cuda.set_device() does NOT propagate to child processes.
+        #
+        # We set CUDA_VISIBLE_DEVICES before LLM construction and restore
+        # it after, so the trainer process can still see all GPUs.
+        import os
+        gpu_ids = gpu_ids or [0]
+        tp_size = len(gpu_ids)
 
-    def generate(self, prompts: list[str], sampling: SamplingConfig) -> list[list[str]]:
-        """Generate `sampling.n` completions per prompt. Returns [B][G] list of strings.
+        old_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
 
-        THEORY
-        ------
-        vLLM's SamplingParams supports `n=group_size` natively — it does
-        sibling sampling efficiently inside the engine (shared prefix KV
-        cache, batched continuation). DON'T sample sequentially in a Python
-        loop; that throws away vLLM's main perf advantage.
+        self.llm = LLM(model=model_name, tensor_parallel_size=tp_size,
+                       gpu_memory_utilization=gpu_memory_utilization, dtype=dtype,
+                       enable_lora=enable_lora, max_lora_rank=max_lora_rank,
+                       enforce_eager=enforce_eager,
+                       disable_log_stats=True)
 
-        GOTCHAS
-        -------
-        - The `RequestOutput` returned by `llm.generate` has shape
-          [num_prompts] outer, each with [n] sibling completions inside
-          `output.outputs`. Flatten to [B][G] list of strings.
-        - Stop tokens vs `max_tokens`: setting both is fine — whichever
-          fires first wins. For reasoning tasks, set `stop=["</answer>"]`
-          to terminate as soon as the answer block closes.
-        - Keep `prompt_token_ids` from the output if you need them later
-          for log-prob recomputation alignment (left-padding gotcha
-          carries over).
+        # Restore so the trainer can still access all GPUs
+        if old_visible is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = old_visible
+        else:
+            del os.environ["CUDA_VISIBLE_DEVICES"]
 
-        HINTS
-        -----
-        - sp = SamplingParams(temperature=sampling.temperature, top_p=sampling.top_p,
-                              top_k=sampling.top_k, max_tokens=sampling.max_tokens,
-                              n=sampling.n, seed=sampling.seed)
-        - outputs = self.llm.generate(prompts, sp)
-        - return [[o.text for o in req.outputs] for req in outputs]
+        self.colocated = colocated
+        self.gpu_ids = gpu_ids
+        self._lora_counter = 0
+        self._current_lora = None
+
+    def generate(
+        self,
+        prompts: list[str] | None = None,
+        prompt_token_ids: list[list[int]] | None = None,
+        sampling: SamplingConfig | None = None,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        top_k: int = -1,
+        max_tokens: int = 1024,
+        n: int = 8,
+    ) -> tuple[list, list[list[str]]]:
+        """Generate n completions per prompt. Returns (raw_outputs, response_texts).
+
+        Args:
+            prompts: text prompts (mutually exclusive with prompt_token_ids)
+            prompt_token_ids: pre-tokenized prompts as list[list[int]]
+                              (avoids re-tokenization boundary issues)
+            sampling: SamplingConfig (if provided, overrides individual params)
+            temperature, top_p, top_k, max_tokens, n: individual params
+                              (used when sampling is None)
+
+        Returns:
+            raw_outputs: list of vLLM RequestOutput objects (for extracting
+                         prompt_token_ids and completion token_ids)
+            response_texts: nested list [B][G] of response strings
         """
-        # TODO: implement.
-        raise NotImplementedError
+        if sampling is not None:
+            sp = SamplingParams(
+                temperature=sampling.temperature, top_p=sampling.top_p,
+                top_k=sampling.top_k, max_tokens=sampling.max_tokens,
+                n=sampling.n, seed=sampling.seed,
+            )
+        else:
+            sp = SamplingParams(
+                temperature=temperature, top_p=top_p,
+                top_k=top_k, max_tokens=max_tokens, n=n,
+            )
+
+        input_arg = prompt_token_ids if prompt_token_ids is not None else prompts
+        outputs = self.llm.generate(
+            input_arg, sp,
+            lora_request=self._current_lora,
+            use_tqdm=False,
+        )
+        texts = [[o.text for o in req.outputs] for req in outputs]
+        return outputs, texts
 
     def update_weights(self, named_tensors) -> None:
         """In-place parameter update over a NCCL subgroup.
@@ -244,20 +277,23 @@ class VLLMRolloutWorker:
 
         HINTS
         -----
-        - from vllm.lora.request import LoRARequest
         - self._lora_counter += 1
         - self._current_lora = LoRARequest(
               lora_name=f"adapter-{self._lora_counter}",
               lora_int_id=self._lora_counter,
-              lora_local_path=adapter_path,
+              lora_path=adapter_path,
           )
         - In generate(), pass lora_request=self._current_lora when set.
 
         IMPLEMENT THIS BEFORE update_weights — it gives you a working
         LoRA training loop with ~10 lines of code.
         """
-        # TODO: implement.
-        raise NotImplementedError
+        self._lora_counter += 1
+        self._current_lora = LoRARequest(
+            lora_name=f"adapter-{self._lora_counter}",
+            lora_int_id=self._lora_counter,
+            lora_path=adapter_path,
+        )
 
     def sleep(self) -> None:
         """Release KV cache for colocated mode.
@@ -280,10 +316,9 @@ class VLLMRolloutWorker:
         - Always follow with torch.cuda.empty_cache() to actually return
           memory to the allocator pool.
         """
-        # TODO: implement.
-        raise NotImplementedError
+        self.llm.sleep()
+        torch.cuda.empty_cache()
 
     def wake_up(self) -> None:
         """Rebuild KV cache for colocated mode. Inverse of sleep()."""
-        # TODO: implement.
-        raise NotImplementedError
+        self.llm.wake_up()

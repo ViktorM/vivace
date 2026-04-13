@@ -34,8 +34,19 @@ def build_sft_data(examples: list, n: int, tokenizer, make_prompt) -> list[dict]
                f"<answer>\\n{ex.answer}\\n</answer>\\n{tokenizer.eos_token}"
     - return [{"prompt": ..., "target": ...}, ...] truncated to n
     """
-    # TODO: implement.
-    raise NotImplementedError
+    data = []
+    for ex in examples[:n]:
+        prompt = make_prompt(ex.problem)
+        # Build the ideal response in the same <think>/<answer> format
+        # the RL reward functions expect.
+        reasoning = ex.metadata.get("reasoning", "") if ex.metadata else ""
+        target = (
+            f"<think>\n{reasoning}\n</think>\n"
+            f"<answer>\n{ex.answer}\n</answer>\n"
+            f"{tokenizer.eos_token}"
+        )
+        data.append({"prompt": prompt, "target": target})
+    return data
 
 
 def encode_sft_batch(batch: list[dict], tokenizer, device) -> dict[str, torch.Tensor]:

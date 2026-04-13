@@ -116,8 +116,12 @@ Larger setup (2+4+2):
 ```
 GPUs 0-1: [ vllm tp=2 rollout worker  ] --generations-->
 GPUs 2-5: [ FSDP trainer dp=4         ] <--weight sync--
-GPUs 6-7: [ eval workers (optional)   ]
+GPUs 6-7: [ eval workers (optional)   ] --accuracy, pass@k-->
 ```
+
+The optional eval workers run continuous evaluation (greedy pass@1 and
+sampled pass@k / maj@k) on the latest checkpoint without blocking the
+training loop. They use their own vLLM instance for fast inference.
 
 ## Adding a new loss variant
 
