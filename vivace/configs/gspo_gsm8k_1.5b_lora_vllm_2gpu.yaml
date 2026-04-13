@@ -61,6 +61,11 @@ max_lr: 2.0e-5
 sft_warmup: false
 sft_warmup_steps: 0
 
+# ----- eval -----
+eval_n: 500                      # -1 for full eval set
+eval_batch_size: 32
+eval_use_vllm: true              # use vLLM rollout worker for fast eval
+
 # ----- logging -----
 wandb_project: vivace
 log_interval: 1

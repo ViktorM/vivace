@@ -47,7 +47,7 @@ from vivace.envs.gsm8k import GSM8KEnv
 from vivace.rollout.hf_sampler import sample_responses
 from vivace.rollout.vllm_worker import VLLMRolloutWorker
 from vivace.rewards import extract_answer
-from vivace.eval.runner import evaluate_model, compare_metrics
+from vivace.eval.runner import evaluate_model, compare_metrics, sample_evaluate
 from vivace.utils.stats import TrainingStats
 from vivace.utils.logging import ConsoleLogger, init_wandb, log_metrics, finish_wandb
 from vivace.utils.perf import Timer, throughput
@@ -138,6 +138,12 @@ class TrainerConfig:
     # ----- SFT warmup (optional) -----
     sft_warmup: bool = False
     sft_warmup_steps: int = 0
+
+    # ----- eval -----
+    eval_n: int = 500               # number of eval examples (-1 = full eval set)
+    eval_batch_size: int = 32        # batch size for eval generation
+    eval_use_vllm: bool = True       # use vLLM for eval when available (much faster)
+    eval_gpus: list[int] = field(default_factory=list)  # separate eval GPUs (empty = use rollout worker)
 
     # ----- logging -----
     wandb_project: str = "vivace"
@@ -425,7 +431,36 @@ class Trainer:
         self.console = ConsoleLogger(label=label)
         init_wandb(cfg, project=cfg.wandb_project, run_name=cfg.wandb_run_name)
 
+        # --- Eval worker ---
+        # For now, reuse the rollout worker for eval when available.
+        # Future: dedicated eval workers on separate GPUs (cfg.eval_gpus).
+        self.eval_worker = None
+        if cfg.eval_use_vllm and self.rollout_worker is not None:
+            self.eval_worker = self.rollout_worker
+        elif cfg.eval_gpus:
+            # TODO: build a dedicated VLLMRolloutWorker on eval_gpus
+            # self.eval_worker = VLLMRolloutWorker(
+            #     model_name=cfg.model_name,
+            #     gpu_ids=cfg.eval_gpus,
+            #     gpu_memory_utilization=cfg.gpu_memory_utilization,
+            #     enable_lora=cfg.use_lora,
+            #     colocated=False,
+            # )
+            pass
+
         _print_training_info(cfg, self.model, self.trainer_devices, self.rollout_devices)
+
+    def _run_eval(self, eval_data: list, label: str = "") -> tuple[dict, list, list]:
+        """Run evaluation using the best available backend."""
+        n = len(eval_data) if self.cfg.eval_n == -1 else self.cfg.eval_n
+        return evaluate_model(
+            self.model, self.tokenizer, eval_data, self.env,
+            n=n,
+            batch_size=self.cfg.eval_batch_size,
+            max_new_tokens=self.cfg.max_new_tokens,
+            device=str(self.device),
+            vllm_worker=self.eval_worker,
+        )
 
     def maybe_sft_warmup(self) -> None:
         """If cfg.sft_warmup, run cfg.sft_warmup_steps of SFT before RL.
@@ -690,11 +725,9 @@ class Trainer:
         # --- Baseline eval ---
         eval_data = self.env.load_split("eval")
         print("Evaluating baseline...")
-        baseline_metrics, baseline_correct, baseline_incorrect = evaluate_model(
-            self.model, self.tokenizer, eval_data, self.env, n=200,
-            device=str(self.device),
-        )
-        print(f"Baseline accuracy: {baseline_metrics['accuracy_pct']:.1f}%  format: {baseline_metrics['format_rate_pct']:.1f}%")
+        baseline_metrics, baseline_correct, baseline_incorrect = self._run_eval(eval_data)
+        backend = baseline_metrics.get("eval_backend", "hf")
+        print(f"Baseline accuracy: {baseline_metrics['accuracy_pct']:.1f}%  format: {baseline_metrics['format_rate_pct']:.1f}%  ({backend}, {baseline_metrics.get('eval_time_s', 0):.1f}s)")
         if is_main_process():
             log_metrics({"eval/" + k: v for k, v in baseline_metrics.items()}, step=0)
 
@@ -808,11 +841,8 @@ class Trainer:
 
                 # --- Periodic eval ---
                 if step > 0 and step % self.cfg.eval_interval == 0:
-                    eval_metrics, _, _ = evaluate_model(
-                        self.model, self.tokenizer, eval_data, self.env, n=200,
-                        device=str(self.device),
-                    )
-                    print(f"  [eval] Step {step:04d} | accuracy={eval_metrics['accuracy_pct']:.1f}%  format={eval_metrics['format_rate_pct']:.1f}%  reward={eval_metrics['avg_reward']:.3f}")
+                    eval_metrics, _, _ = self._run_eval(eval_data)
+                    print(f"  [eval] Step {step:04d} | accuracy={eval_metrics['accuracy_pct']:.1f}%  format={eval_metrics['format_rate_pct']:.1f}%  reward={eval_metrics['avg_reward']:.3f}  ({eval_metrics.get('eval_time_s', 0):.1f}s)")
                     log_metrics({"eval/" + k: v for k, v in eval_metrics.items()}, step)
 
                 # --- Periodic checkpoint (stub — save_checkpoint not implemented yet) ---
@@ -822,11 +852,8 @@ class Trainer:
 
         # --- Final eval ---
         print("\nFinal evaluation...")
-        final_metrics, final_correct, final_incorrect = evaluate_model(
-            self.model, self.tokenizer, eval_data, self.env, n=200,
-            device=str(self.device),
-        )
-        print(f"Final accuracy: {final_metrics['accuracy_pct']:.1f}%  format: {final_metrics['format_rate_pct']:.1f}%")
+        final_metrics, final_correct, final_incorrect = self._run_eval(eval_data)
+        print(f"Final accuracy: {final_metrics['accuracy_pct']:.1f}%  format: {final_metrics['format_rate_pct']:.1f}%  ({final_metrics.get('eval_time_s', 0):.1f}s)")
         compare_metrics(baseline_metrics, final_metrics, label="RL training")
 
         if is_main_process():
