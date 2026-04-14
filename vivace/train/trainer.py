@@ -424,9 +424,14 @@ class Trainer:
             self.optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
 
         # --- Stats + logging ---
+        # Label includes key config differences for comparison plots
         label = f"{cfg.loss_type}/{cfg.adv_type}"
         if cfg.use_lora:
             label += f" LoRA r={cfg.lora_rank}"
+        if cfg.adaptive_sampling:
+            label += f" adapt={cfg.oversample_factor}x"
+        label += f" kl={cfg.kl_coef}"
+        label += f" ep={cfg.optim_epochs}"
         self.stats = TrainingStats(method=label)
         self.console = ConsoleLogger(label=label)
         init_wandb(cfg, project=cfg.wandb_project, run_name=cfg.wandb_run_name)
@@ -531,10 +536,8 @@ class Trainer:
         for i in range(self.cfg.grad_accum_steps):
             n_prompts = int(self.cfg.oversample_factor * B) if self.cfg.adaptive_sampling else B
 
-            batch_ex = [random.choice(self.train_data) for _ in range(n_prompts)]
-            # TODO: numpy batched way
-            #idxs = np.random.choice(len(self.train_data), size=n_prompts, replace=False)
-            #batch_ex = [self.train_data[i] for i in idxs]
+            idxs = np.random.choice(len(self.train_data), size=n_prompts, replace=False)
+            batch_ex = [self.train_data[i] for i in idxs]
 
             if self.rollout_worker is not None:
                 # --- vLLM path ---
@@ -591,10 +594,10 @@ class Trainer:
                 # TODO: investigate vectorizing format_prompt — would need Env.format_prompt_batch(examples)
                 # or a batched string template. Current per-example call is ~microseconds so low priority,
                 # but at large batch sizes (256+ prompts) the Python loop may show up in profiles.
-                prompts = [self.env.format_prompt(ex) for ex in batch_ex for _ in range(G)]
+
+                # prompts = [self.env.format_prompt(ex) for ex in batch_ex for _ in range(G)]
+                prompts = np.repeat([self.env.format_prompt(ex) for ex in batch_ex], G).tolist()
                 examples = [ex for ex in batch_ex for _ in range(G)]
-                # TODO: vectorized repeat via np.repeat instead of nested comprehension
-                # prompts = np.repeat([self.env.format_prompt(ex) for ex in batch_ex], G).tolist()
 
                 full_ids, responses, plen = sample_responses(self.model, self.tokenizer, prompts, 
                                                             max_new_tokens=self.cfg.max_new_tokens,
@@ -603,16 +606,28 @@ class Trainer:
                 torch.cuda.empty_cache()
 
 
-            if self.cfg.adaptive_sampling:
-                # TODO: to implement
-                pass
-            
+            # Compute rewards for ALL responses (needed for adaptive sampling spread)
             # reward_fn takes (response, Example) — full example available for
             # problem-aware rewards (e.g. bonus for using numbers from the problem)
             rewards = torch.tensor(
                 [self.env.reward_fn(resp, ex) for resp, ex in zip(responses, examples)],
                 device=self.device, dtype=torch.float32,
             )
+
+            if self.cfg.adaptive_sampling:
+                rg = rewards.view(n_prompts, G)
+                spread = rg.max(dim=1).values - rg.min(dim=1).values
+                top_idx = spread.argsort(descending=True)[:B]
+
+                alive_count = (spread > self.cfg.min_reward_spread).sum().item()
+                alive_rates_step.append(alive_count / n_prompts)
+                spread_step.append((spread.mean().item(), spread.max().item()))
+
+                keep = [j for idx in top_idx for j in range(idx * G, (idx + 1) * G)]
+                full_ids = full_ids[keep]
+                rewards = rewards[keep]
+                responses = [responses[k] for k in keep]
+
             adv = compute_advantages(rewards.view(B, G), self.rl_cfg)
 
             with torch.no_grad():
@@ -645,6 +660,11 @@ class Trainer:
                 "responses": responses, "rewards": rewards,
                 "pad_token_id": self.tokenizer.pad_token_id,
             })
+        # Store adaptive sampling stats for logging
+        self._last_alive_rate = float(np.mean(alive_rates_step)) if alive_rates_step else 0.0
+        self._last_spread_mean = float(np.mean([s[0] for s in spread_step])) if spread_step else 0.0
+        self._last_spread_max = float(max(s[1] for s in spread_step)) if spread_step else 0.0
+
         return micro_batches
 
     def train_phase(self, micro_batches: list[dict]) -> dict:
@@ -730,6 +750,10 @@ class Trainer:
         print(f"Baseline accuracy: {baseline_metrics['accuracy_pct']:.1f}%  format: {baseline_metrics['format_rate_pct']:.1f}%  ({backend}, {baseline_metrics.get('eval_time_s', 0):.1f}s)")
         if is_main_process():
             log_metrics({"eval/" + k: v for k, v in baseline_metrics.items()}, step=0)
+        self.stats.eval_steps.append(0)
+        self.stats.eval_accuracy.append(baseline_metrics["accuracy_pct"])
+        self.stats.eval_format_rate.append(baseline_metrics["format_rate_pct"])
+        self.stats.eval_reward.append(baseline_metrics["avg_reward"])
 
         # --- Initial weight sync ---
         # vLLM starts with the base model only. Sync the initial LoRA adapter
@@ -781,6 +805,8 @@ class Trainer:
                 length_max=metrics["length_max"],
                 length_min=metrics["length_min"],
                 advantage_std=metrics["advantage_std"],
+                # Adaptive sampling (0 if disabled)
+                alive_rates=self._last_alive_rate,
                 # Performance
                 rollout_time=rollout_t.dt,
                 train_time=train_t.dt,
@@ -805,6 +831,8 @@ class Trainer:
             if is_main_process():
                 if step % self.cfg.log_interval == 0:
                     self.console.log(step, perf=perf_info, **metrics)
+                    if self.cfg.adaptive_sampling:
+                        print(f"    alive={self._last_alive_rate:.1%} spread_mean={self._last_spread_mean:.3f} spread_max={self._last_spread_max:.3f}")
                     # Core metrics (flat — wandb top level)
                     log_metrics({
                         "loss": metrics["loss"],
@@ -829,6 +857,13 @@ class Trainer:
                         "reward_dist/min": metrics["reward_min"],
                         "reward_dist/advantage_std": metrics["advantage_std"],
                     }, step)
+                    # Adaptive sampling (logged even when disabled — 0 values)
+                    if self.cfg.adaptive_sampling:
+                        log_metrics({
+                            "sampling/alive_rate": self._last_alive_rate,
+                            "sampling/spread_mean": self._last_spread_mean,
+                            "sampling/spread_max": self._last_spread_max,
+                        }, step)
                     # Performance
                     log_metrics({
                         "perf/rollout_time": rollout_t.dt,
@@ -844,6 +879,11 @@ class Trainer:
                     eval_metrics, _, _ = self._run_eval(eval_data)
                     print(f"  [eval] Step {step:04d} | accuracy={eval_metrics['accuracy_pct']:.1f}%  format={eval_metrics['format_rate_pct']:.1f}%  reward={eval_metrics['avg_reward']:.3f}  ({eval_metrics.get('eval_time_s', 0):.1f}s)")
                     log_metrics({"eval/" + k: v for k, v in eval_metrics.items()}, step)
+                    # Store in stats for offline analysis
+                    self.stats.eval_steps.append(step)
+                    self.stats.eval_accuracy.append(eval_metrics["accuracy_pct"])
+                    self.stats.eval_format_rate.append(eval_metrics["format_rate_pct"])
+                    self.stats.eval_reward.append(eval_metrics["avg_reward"])
 
                 # --- Periodic checkpoint (stub — save_checkpoint not implemented yet) ---
                 # if step > 0 and step % self.cfg.checkpoint_interval == 0:
@@ -855,6 +895,11 @@ class Trainer:
         final_metrics, final_correct, final_incorrect = self._run_eval(eval_data)
         print(f"Final accuracy: {final_metrics['accuracy_pct']:.1f}%  format: {final_metrics['format_rate_pct']:.1f}%  ({final_metrics.get('eval_time_s', 0):.1f}s)")
         compare_metrics(baseline_metrics, final_metrics, label="RL training")
+
+        self.stats.eval_steps.append(self.cfg.num_steps)
+        self.stats.eval_accuracy.append(final_metrics["accuracy_pct"])
+        self.stats.eval_format_rate.append(final_metrics["format_rate_pct"])
+        self.stats.eval_reward.append(final_metrics["avg_reward"])
 
         if is_main_process():
             log_metrics({"eval/" + k: v for k, v in final_metrics.items()},

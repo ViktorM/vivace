@@ -25,6 +25,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="show only one plot type")
     p.add_argument("--compare", action="store_true",
                    help="overlay multiple runs on the same plots")
+    p.add_argument("--min-steps", type=int, default=0,
+                   help="skip runs with fewer steps (filters out short test runs)")
     p.add_argument("--dpi", type=int, default=150)
     return p.parse_args(argv)
 
@@ -44,17 +46,26 @@ def main(argv: list[str] | None = None) -> None:
     stats_list = []
     for path in args.stats:
         s = torch.load(path, weights_only=False)
+        if len(s.steps) < args.min_steps:
+            print(f"Skipped: {path}  ({len(s.steps)} steps < --min-steps {args.min_steps})")
+            continue
         stats_list.append((path, s))
         print(f"Loaded: {path}  ({s.method}, {len(s.steps)} steps)")
+
+    if not stats_list:
+        print("No stats files to plot.")
+        return
 
     if args.compare and len(stats_list) > 1:
         # Comparison mode: overlay multiple runs
         stats_dict = {}
         for path, s in stats_list:
-            label = s.method or os.path.basename(os.path.dirname(path))
-            # Deduplicate labels
+            # Label: algo method + step count (concise for legends)
+            label = f"{s.method} {len(s.steps)}st"
+            # Deduplicate
             if label in stats_dict:
-                label = f"{label} ({os.path.basename(path)})"
+                run_dir = os.path.basename(os.path.dirname(path))
+                label = f"{label} [{run_dir}]"
             stats_dict[label] = s
 
         plots = []
@@ -64,13 +75,16 @@ def main(argv: list[str] | None = None) -> None:
         if args.only is None or args.only == "perf":
             plot_perf_comparison(stats_dict)
             plots.append("perf_comparison")
+        if args.only is None or args.only == "wallclock":
+            plot_wallclock_comparison(stats_dict)
+            plots.append("wallclock_comparison")
 
         if args.save:
-            out_dir = os.path.dirname(args.stats[0])
-            for name in plots:
+            out_dir = os.path.dirname(args.stats[0]) or "."
+            figs = [plt.figure(i) for i in plt.get_fignums()]
+            for fig, name in zip(figs, plots):
                 path = os.path.join(out_dir, f"plot_{name}.png")
-                plt.figure(plt.gcf().number - len(plots) + plots.index(name) + 1)
-                plt.savefig(path, dpi=args.dpi, bbox_inches="tight")
+                fig.savefig(path, dpi=args.dpi, bbox_inches="tight")
                 print(f"Saved: {path}")
             plt.close("all")
         else:

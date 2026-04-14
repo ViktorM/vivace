@@ -54,6 +54,11 @@ class TrainingStats:
     rollout_samples: list[int] = field(default_factory=list)   # sequences generated (B*G)
     tokens_per_sec: list[float] = field(default_factory=list)  # rollout_tokens / rollout_time
     samples_per_sec: list[float] = field(default_factory=list) # rollout_samples / rollout_time
+    # --- eval checkpoints (sparse — only populated at eval_interval) ---
+    eval_steps: list[int] = field(default_factory=list)
+    eval_accuracy: list[float] = field(default_factory=list)
+    eval_format_rate: list[float] = field(default_factory=list)
+    eval_reward: list[float] = field(default_factory=list)
 
     def log(self, step: int, **kw) -> None:
         self.steps.append(step)
@@ -111,7 +116,10 @@ def plot_stats(stats: TrainingStats, title: str = "") -> None:
 
 
 def plot_comparison(stats_dict: dict[str, TrainingStats]) -> None:
-    """Overlay multiple TrainingStats on the same 3x3 grid."""
+    """Overlay multiple TrainingStats on the same 3x3 grid.
+
+    Legend shown once (top-right subplot only) to avoid clutter.
+    """
     import matplotlib.pyplot as plt
 
     metrics = [
@@ -127,7 +135,7 @@ def plot_comparison(stats_dict: dict[str, TrainingStats]) -> None:
     ]
     fig, axes = plt.subplots(3, 3, figsize=(15, 8))
     colors = {name: plt.cm.tab10(i) for i, name in enumerate(stats_dict)}
-    for ax, (attr, title) in zip(axes.flat, metrics):
+    for ax_idx, (ax, (attr, title)) in enumerate(zip(axes.flat, metrics)):
         for name, st in stats_dict.items():
             vals = getattr(st, attr, [])
             if vals:
@@ -136,8 +144,9 @@ def plot_comparison(stats_dict: dict[str, TrainingStats]) -> None:
         if attr == "lrs":
             ax.ticklabel_format(style="scientific", axis="y", scilimits=(-3, -3))
         ax.set_title(title)
-        ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
+    # Single legend in the top-right subplot
+    axes.flat[2].legend(fontsize=8, loc="best")
     plt.suptitle("Training Comparison", fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.show()

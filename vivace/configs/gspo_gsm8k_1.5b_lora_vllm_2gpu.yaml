@@ -46,7 +46,7 @@ adv_eps: 1.0e-4
 dg_eta: 1.0
 
 # ----- adaptive sampling / LR -----
-adaptive_sampling: false
+adaptive_sampling: true
 oversample_factor: 2.0
 min_reward_spread: 0.5
 use_adaptive_lr: false

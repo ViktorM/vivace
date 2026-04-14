@@ -87,7 +87,8 @@ def compute_advantages(rewards: torch.Tensor, cfg: RLConfig) -> torch.Tensor:
     rg = rewards.view(B, G)
 
     if cfg.adv_type == "rloo":
-        adv = rg - (rg.sum(dim=1, keepdim=True) - rg) / (G - 1)
+        baseline = (rg.sum(dim=1, keepdim=True) - rg) / (G - 1)
+        adv = rg - baseline
     elif cfg.adv_type == "dr_grpo":
         adv = rg - rg.mean(dim=1, keepdim=True)
     elif cfg.adv_type == "grpo":
@@ -95,7 +96,7 @@ def compute_advantages(rewards: torch.Tensor, cfg: RLConfig) -> torch.Tensor:
     else:
         ValueError(f"Wrong adv type in config: {cfg.adv_type}")
 
-    return adv
+    return adv.view(-1).detach() # (B * G)
 
 
 # =============================================================================
@@ -221,8 +222,6 @@ def compute_token_logprobs(
     if return_entropy:
         probs = log_probs.exp()
         entropy = - (probs * log_probs).sum(dim=-1)
-
-    return token_log_prob, mask, entropy
 
     return token_log_prob, mask, entropy
 
@@ -380,31 +379,33 @@ def compute_loss(
 
     """
     if cfg.loss_type == "rloo":
-        mean_logp = (policy_logp * mask).sum(dim=1) / token_count # (B*G,)
+        mean_logp = (policy_logp * mask).sum(dim=1) / token_count  # (B*G,)
         loss = -(advantages * mean_logp).mean()
     # sequence-level ratio
     elif cfg.loss_type == "gspo":
-        seq_logp = (policy_logp * mask).sum(dim=1) / token_count # (B*G,)
+        seq_logp = (policy_logp * mask).sum(dim=1) / token_count  # (B*G,)
         old_seq_logp = (old_logp * mask).sum(dim=1) / token_count
-        seq_log_ratio = (seq_logp - old_seq_logp).clamp(-5, 5) # clamp for stability
-        seq_ratio = torch.exp(seq_log_ratio) # (B*G,)
+        seq_log_ratio = (seq_logp - old_seq_logp).clamp(-5, 5)  # clamp for stability
+        seq_ratio = torch.exp(seq_log_ratio)  # (B*G,)
         # we support asymmetric clipping for GSPO as well
         seq_clipped = torch.clamp(seq_ratio, 1.0 - cfg.clip_low, 1.0 + cfg.clip_high)
         loss = -torch.min(advantages * seq_ratio, advantages * seq_clipped).mean()
     # all token-level variants
     else:
-        log_ratio = (policy_logp - old_logp).clamp(-5, 5) # clamp for stability
-        ratio = torch.exp(log_ratio) # (B*G, S-1)
+        log_ratio = (policy_logp - old_logp).clamp(-5, 5)  # clamp for stability
+        ratio = torch.exp(log_ratio)  # (B*G, S-1)
         clipped = torch.clamp(ratio, 1 - cfg.clip_low, 1 + cfg.clip_high)
-        a = advantages.unsqueeze(1) # (B*G, 1)
+        a = advantages.unsqueeze(1)  # (B*G, 1)
         obj = torch.min(ratio * a, clipped * a)
         # token-level normalization
         if cfg.loss_type == "dapo":
-            pass
+            loss = -(obj * mask).sum() / mask.sum().clamp(min=1.0)
         elif cfg.loss_type == "grpo":
-            pass
+            per_seq = (obj * mask).sum(dim=1) / token_count
+            loss = -per_seq.mean()
         elif cfg.loss_type == "dr_grpo":
-            raise NotImplemented
+            per_seq = (obj * mask).sum(dim=1) / cfg.max_token_count
+            loss = -per_seq.mean()
         elif cfg.loss_type == "cispo":
             raise NotImplemented
         elif cfg.loss_type == "dg":
