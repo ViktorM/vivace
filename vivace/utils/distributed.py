@@ -256,4 +256,4 @@ def make_weight_sync_group(
         return None # colocated, no subgroup needed
     
     all_ranks = sorted(set(trainer_ranks) | set(rollout_ranks))
-    return dist.new_group(rank=all_ranks, backend="nccl")
+    return dist.new_group(ranks=all_ranks, backend="nccl")
