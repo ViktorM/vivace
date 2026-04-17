@@ -51,6 +51,7 @@ from vivace.eval.runner import evaluate_model, compare_metrics, sample_evaluate
 from vivace.utils.stats import TrainingStats
 from vivace.utils.logging import ConsoleLogger, init_wandb, log_metrics, finish_wandb
 from vivace.utils.perf import Timer, throughput
+from vivace.utils.profiling import ProfilingConfig, create_profiler, export_and_summarize
 from vivace.utils.distributed import is_main_process, barrier
 from vivace.utils.checkpointing import save_checkpoint
 
@@ -152,6 +153,9 @@ class TrainerConfig:
     eval_interval: int = 50
     checkpoint_interval: int = 100
     run_dir: str = "runs/default"
+
+    # ----- profiling -----
+    profiling: dict | None = None    # maps to ProfilingConfig; None = disabled
 
     # ----- misc -----
     seed: int = 42
@@ -452,6 +456,9 @@ class Trainer:
             #     colocated=False,
             # )
             pass
+
+        # --- Profiling ---
+        self.profiling_cfg = ProfilingConfig(**(cfg.profiling or {}))
 
         _print_training_info(cfg, self.model, self.trainer_devices, self.rollout_devices)
 
@@ -760,6 +767,12 @@ class Trainer:
         # so vLLM and the trainer use the same policy from step 0.
         self.sync_weights()
 
+        # --- Profiler (optional) ---
+        prof = create_profiler(self.profiling_cfg)
+        if prof is not None:
+            prof.__enter__()
+            print(f"Profiler armed: will profile steps {self.profiling_cfg.start_step}-{self.profiling_cfg.end_step}")
+
         # --- Training loop ---
         self.kl_ema = self.cfg.kl_target
         for step in range(self.cfg.num_steps):
@@ -779,6 +792,15 @@ class Trainer:
                 self.sync_weights()
 
             self.scheduler.step()
+
+            # --- Profiler step ---
+            if prof is not None:
+                prof.step()
+                # Export after profiling window closes
+                if step == self.profiling_cfg.end_step:
+                    prof.__exit__(None, None, None)
+                    export_and_summarize(prof, self.profiling_cfg, self.cfg.run_dir)
+                    prof = None  # done profiling, no further overhead
 
             # --- Log everything in one stats.log() call ---
             rollout_tokens = int(sum(mb["mask"].sum().item() for mb in micro_batches))
@@ -889,6 +911,12 @@ class Trainer:
                 # if step > 0 and step % self.cfg.checkpoint_interval == 0:
                 #     save_checkpoint(self.model, self.optimizer, self.scheduler,
                 #                     step, f"{self.cfg.run_dir}/ckpt-{step}")
+
+        # --- Clean up profiler if training ended before profiling window ---
+        if prof is not None:
+            prof.__exit__(None, None, None)
+            export_and_summarize(prof, self.profiling_cfg, self.cfg.run_dir)
+            prof = None
 
         # --- Final eval ---
         print("\nFinal evaluation...")

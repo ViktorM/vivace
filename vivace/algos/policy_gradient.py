@@ -296,15 +296,15 @@ def compute_kl(
     GOTCHA
     ------
     For k3, clamp log_r before exp() if you're seeing nan/inf in training:
-        log_r = (ref_logp - policy_logp).clamp(-20, 20)
+        log_r = (ref_logp - policy_logp).clamp(-10, 10)
     `rl_step` clamps the POLICY ratio to [-5, 5] but that's a different
-    ratio (policy/old, not ref/policy). For the KL ratio, -20/+20
+    ratio (policy/old, not ref/policy). For the KL ratio, -10/+10
     is looser and sufficient for stability without distorting typical values.
     """
     if estimator == "k1":
         per_token_kl = policy_logp - ref_logp
     elif estimator == "k3":
-        log_r = (ref_logp - policy_logp).clamp(-20, 20)
+        log_r = (ref_logp - policy_logp).clamp(-10, 10)
         r = torch.exp(log_r)
         per_token_kl = r - log_r - 1.0
     else:
