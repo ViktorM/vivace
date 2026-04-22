@@ -75,10 +75,12 @@ class RLConfig:
     max_new_tokens: int = 192        # max response length (HF generate / vLLM max_tokens)
     temperature: float = 0.9
     top_p: float = 0.95
+    top_k: int = -1                  # -1 = disabled; set e.g. 50 for top-k sampling
 
     # --- Clipping ---
     clip_low: float = 0.2          # epsilon_low
     clip_high: float = 0.2         # epsilon_high (set > clip_low for DAPO), but asymmetric can be used with other algorithms
+    clip_ratio: float = 0.25       # PPO-style clip (referenced by some variants; currently unused by default loss)
     clip_cispo: float = 5.0        # CISPO upper bound on importance weight
 
     # --- KL ---

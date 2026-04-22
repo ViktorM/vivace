@@ -81,7 +81,7 @@ vivace/                    # installable package
 │   └── distributed.py     # init, ranks, barriers, weight-sync subgroup
 ├── configs/               # YAML configs (one per experiment)
 └── scripts/               # CLI entry points (vivace-train, vivace-sft, vivace-eval)
-tests/                     # Unit tests (no GPU needed)
+tests/                     # Unit tests + integration scripts (weight-sync verify, NCCL smoke)
 docs/                      # Implementation notes
 ```
 
@@ -144,6 +144,20 @@ writing anything new.
 3. Point a config at it.
 
 The reward function and the verifier are the contract. Everything else is up to you.
+
+## Testing weight sync
+
+Two scripts. See `docs/weight_sync_approaches.md` §Testing for details and
+failure-mode diagnostics.
+
+```bash
+# 1. Low-level smoke test: scalar NCCL broadcast between trainer + vLLM worker
+.venv/bin/python -m tests.test_nccl_sync
+
+# 2. End-to-end: 3-step verify (fresh / perturb / sync) against the backend under test
+.venv/bin/python -m tests.test_weight_sync --config <path> --method disk
+.venv/bin/python -m tests.test_weight_sync --config <path> --method nccl
+```
 
 ## Roadmap
 

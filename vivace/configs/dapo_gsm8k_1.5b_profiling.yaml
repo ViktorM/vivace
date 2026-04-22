@@ -1,6 +1,6 @@
 model_name: Qwen/Qwen2.5-1.5B
 env_name: gsm8k
-algo_name: gspo
+algo_name: dapo
 mode: disaggregated
 trainer_gpus:
 - 0
@@ -8,7 +8,7 @@ rollout_gpus:
 - 1
 use_vllm: true
 gpu_memory_utilization: 0.8
-enforce_eager: false
+enforce_eager: true
 use_lora: true
 lora_rank: 16
 lora_alpha: 32
@@ -18,23 +18,25 @@ lora_target_modules:
 - k_proj
 - v_proj
 - o_proj
-num_steps: 200
-sft_warmup: false
-sft_warmup_steps: 0
-eval_n: 500
+num_steps: 10
+eval_n: 50
 eval_batch_size: 32
 eval_use_vllm: true
+sft_warmup: false
 wandb_project: vivace
 log_interval: 1
-eval_interval: 50
-checkpoint_interval: 100
-run_dir: runs/gspo_gsm8k_1.5b_lora_vllm_2gpu
+eval_interval: 100
+run_dir: runs/profiling_test
 seed: 42
+profiling:
+  enabled: true
+  start_step: 3
+  end_step: 7
 rl:
   lr: 2.0e-05
   batch_size: 1
   grad_clip: 1.0
-  loss_type: gspo
+  loss_type: dapo
   adv_type: rloo
   group_size: 8
   grad_accum_steps: 4
@@ -44,19 +46,10 @@ rl:
   top_p: 0.95
   top_k: -1
   clip_low: 0.2
-  clip_high: 0.2
+  clip_high: 0.28
   clip_ratio: 0.25
   clip_cispo: 5.0
-  kl_coef: 0.05
+  kl_coef: 0.01
   adv_eps: 0.0001
   dg_eta: 1.0
   adaptive_sampling: true
-  oversample_factor: 2.0
-  min_reward_spread: 0.5
-  use_adaptive_lr: false
-  kl_target: 0.05
-  kl_factor: 1.5
-  kl_ema: 0.2
-  lr_factor: 1.5
-  min_lr: 1.0e-07
-  max_lr: 2.0e-05

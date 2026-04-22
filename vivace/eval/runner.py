@@ -47,7 +47,8 @@ def evaluate_model(
     subset = examples if n == -1 else examples[:n]
     format_ok = correct = 0
     reward_sum = 0.0
-    lengths = []
+    token_lengths: list[int] = []      # response length in tokens (primary)
+    char_lengths: list[int] = []       # response length in characters (secondary)
     correct_list, incorrect_list = [], []
     t0 = time.time()
 
@@ -76,7 +77,10 @@ def evaluate_model(
         pred = to_float(ans) if ans else None
         r = env.reward_fn(resp, ex)
         reward_sum += r
-        lengths.append(len(resp))
+        char_lengths.append(len(resp))
+        # add_special_tokens=False: we only want the generated content length,
+        # not BOS/EOS that the tokenizer would insert
+        token_lengths.append(len(tokenizer.encode(resp, add_special_tokens=False)))
         detail = {
             "question": ex.problem,
             "ground_truth": gt,
@@ -99,7 +103,8 @@ def evaluate_model(
             "format_rate_pct": 100.0 * format_ok / total,
             "accuracy_pct": 100.0 * correct / total,
             "avg_reward": reward_sum / total,
-            "avg_length": float(np.mean(lengths)) if lengths else 0.0,
+            "avg_length_tokens": float(np.mean(token_lengths)) if token_lengths else 0.0,
+            "avg_length_chars": float(np.mean(char_lengths)) if char_lengths else 0.0,
             "eval_time_s": elapsed,
             "eval_backend": backend,
         },

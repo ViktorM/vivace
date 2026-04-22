@@ -1,27 +1,9 @@
 """Main training orchestrator.
 
-Wires the rollout backend, the algos/policy_gradient module, the eval
-runner, the logging, and the checkpoint saver into one loop. The loop
-itself is what's interesting; everything else is delegated.
-
-==============================================================================
-WHAT NEEDS TO BE IMPLEMENTED
-==============================================================================
-
-The class skeleton, the dataclass, and the train() outer loop structure
-are provided. The bodies of __init__, rollout_phase, train_phase,
-sync_weights, and maybe_sft_warmup are stubs.
-
-Suggested order:
-  1. __init__ — single GPU, no DDP, HF sampler, no LoRA
-  2. rollout_phase — call hf_sampler.sample_responses, build micro-batches
-  3. train_phase — call algos/policy_gradient.rl_step
-  4. train() body — wire it together end-to-end on a single GPU
-  5. LoRA path in __init__ + reference model via disable_adapter
-  6. DDP wrap in __init__ (graduate to multi-GPU)
-  7. sync_weights — disk-based LoRA sync via vllm_worker.update_lora
-  8. maybe_sft_warmup
-  9. Disaggregated mode + in-place weight sync (much later)
+Wires rollout backend, policy_gradient module, eval runner, logging, and
+checkpointing into one loop. The loop is what matters; everything else is
+delegated. RL hyperparameters live in `cfg.rl` (RLConfig); trainer-side
+orchestration fields live directly on TrainerConfig.
 """
 
 from __future__ import annotations
@@ -29,6 +11,8 @@ from __future__ import annotations
 import gc
 import os
 import random
+import socket
+import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -36,6 +20,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.profiler import record_function
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from vivace.algos.types import RLConfig, SFTConfig, validate_rl_config
@@ -52,6 +37,7 @@ from vivace.utils.stats import TrainingStats
 from vivace.utils.logging import ConsoleLogger, init_wandb, log_metrics, finish_wandb
 from vivace.utils.perf import Timer, throughput
 from vivace.utils.profiling import ProfilingConfig, create_profiler, export_and_summarize
+from vivace.utils.weight_sync import sender_broadcast_loop
 from vivace.utils.distributed import is_main_process, barrier
 from vivace.utils.checkpointing import save_checkpoint
 
@@ -74,6 +60,13 @@ DTYPE_MAP = {
 
 @dataclass
 class TrainerConfig:
+    """Trainer orchestration config. RL-math hyperparameters live in the
+    nested `rl: RLConfig` — see `vivace/algos/types.py`. This separation
+    keeps training infrastructure (model loading, device placement, logging)
+    distinct from the algorithm itself, and lets `rl_step` consume `RLConfig`
+    directly without the trainer re-translating fields.
+    """
+
     # ----- what to train -----
     model_name: str = "Qwen/Qwen2.5-0.5B"
     env_name: str = "gsm8k"
@@ -95,46 +88,16 @@ class TrainerConfig:
     lora_dropout: float = 0.0
     lora_target_modules: tuple = ("q_proj", "k_proj", "v_proj", "o_proj")
 
-    # ----- rollout -----
-    group_size: int = 8
-    max_new_tokens: int = 1024      # max response length (HF generate / vLLM max_tokens)
-    temperature: float = 0.7
-    top_p: float = 0.95
-    top_k: int = -1
-
-    # ----- training -----
-    learning_rate: float = 1e-6
-    kl_coef: float = 0.02
+    # ----- training loop orchestration -----
     num_steps: int = 500
-    micro_batch_size: int = 4
-    grad_accum_steps: int = 4
-    max_grad_norm: float = 1.0
     use_vllm: bool = True
     gpu_memory_utilization: float = 0.4  # only used when use_vllm = True
     enforce_eager: bool = False          # disable CUDA graphs in vLLM (safer for weight updates, slower)
 
-    # ----- composable PG (mirrors RLConfig) -----
-    loss_type: str = "grpo"
-    adv_type: str = "grpo"
-    clip_low: float = 0.2
-    clip_high: float = 0.2
-    clip_ratio: float = 0.25
-    clip_cispo: float = 5.0
-    optim_epochs: int = 2
-    adv_eps: float = 1e-4
-    dg_eta: float = 1.0
-
-    # ----- adaptive sampling / LR -----
-    adaptive_sampling: bool = False
-    oversample_factor: float = 2.0
-    min_reward_spread: float = 0.5
-    use_adaptive_lr: bool = False
-    kl_target: float = 0.05
-    kl_factor: float = 1.5
-    kl_ema: float = 0.2
-    lr_factor: float = 1.5
-    min_lr: float = 1e-7
-    max_lr: float = 2e-5
+    # ----- RL hyperparameters (algorithm, optimizer, clipping, generation, adaptive sampling/LR) -----
+    # Previously ~25 fields were duplicated here and copied into RLConfig at __init__.
+    # Now they live canonically in RLConfig and are accessed via cfg.rl.X.
+    rl: RLConfig = field(default_factory=RLConfig)
 
     # ----- SFT warmup (optional) -----
     sft_warmup: bool = False
@@ -157,8 +120,25 @@ class TrainerConfig:
     # ----- profiling -----
     profiling: dict | None = None    # maps to ProfilingConfig; None = disabled
 
+    # ----- weight sync -----
+    # "disk": save adapter to disk, vLLM reloads via LoRARequest (simple, slow, works today)
+    # "nccl": direct GPU->GPU broadcast via vLLM collective_rpc (fast, scaffold in weight_sync.py)
+    weight_sync_method: str = "disk"
+
     # ----- misc -----
     seed: int = 42
+
+
+def _find_free_port() -> int:
+    """Bind to port 0 to let the OS pick a free loopback port, then release it.
+    Small race window between releasing and another process grabbing it, but
+    sufficient for one-shot rendezvous at process startup.
+    """
+    s = socket.socket()
+    s.bind(("localhost", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -215,88 +195,34 @@ def _print_training_info(
     if hasattr(model.config, 'layer_types'):
         print(f"  Layer types:     {model.config.layer_types}")
     print(f"  Env:             {cfg.env_name}")
-    print(f"  Algo:            {cfg.loss_type} / {cfg.adv_type}")
-    print(f"  Batch:           {cfg.micro_batch_size} prompts x {cfg.group_size} group x {cfg.grad_accum_steps} accum")
-    print(f"  LR:              {cfg.learning_rate}")
-    print(f"  KL coef:         {cfg.kl_coef}")
+    print(f"  Algo:            {cfg.rl.loss_type} / {cfg.rl.adv_type}")
+    print(f"  Batch:           {cfg.rl.batch_size} prompts x {cfg.rl.group_size} group x {cfg.rl.grad_accum_steps} accum")
+    print(f"  LR:              {cfg.rl.lr}")
+    print(f"  KL coef:         {cfg.rl.kl_coef}")
     print(f"  Steps:           {cfg.num_steps}")
     print(f"  Run dir:         {cfg.run_dir}")
     print(f"{'=' * 60}\n")
 
 
 class Trainer:
-    """The training orchestrator. Owns the model, the rollout backend, the env,
-    the algo (RLConfig), and the loop.
+    """Training orchestrator. Owns model, rollout backend, env, RLConfig, and loop.
 
-    Key invariants the loop maintains (do NOT break these in your impl):
-      - Weight sync happens AFTER optimizer.step() and BEFORE the next
-        rollout_phase. If you flip this order, the rollout sees stale
-        weights and the importance ratio is wrong by one step (technically
-        debuggable but very confusing).
-      - Eval and checkpoint happen on rank 0 only. The other ranks must
-        barrier() at the same point so they don't drift ahead.
-      - Logging metrics use distributed all-reduce mean BEFORE the rank-0
-        print, otherwise the printed loss is just rank 0's view.
+    Loop invariants:
+      - Weight sync runs AFTER optimizer.step(), BEFORE the next rollout.
+        Flipping this makes the rollout use stale weights, biasing the importance ratio.
+      - Eval and checkpoint run on rank 0 only; other ranks must hit the same `barrier()`.
+      - Metric logging all-reduces BEFORE the rank-0 print.
     """
 
     def __init__(self, cfg: TrainerConfig):
-        """Build everything.
+        """Build model, tokenizer, env, rollout backend, optimizer, stats, and
+        (optionally) the NCCL weight-sync comm.
 
-        THEORY — wrap order matters
-        ----------
-        The correct order for setting up a LoRA + DDP model is:
-            1. Load base model (HF, bf16, low_cpu_mem_usage=True)
-            2. peft.get_peft_model(base, lora_cfg)        <-- LoRA wrap
-            3. .to(device)
-            4. DDP(model, device_ids=[local_rank])         <-- DDP wrap
-        Other orders LOOK like they work but break checkpointing or
-        gradient sync silently. Stick with this order.
+        Wrap order for LoRA + DDP: load base -> peft wrap -> .to(device) -> DDP.
+        Other orders silently break checkpointing or gradient sync.
 
-        For full FT (no LoRA): skip step 2.
-
-        Reference model handling
-        ------------------------
-        With LoRA: there is no separate ref model. Use peft's
-        `with model.disable_adapter():` context inside compute_token_logprobs
-        to forward the BASE model and treat that as the reference. Zero
-        extra memory.
-
-        Without LoRA: you need a separate frozen copy:
-            ref_model = copy.deepcopy(base_model)
-            ref_model.eval()
-            for p in ref_model.parameters(): p.requires_grad_(False)
-        ~2x model VRAM. Acceptable for small models, painful for big ones.
-
-        GOTCHAS
-        -------
-        - Tokenizer: set padding_side="left", pad_token=eos_token BEFORE any
-          generate calls. Forgetting this is the most common bug.
-        - model.config.use_cache = False during training (else gradient
-          checkpointing complains).
-        - torch.backends.cuda.matmul.allow_tf32 = True for TF32 perf on
-          ampere+ (free speedup).
-        - Seed EVERYTHING after init: random, numpy, torch, torch.cuda.
-
-        WHAT TO BUILD
-        -------------
-        - self.cfg = cfg
-        - self.rank, self.local_rank, self.world_size = init_distributed()
-        - tokenizer (with the padding fix)
-        - base model (bf16, on local_rank GPU)
-        - LoRA wrap (if cfg.use_lora) via peft.get_peft_model
-        - DDP wrap (if world_size > 1)
-        - ref_model handle (None if LoRA — disable_adapter trick;
-          deepcopy if full FT)
-        - env (build via cfg.env_name -> GSM8KEnv etc.)
-        - rollout backend (HFSampler or VLLMRolloutWorker depending on mode)
-        - optimizer (AdamW)
-        - scheduler (LinearLR warmup + CosineAnnealingLR via SequentialLR)
-        - TrainingStats, ConsoleLogger
-        - init_wandb (rank 0 only)
-
-        REFERENCES
-        ----------
-        - PyTorch DDP tutorial: pytorch.org/tutorials/intermediate/ddp_tutorial.html
+        Ref model: LoRA uses `with model.disable_adapter():` for zero extra VRAM.
+        Full FT needs a frozen deepcopy (~2× model VRAM).
         """
         self.cfg = cfg
         self.env = GSM8KEnv()  # TODO: dispatch on cfg.env_name for other envs
@@ -383,59 +309,34 @@ class Trainer:
         else:
             self.rollout_worker = None  # HF sampler path
 
-        # --- RLConfig (built from TrainerConfig fields) ---
-        self.rl_cfg = RLConfig(
-            loss_type=cfg.loss_type,
-            adv_type=cfg.adv_type,
-            batch_size=cfg.micro_batch_size,
-            group_size=cfg.group_size,
-            lr=cfg.learning_rate,
-            grad_accum_steps=cfg.grad_accum_steps,
-            optim_epochs=cfg.optim_epochs,
-            grad_clip=cfg.max_grad_norm,
-            temperature=cfg.temperature,
-            top_p=cfg.top_p,
-            max_new_tokens=cfg.max_new_tokens,
-            clip_low=cfg.clip_low,
-            clip_high=cfg.clip_high,
-            clip_cispo=cfg.clip_cispo,
-            kl_coef=cfg.kl_coef,
-            adv_eps=cfg.adv_eps,
-            dg_eta=cfg.dg_eta,
-            adaptive_sampling=cfg.adaptive_sampling,
-            oversample_factor=cfg.oversample_factor,
-            min_reward_spread=cfg.min_reward_spread,
-            use_adaptive_lr=cfg.use_adaptive_lr,
-            kl_target=cfg.kl_target,
-            kl_factor=cfg.kl_factor,
-            kl_ema=cfg.kl_ema,
-            lr_factor=cfg.lr_factor,
-            min_lr=cfg.min_lr,
-            max_lr=cfg.max_lr,
-            log_interval=cfg.log_interval,
-        )
+        # --- RLConfig: now owned directly by TrainerConfig.rl, no re-translation needed ---
+        self.rl_cfg = cfg.rl
+        # Trainer-side log_interval controls console/wandb cadence and is
+        # separate from RLConfig's log_interval (which controls rl_step's own
+        # internal prints). Keep the trainer one authoritative by mirroring.
+        self.rl_cfg.log_interval = cfg.log_interval
         validate_rl_config(self.rl_cfg)
 
         # --- Optimizer + scheduler ---
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.learning_rate)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.rl.lr)
         warmup_steps = 10
         warmup = torch.optim.lr_scheduler.LinearLR(
             self.optimizer, start_factor=0.1, total_iters=warmup_steps)
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=max(cfg.num_steps - warmup_steps, 1),
-            eta_min=cfg.learning_rate * 0.2)
+            eta_min=cfg.rl.lr * 0.2)
         self.scheduler = torch.optim.lr_scheduler.SequentialLR(
             self.optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
 
         # --- Stats + logging ---
         # Label includes key config differences for comparison plots
-        label = f"{cfg.loss_type}/{cfg.adv_type}"
+        label = f"{cfg.rl.loss_type}/{cfg.rl.adv_type}"
         if cfg.use_lora:
             label += f" LoRA r={cfg.lora_rank}"
-        if cfg.adaptive_sampling:
-            label += f" adapt={cfg.oversample_factor}x"
-        label += f" kl={cfg.kl_coef}"
-        label += f" ep={cfg.optim_epochs}"
+        if cfg.rl.adaptive_sampling:
+            label += f" adapt={cfg.rl.oversample_factor}x"
+        label += f" kl={cfg.rl.kl_coef}"
+        label += f" ep={cfg.rl.optim_epochs}"
         self.stats = TrainingStats(method=label)
         self.console = ConsoleLogger(label=label)
         init_wandb(cfg, project=cfg.wandb_project, run_name=cfg.wandb_run_name)
@@ -460,6 +361,80 @@ class Trainer:
         # --- Profiling ---
         self.profiling_cfg = ProfilingConfig(**(cfg.profiling or {}))
 
+        # ----- NCCL weight sync setup (one-time, Pattern A) -----
+        # Pattern A = StatelessProcessGroup (TCP rendezvous) + PyNcclCommunicator.
+        # See docs/training_theory.md and docs/weight_sync_approaches.md.
+        self._nccl_sync_state = None
+        if cfg.weight_sync_method == "nccl" and cfg.mode == "disaggregated":
+            if cfg.use_lora:
+                # LoRA A/B matrices live in vLLM's PunicaWrapper, not in the
+                # base model's named_parameters(). NCCL broadcast can't reach
+                # them without vLLM-internals hooks. Use disk sync for LoRA.
+                raise NotImplementedError(
+                    "weight_sync_method='nccl' with use_lora=True is not supported. "
+                    "vLLM stores LoRA adapters in its PunicaWrapper, not in the base "
+                    "model's named_parameters, so NCCL broadcast can't target them. "
+                    "Use weight_sync_method='disk' for LoRA training — it's fast "
+                    "enough (~300ms) and hits vLLM's LoRARequest API directly. "
+                    "NCCL sync is designed for full FT (use_lora=False)."
+                )
+            from vllm.distributed.utils import StatelessProcessGroup
+            from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+            from vivace.utils.weight_sync import build_param_specs
+
+            host, port = "localhost", _find_free_port()
+            world_size = 2   # 1 trainer + 1 vLLM worker at TP=1; bump when scaling
+
+            # Worker-side init runs inside the vLLM subprocess via collective_rpc.
+            # collective_rpc blocks the caller until the function returns on the
+            # worker, so we run it on a background thread while the trainer's own
+            # StatelessProcessGroup.create is called concurrently on the main
+            # thread. Both sides must be in their create() call at the same time
+            # for the TCP rendezvous to complete.
+            worker_err: list[BaseException] = []
+            def _trigger_worker_init():
+                try:
+                    self.rollout_worker.init_weight_sync(
+                        master_addr=host, master_port=port,
+                        trainer_rank=0, worker_rank_offset=1, world_size=world_size,
+                    )
+                except BaseException as e:
+                    worker_err.append(e)
+                    print(f"[trainer init] worker-side NCCL init failed: {e!r}", flush=True)
+
+            worker_thread = threading.Thread(target=_trigger_worker_init, daemon=True)
+            worker_thread.start()
+
+            # Trainer-side rendezvous. If the worker errored, the trainer's
+            # TCPStore will time out — surface the worker error first.
+            try:
+                pg = StatelessProcessGroup.create(
+                    host=host, port=port, rank=0, world_size=world_size,
+                    store_timeout=30,
+                )
+            except BaseException:
+                if worker_err:
+                    raise RuntimeError(
+                        f"NCCL rendezvous failed because the vLLM worker errored: {worker_err[0]!r}"
+                    ) from worker_err[0]
+                raise
+            trainer_comm = PyNcclCommunicator(group=pg, device=self.device)
+
+            worker_thread.join(timeout=60)
+            if worker_err:
+                raise worker_err[0]
+
+            # Full FT: all trainable params. (LoRA path is guarded above.)
+            specs = build_param_specs(self.model)
+
+            self._nccl_sync_state = {
+                "specs": specs,
+                "comm": trainer_comm,
+                "pg": pg,   # kept alive; Python GC would otherwise drop the TCP store
+            }
+            print(f"[trainer init] NCCL weight sync ready: {len(specs)} params")
+
+
         _print_training_info(cfg, self.model, self.trainer_devices, self.rollout_devices)
 
     def _run_eval(self, eval_data: list, label: str = "") -> tuple[dict, list, list]:
@@ -469,79 +444,34 @@ class Trainer:
             self.model, self.tokenizer, eval_data, self.env,
             n=n,
             batch_size=self.cfg.eval_batch_size,
-            max_new_tokens=self.cfg.max_new_tokens,
+            max_new_tokens=self.cfg.rl.max_new_tokens,
             device=str(self.device),
             vllm_worker=self.eval_worker,
         )
 
     def maybe_sft_warmup(self) -> None:
-        """If cfg.sft_warmup, run cfg.sft_warmup_steps of SFT before RL.
+        """Run a short SFT pass before RL if `cfg.sft_warmup`. Unused by default.
 
-        THEORY
-        ------
-        For most base models on GSM8K with the system prompt format,
-        SFT is unnecessary. Keep this OFF by default.
-
-        When you DO need it, the recipe is:
-          - Build SFT data via vivace.algos.sft.build_sft_data
-          - Build a separate AdamW with a higher LR (1e-5 typical)
-          - Run vivace.algos.sft.sft_train_loop for cfg.sft_warmup_steps
-          - The model is now warmed up; proceed to RL.
-
-        HINTS
-        -----
-        - if not self.cfg.sft_warmup: return
-        - sft_cfg = SFTConfig(steps=self.cfg.sft_warmup_steps, ...)
-        - data = build_sft_data(self.env.load_split("train"), n=sft_cfg.n_examples,
-                                tokenizer=self.tokenizer, make_prompt=self.env.format_prompt)
-        - sft_opt = torch.optim.AdamW(self.model.parameters(), lr=sft_cfg.lr)
-        - sft_train_loop(self.model, self.tokenizer, data, sft_cfg, sft_opt)
+        TODO: implement when SFT warmup is actually needed.
         """
         pass
 
     def rollout_phase(self) -> list[dict]:
-        """Sample prompts -> generate -> compute rewards -> compute advantages.
+        """Sample prompts -> generate -> score -> compute advantages. Returns
+        `grad_accum_steps` micro-batches in the format `rl_step` expects:
+        {full_ids, plen, adv, old_logp, ref_logp, mask, token_count, responses, rewards}.
 
-        Returns a list of micro-batches in the format `rl_step` expects:
-            {full_ids, plen, adv, old_logp, ref_logp, mask, token_count,
-             responses, rewards}
-
-        THEORY
-        ------
-        This is the rollout collection phase, pulled out into the trainer
-        because the policy_gradient module shouldn't know about envs or
-        sampling backends.
-
-        Loop cfg.grad_accum_steps times. Each iteration:
-          1. Sample B prompts from the env (or oversample for adaptive sampling)
-          2. Repeat each prompt G times (group_size)
-          3. Call sample_responses (HF) or vllm_worker.generate to get
-             [B*G] sequences
-          4. Compute rewards via env.reward_fn
-          5. (Optional) adaptive sampling: filter dead groups by reward spread
-          6. Compute advantages via algos/policy_gradient.compute_advantages
-          7. Compute old_logp (under current model) and ref_logp (under ref)
-             via compute_token_logprobs (no_grad)
-          8. Pack into micro_batch dict
-
-        GOTCHAS
-        -------
-        - old_logp is computed under the SAME model that just sampled.
-          With colocated mode and a single optimizer step between rollouts
-          this is fine. With disaggregated + multi-step queues, you need
-          to be more careful.
-        - For LoRA ref logp: use `with self.model.disable_adapter():`
-          inside the forward pass.
-        - Group sampling: prompts = [p for ex in batch_ex for p in [make_prompt(ex)] * G]
-          gives you the right [B*G] order so view(B, G) works downstream.
-
+        old_logp is computed under the same model that just sampled (fine in
+        our synchronous setup). LoRA ref logp uses `model.disable_adapter()`
+        to forward through base weights without a separate ref model.
         """
         micro_batches, alive_rates_step, spread_step = [], [], []
-        B, G = self.cfg.micro_batch_size, self.cfg.group_size
+        rl = self.cfg.rl
+        B, G = rl.batch_size, rl.group_size
 
         # {full_ids, plen, adv, old_logp, ref_logp, mask, token_count, responses, rewards}
-        for i in range(self.cfg.grad_accum_steps):
-            n_prompts = int(self.cfg.oversample_factor * B) if self.cfg.adaptive_sampling else B
+        for i in range(rl.grad_accum_steps):
+            n_prompts = int(rl.oversample_factor * B) if rl.adaptive_sampling else B
 
             idxs = np.random.choice(len(self.train_data), size=n_prompts, replace=False)
             batch_ex = [self.train_data[i] for i in idxs]
@@ -557,11 +487,12 @@ class Trainer:
                 plen = prompt_enc.input_ids.shape[1]
 
                 # 3. Generate via the worker (handles lora_request, tqdm, etc.)
-                vllm_outputs, _ = self.rollout_worker.generate(
-                    prompt_token_ids=prompt_ids_batch,
-                    temperature=self.cfg.temperature, top_p=self.cfg.top_p,
-                    max_tokens=self.cfg.max_new_tokens, n=G,
-                )
+                with record_function("vllm_generate"):
+                    vllm_outputs, _ = self.rollout_worker.generate(
+                        prompt_token_ids=prompt_ids_batch,
+                        temperature=rl.temperature, top_p=rl.top_p,
+                        max_tokens=rl.max_new_tokens, n=G,
+                    )
 
                 # 4. Build full_ids + responses from vLLM output.
                 # Pad all responses to the same length so plen works as a
@@ -606,27 +537,29 @@ class Trainer:
                 prompts = np.repeat([self.env.format_prompt(ex) for ex in batch_ex], G).tolist()
                 examples = [ex for ex in batch_ex for _ in range(G)]
 
-                full_ids, responses, plen = sample_responses(self.model, self.tokenizer, prompts, 
-                                                            max_new_tokens=self.cfg.max_new_tokens,
-                                                            temperature=self.cfg.temperature, top_p=self.cfg.top_p,
-                                                            device=str(self.device))
+                with record_function("hf_generate"):
+                    full_ids, responses, plen = sample_responses(self.model, self.tokenizer, prompts,
+                                                                max_new_tokens=rl.max_new_tokens,
+                                                                temperature=rl.temperature, top_p=rl.top_p,
+                                                                device=str(self.device))
                 torch.cuda.empty_cache()
 
 
             # Compute rewards for ALL responses (needed for adaptive sampling spread)
             # reward_fn takes (response, Example) — full example available for
             # problem-aware rewards (e.g. bonus for using numbers from the problem)
-            rewards = torch.tensor(
-                [self.env.reward_fn(resp, ex) for resp, ex in zip(responses, examples)],
-                device=self.device, dtype=torch.float32,
-            )
+            with record_function("reward"):
+                rewards = torch.tensor(
+                    [self.env.reward_fn(resp, ex) for resp, ex in zip(responses, examples)],
+                    device=self.device, dtype=torch.float32,
+                )
 
-            if self.cfg.adaptive_sampling:
+            if rl.adaptive_sampling:
                 rg = rewards.view(n_prompts, G)
                 spread = rg.max(dim=1).values - rg.min(dim=1).values
                 top_idx = spread.argsort(descending=True)[:B]
 
-                alive_count = (spread > self.cfg.min_reward_spread).sum().item()
+                alive_count = (spread > rl.min_reward_spread).sum().item()
                 alive_rates_step.append(alive_count / n_prompts)
                 spread_step.append((spread.mean().item(), spread.max().item()))
 
@@ -635,30 +568,33 @@ class Trainer:
                 rewards = rewards[keep]
                 responses = [responses[k] for k in keep]
 
-            adv = compute_advantages(rewards.view(B, G), self.rl_cfg)
+            with record_function("advantages"):
+                adv = compute_advantages(rewards.view(B, G), self.rl_cfg)
 
-            with torch.no_grad():
-                self.compiled_model.eval()
-                old_logp, mask, _ = compute_token_logprobs(
-                    self.compiled_model, full_ids, plen, self.cfg.temperature,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
-                self.compiled_model.train()
-
-                if self.compiled_ref is not None:
-                    ref_logp, _, _ = compute_token_logprobs(
-                        self.compiled_ref, full_ids, plen, self.cfg.temperature,
+            with record_function("logprob_recompute"), torch.no_grad():
+                with record_function("logprob_policy"):
+                    self.compiled_model.eval()
+                    old_logp, mask, _ = compute_token_logprobs(
+                        self.compiled_model, full_ids, plen, rl.temperature,
                         pad_token_id=self.tokenizer.pad_token_id,
                     )
-                else:
-                    # LoRA: disable adapter to forward through base weights
-                    with self.model.disable_adapter():
-                        self.compiled_model.eval()
+                    self.compiled_model.train()
+
+                with record_function("logprob_ref"):
+                    if self.compiled_ref is not None:
                         ref_logp, _, _ = compute_token_logprobs(
-                            self.compiled_model, full_ids, plen, self.cfg.temperature,
+                            self.compiled_ref, full_ids, plen, rl.temperature,
                             pad_token_id=self.tokenizer.pad_token_id,
                         )
-                        self.compiled_model.train()
+                    else:
+                        # LoRA: disable adapter to forward through base weights
+                        with self.model.disable_adapter():
+                            self.compiled_model.eval()
+                            ref_logp, _, _ = compute_token_logprobs(
+                                self.compiled_model, full_ids, plen, rl.temperature,
+                                pad_token_id=self.tokenizer.pad_token_id,
+                            )
+                            self.compiled_model.train()
 
             micro_batches.append({
                 "full_ids": full_ids, "plen": plen, "adv": adv,
@@ -675,37 +611,27 @@ class Trainer:
         return micro_batches
 
     def train_phase(self, micro_batches: list[dict]) -> dict:
-        """Multi-epoch optimization over collected micro-batches.
-
-        Thin wrapper around vivace.algos.policy_gradient.rl_step. The reason
-        it lives on Trainer at all is so the Trainer owns the optimizer
-        and the kl_ema state across steps.
-
-        HINTS
-        -----
-        - return rl_step(self.rl_cfg, micro_batches, self.model, self.ref_model,
-                         self.optimizer, self.stats, self.step, self.kl_ema)
-        - Capture the returned new_kl_ema and store it on self.
+        """Multi-epoch optimization. Thin wrapper around `rl_step`; lives here
+        so Trainer owns the optimizer and `kl_ema` across steps.
         """
         metrics, self.kl_ema = rl_step(
             self.rl_cfg, micro_batches, self.compiled_model, self.ref_model,
             self.optimizer, self.stats, self.step, self.kl_ema,
         )
         return metrics
-        
+    
     def sync_weights(self) -> None:
         """Push trainer weights to the rollout worker.
 
-        Two paths:
-          - LoRA: save adapter to disk, call vllm_worker.update_lora(path)
-                  Simple, slow, always works.
-          - Full FT: build NCCL subgroup once, broadcast each parameter,
-                     call vllm_worker.update_weights(state_dict).
-                     Hard, fast.
+        Dispatches to the backend configured by `cfg.weight_sync_method`:
+          - "disk": LoRA adapter save + vLLM LoRARequest reload. Simple, slow,
+                   always works. Requires `cfg.use_lora=True`.
+          - "nccl": direct GPU->GPU broadcast via vLLM collective_rpc.
+                   Fast, supports full FT. See vivace/utils/weight_sync.py.
 
-        Single-GPU dev with HFSampler: this is a no-op (the trainer's
-        model IS the sampler's model — they share weights by reference).
-        Skip the whole thing in that mode.
+        No-op when there is no rollout worker (HFSampler shares weights by
+        reference) and in colocated mode (trainer and vLLM share tensors in
+        the same process; updates are visible without explicit sync).
         """
         # No rollout worker (HF sampler) — model shared by reference, nothing to sync.
         if self.rollout_worker is None:
@@ -718,34 +644,60 @@ class Trainer:
         if self.cfg.mode == "colocated":
             return
 
-        # Disaggregated mode: vLLM is on a different GPU, separate model copy.
-        # Need to push updated weights.
-        adapter_path = os.path.join(self.cfg.run_dir, "adapter_sync")
-        if self.cfg.use_lora:
-            os.makedirs(adapter_path, exist_ok=True)
-            if is_main_process():
-                self.model.save_pretrained(adapter_path)
-            barrier()
-            self.rollout_worker.update_lora(adapter_path)
+        # Disaggregated mode: dispatch to the configured backend.
+        if self.cfg.weight_sync_method == "disk":
+            self._sync_weights_disk()
+        elif self.cfg.weight_sync_method == "nccl":
+            self._sync_weights_nccl()
         else:
-            # full FT: in-place NCCL broadcast (TODO)
-            raise NotImplementedError("full FT weight sync not yet implemented")
+            raise ValueError(
+                f"unknown weight_sync_method {self.cfg.weight_sync_method!r}, "
+                f"expected 'disk' or 'nccl'"
+            )
+
+    def _sync_weights_disk(self) -> None:
+        """Disk-based LoRA adapter sync. Rank 0 saves; vLLM reloads via update_lora."""
+        if not self.cfg.use_lora:
+            raise NotImplementedError(
+                "full FT weight sync requires weight_sync_method='nccl'"
+            )
+        adapter_path = os.path.join(self.cfg.run_dir, "adapter_sync")
+        os.makedirs(adapter_path, exist_ok=True)
+        if is_main_process():
+            self.model.save_pretrained(adapter_path)
+        barrier()
+        self.rollout_worker.update_lora(adapter_path)
+
+    def _sync_weights_nccl(self) -> None:
+        """NCCL broadcast from trainer to vLLM worker. Uses state from __init__.
+
+        Receiver runs on a thread so sender can broadcast concurrently — without
+        the thread, the RPC dispatch and the broadcast deadlock. See
+        docs/weight_sync_approaches.md §"Concurrency model".
+        """
+        state = self._nccl_sync_state
+        assert state is not None, (
+            "NCCL sync state not initialized — check Trainer.__init__ for "
+            "the weight_sync_method='nccl' setup block"
+        )
+
+        def _trigger_receiver():
+            self.rollout_worker.update_weights(state["specs"])
+
+        receiver_thread = threading.Thread(target=_trigger_receiver, daemon=True)
+        receiver_thread.start()
+
+        sender_broadcast_loop(
+            self.model,
+            state["specs"],
+            comm=state["comm"],
+            src_rank=0,
+        )
+        receiver_thread.join()
 
     def train(self) -> None:
-        """Outer training loop.
-
-        Structure (this is the part you DON'T need to change):
-          1. Optional SFT warmup
-          2. Baseline eval
-          3. For step in range(num_steps):
-              a. rollout_phase
-              b. train_phase
-              c. sync_weights
-              d. (rank 0) periodic logging via wandb
-              e. (rank 0) periodic eval
-              f. (rank 0) periodic checkpoint
-          4. Final eval
-          5. wandb finish
+        """Main training loop: optional SFT warmup, baseline eval, N steps of
+        (rollout -> train -> sync -> log/eval/ckpt), final eval, cleanup.
         """
         self.maybe_sft_warmup()
 
@@ -774,22 +726,25 @@ class Trainer:
             print(f"Profiler armed: will profile steps {self.profiling_cfg.start_step}-{self.profiling_cfg.end_step}")
 
         # --- Training loop ---
-        self.kl_ema = self.cfg.kl_target
+        self.kl_ema = self.cfg.rl.kl_target
         for step in range(self.cfg.num_steps):
             self.step = step
 
-            with Timer() as step_t:
-                with Timer() as rollout_t:
+            with record_function(f"step_{step}"), Timer() as step_t:
+                with record_function("rollout"), Timer() as rollout_t:
                     # In colocated mode: wake vLLM before rollout, sleep after.
                     # Skip wake_up on step 0 — vLLM starts awake after construction.
                     if self.rollout_worker and self.rollout_worker.colocated and step > 0:
-                        self.rollout_worker.wake_up()
+                        with record_function("vllm_wake_up"):
+                            self.rollout_worker.wake_up()
                     micro_batches = self.rollout_phase()
                     if self.rollout_worker and self.rollout_worker.colocated:
-                        self.rollout_worker.sleep()
-                with Timer() as train_t:
+                        with record_function("vllm_sleep"):
+                            self.rollout_worker.sleep()
+                with record_function("train_phase"), Timer() as train_t:
                     metrics = self.train_phase(micro_batches)
-                self.sync_weights()
+                with record_function("weight_sync"):
+                    self.sync_weights()
 
             self.scheduler.step()
 
@@ -853,7 +808,7 @@ class Trainer:
             if is_main_process():
                 if step % self.cfg.log_interval == 0:
                     self.console.log(step, perf=perf_info, **metrics)
-                    if self.cfg.adaptive_sampling:
+                    if self.cfg.rl.adaptive_sampling:
                         print(f"    alive={self._last_alive_rate:.1%} spread_mean={self._last_spread_mean:.3f} spread_max={self._last_spread_max:.3f}")
                     # Core metrics (flat — wandb top level)
                     log_metrics({
@@ -880,7 +835,7 @@ class Trainer:
                         "reward_dist/advantage_std": metrics["advantage_std"],
                     }, step)
                     # Adaptive sampling (logged even when disabled — 0 values)
-                    if self.cfg.adaptive_sampling:
+                    if self.cfg.rl.adaptive_sampling:
                         log_metrics({
                             "sampling/alive_rate": self._last_alive_rate,
                             "sampling/spread_mean": self._last_spread_mean,
@@ -943,7 +898,7 @@ class Trainer:
 
         os.makedirs(self.cfg.run_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_label = f"{self.cfg.loss_type}_{self.cfg.adv_type}_{self.cfg.num_steps}steps"
+        run_label = f"{self.cfg.rl.loss_type}_{self.cfg.rl.adv_type}_{self.cfg.num_steps}steps"
         stats_path = os.path.join(self.cfg.run_dir, f"stats_{run_label}_{timestamp}.pt")
         torch.save(self.stats, stats_path)
         print(f"\nStats saved to {stats_path}")

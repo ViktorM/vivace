@@ -99,7 +99,6 @@ def sample_responses(
     gen = model.generate(**enc, do_sample=True, max_new_tokens=max_new_tokens,
                          temperature=temperature, top_p=top_p,
                          pad_token_id=tokenizer.eos_token_id)
-
     if was_training:
         model.train()
 

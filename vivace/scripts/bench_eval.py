@@ -85,7 +85,7 @@ def main():
         )
         torch.cuda.synchronize()
         hf_time = time.time() - t0
-        hf_tps = n * hf_metrics["avg_length"] / hf_time if hf_time > 0 else 0
+        hf_tps = n * hf_metrics["avg_length_tokens"] / hf_time if hf_time > 0 else 0
         print(f"{'HF':<10} {n:>6} {hf_time:>10.1f} {hf_tps:>10.0f} {hf_metrics['accuracy_pct']:>9.1f}%")
 
         # vLLM benchmark
@@ -100,7 +100,7 @@ def main():
             )
             torch.cuda.synchronize()
             vllm_time = time.time() - t0
-            vllm_tps = n * vllm_metrics["avg_length"] / vllm_time if vllm_time > 0 else 0
+            vllm_tps = n * vllm_metrics["avg_length_tokens"] / vllm_time if vllm_time > 0 else 0
             speedup = hf_time / vllm_time if vllm_time > 0 else 0
             print(f"{'vLLM':<10} {n:>6} {vllm_time:>10.1f} {vllm_tps:>10.0f} {vllm_metrics['accuracy_pct']:>9.1f}%  ({speedup:.1f}x)")
 
