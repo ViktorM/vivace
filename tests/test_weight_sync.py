@@ -35,9 +35,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--config", required=True, help="path to YAML config (mode must be disaggregated)")
     p.add_argument("--method", choices=["disk", "nccl"], required=True,
                    help="weight sync backend under test — overrides config value")
-    p.add_argument("--perturb-scale", type=float, default=0.1,
+    p.add_argument("--perturb-scale", type=float, default=0.01,
                    help="std of gaussian noise added to trainable params in step 2. "
-                        "Needs to be large enough to shift top-k token agreement below 0.8.")
+                        "Needs to be large enough for step 2 to detect disagreement "
+                        "(top_1_match becomes False), but small enough that step 3 "
+                        "after sync doesn't hit HF↔vLLM implementation numerics "
+                        "(different attn kernels, rotary, RMSNorm) that amplify on "
+                        "ill-conditioned post-perturbation models. 0.01 works for "
+                        "Qwen2.5-0.5B full FT; tune per model/setup.")
     p.add_argument("--test-prompt", type=str, default="The capital of France is",
                    help="prompt used for the forward-pass comparison in verify_weights_match")
     return p.parse_args(argv)

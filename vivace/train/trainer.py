@@ -380,7 +380,7 @@ class Trainer:
                 )
             from vllm.distributed.utils import StatelessProcessGroup
             from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-            from vivace.utils.weight_sync import build_param_specs
+            from vivace.utils.weight_sync import build_param_specs, allocate_fused_buffers
 
             host, port = "localhost", _find_free_port()
             world_size = 2   # 1 trainer + 1 vLLM worker at TP=1; bump when scaling
@@ -425,15 +425,16 @@ class Trainer:
                 raise worker_err[0]
 
             # Full FT: all trainable params. (LoRA path is guarded above.)
-            specs = build_param_specs(self.model)
-
+            specs, fusion_map = build_param_specs(self.model, fuse=True)
+            fused_buffers = allocate_fused_buffers(self.model, specs, self.device)
             self._nccl_sync_state = {
                 "specs": specs,
+                "fusion_map": fusion_map,
+                "fused_buffers": fused_buffers,
                 "comm": trainer_comm,
-                "pg": pg,   # kept alive; Python GC would otherwise drop the TCP store
+                "pg": pg,
             }
             print(f"[trainer init] NCCL weight sync ready: {len(specs)} params")
-
 
         _print_training_info(cfg, self.model, self.trainer_devices, self.rollout_devices)
 
@@ -505,6 +506,12 @@ class Trainer:
                         all_resp_ids.append(list(completion.token_ids))
                         responses.append(completion.text)
 
+                # Record true pre-padding lengths so the trainer can build correct
+                # attention + loss masks. Without this, right-pads get attended to
+                # (pad_id == eos_id) and truncated responses leak one pad into the loss.
+                response_lengths = torch.tensor(
+                    [len(r) for r in all_resp_ids], device=self.device, dtype=torch.long,
+                )
                 max_resp_len = max(len(r) for r in all_resp_ids)
                 # Right-pad responses to uniform length (prompt is already uniform)
                 all_resp_ids = [r + [pad_id] * (max_resp_len - len(r)) for r in all_resp_ids]
@@ -538,10 +545,12 @@ class Trainer:
                 examples = [ex for ex in batch_ex for _ in range(G)]
 
                 with record_function("hf_generate"):
-                    full_ids, responses, plen = sample_responses(self.model, self.tokenizer, prompts,
-                                                                max_new_tokens=rl.max_new_tokens,
-                                                                temperature=rl.temperature, top_p=rl.top_p,
-                                                                device=str(self.device))
+                    full_ids, responses, plen, response_lengths = sample_responses(
+                        self.model, self.tokenizer, prompts,
+                        max_new_tokens=rl.max_new_tokens,
+                        temperature=rl.temperature, top_p=rl.top_p,
+                        device=str(self.device),
+                    )
                 torch.cuda.empty_cache()
 
 
@@ -567,6 +576,8 @@ class Trainer:
                 full_ids = full_ids[keep]
                 rewards = rewards[keep]
                 responses = [responses[k] for k in keep]
+                if response_lengths is not None:
+                    response_lengths = response_lengths[keep]
 
             with record_function("advantages"):
                 adv = compute_advantages(rewards.view(B, G), self.rl_cfg)
@@ -577,6 +588,7 @@ class Trainer:
                     old_logp, mask, _ = compute_token_logprobs(
                         self.compiled_model, full_ids, plen, rl.temperature,
                         pad_token_id=self.tokenizer.pad_token_id,
+                        response_lengths=response_lengths,
                     )
                     self.compiled_model.train()
 
@@ -585,6 +597,7 @@ class Trainer:
                         ref_logp, _, _ = compute_token_logprobs(
                             self.compiled_ref, full_ids, plen, rl.temperature,
                             pad_token_id=self.tokenizer.pad_token_id,
+                            response_lengths=response_lengths,
                         )
                     else:
                         # LoRA: disable adapter to forward through base weights
@@ -593,6 +606,7 @@ class Trainer:
                             ref_logp, _, _ = compute_token_logprobs(
                                 self.compiled_model, full_ids, plen, rl.temperature,
                                 pad_token_id=self.tokenizer.pad_token_id,
+                                response_lengths=response_lengths,
                             )
                             self.compiled_model.train()
 
@@ -602,6 +616,7 @@ class Trainer:
                 "token_count": mask.sum(dim=1).clamp(min=1.0),
                 "responses": responses, "rewards": rewards,
                 "pad_token_id": self.tokenizer.pad_token_id,
+                "response_lengths": response_lengths,
             })
         # Store adaptive sampling stats for logging
         self._last_alive_rate = float(np.mean(alive_rates_step)) if alive_rates_step else 0.0
@@ -692,6 +707,8 @@ class Trainer:
             state["specs"],
             comm=state["comm"],
             src_rank=0,
+            fusion_map=state["fusion_map"],
+            fused_buffers=state["fused_buffers"],
         )
         receiver_thread.join()
 

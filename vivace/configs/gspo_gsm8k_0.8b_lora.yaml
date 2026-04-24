@@ -25,14 +25,14 @@ checkpoint_interval: 100
 run_dir: runs/gspo_gsm8k_0.8b_lora
 seed: 42
 rl:
-  lr: 2.0e-05
-  batch_size: 1
-  grad_clip: 1.0
   loss_type: gspo
   adv_type: rloo
+  batch_size: 1
   group_size: 6
+  lr: 2.0e-05
   grad_accum_steps: 4
   optim_epochs: 2
+  grad_clip: 1.0
   max_new_tokens: 192
   temperature: 0.9
   top_p: 0.95

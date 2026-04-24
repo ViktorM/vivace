@@ -23,13 +23,18 @@ def sample_responses(
     temperature: float,
     top_p: float,
     device: str = "cuda",
-) -> tuple[torch.Tensor, list[str], int]:
+) -> tuple[torch.Tensor, list[str], int, torch.Tensor]:
     """Batched HF sampling. Generates one response per entry in `prompts`.
 
     Returns:
-        full_ids: [B, prompt_len + response_len] (LEFT-PADDED prompt + response)
+        full_ids: [B, prompt_len + response_len] (LEFT-PADDED prompt + right-padded response)
         response_strings: list of decoded response strings (length B)
         prompt_len: int — the padded prompt length so the trainer can split
+        response_lengths: [B] long tensor — true per-sample response length
+            BEFORE right-padding. Includes the EOS token when present; equals
+            max_new_tokens for sequences that didn't emit EOS. The trainer
+            uses this to build correct attention + loss masks (pad_id == eos_id
+            means we can't tell right-pads from real EOS by token value alone).
 
     BATCHING NOTE
     -------------
@@ -76,24 +81,10 @@ def sample_responses(
       uses prompt_len to slice them apart for log-prob recomputation.
     - Don't run this under torch.compile — generate() and torch.compile
       don't get along.
-
-    HINTS
-    -----
-    - enc = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
-    - plen = enc["input_ids"].shape[1]
-    - was_training = model.training
-    - model.eval()
-    - gen = model.generate(**enc, do_sample=True, max_new_tokens=max_new_tokens,
-                           temperature=temperature, top_p=top_p,
-                           pad_token_id=tokenizer.eos_token_id)
-    - if was_training: model.train()
-    - responses = tokenizer.batch_decode(gen[:, plen:], skip_special_tokens=True)
-    - return gen, responses, plen
-
     """
     enc = tokenizer(prompts, return_tensors="pt", padding=True).to(device) # dict
     plen = enc["input_ids"].shape[1]
-    
+
     was_training = model.training
     model.eval()
     gen = model.generate(**enc, do_sample=True, max_new_tokens=max_new_tokens,
@@ -102,6 +93,19 @@ def sample_responses(
     if was_training:
         model.train()
 
-    responses = tokenizer.batch_decode(gen[:, plen:], skip_special_tokens=True)
+    # Response portion (may contain right-pads for samples that emitted EOS
+    # before others in the batch — generate() fills with pad_token_id=eos).
+    resp_ids = gen[:, plen:]  # [B, R]
+    eos_id = tokenizer.eos_token_id
+    R = resp_ids.shape[1]
 
-    return gen, responses, plen
+    # True response length = index of first EOS + 1 (include EOS); if no EOS,
+    # the whole response is real (hit max_new_tokens without stopping).
+    is_eos = (resp_ids == eos_id)
+    any_eos = is_eos.any(dim=1)
+    first_eos = is_eos.int().argmax(dim=1)   # 0 when no EOS; gated by any_eos below
+    response_lengths = torch.where(any_eos, first_eos + 1, torch.full_like(first_eos, R))
+
+    responses = tokenizer.batch_decode(resp_ids, skip_special_tokens=True)
+
+    return gen, responses, plen, response_lengths

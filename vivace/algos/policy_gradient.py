@@ -83,20 +83,22 @@ def compute_advantages(rewards: torch.Tensor, cfg: RLConfig) -> torch.Tensor:
       is what most papers report.
     - Always .detach() the result. Advantages must NOT carry gradients.
     """
-    B, G = cfg.batch_size, cfg.group_size
-    rg = rewards.view(B, G)
+    G = cfg.group_size
+    rg = rewards.view(-1, G)   # infer batch from total, robust to adaptive filtering
 
     if cfg.adv_type == "rloo":
+        if G < 2:
+            raise ValueError(f"RLOO requires group_size >= 2 (leave-one-out), got {G}")
         baseline = (rg.sum(dim=1, keepdim=True) - rg) / (G - 1)
         adv = rg - baseline
     elif cfg.adv_type == "dr_grpo":
         adv = rg - rg.mean(dim=1, keepdim=True)
     elif cfg.adv_type == "grpo":
-        adv = (rg - rg.mean(dim=1, keepdim=True)) / (rg.std(dim=1, keepdim=True) + cfg.adv_eps)
+        adv = (rg - rg.mean(dim=1, keepdim=True)) / (rg.std(dim=1, keepdim=True, unbiased=False) + cfg.adv_eps)
     else:
-        ValueError(f"Wrong adv type in config: {cfg.adv_type}")
+        raise ValueError(f"unknown adv_type {cfg.adv_type!r}, expected grpo | dr_grpo | rloo")
 
-    return adv.view(-1).detach() # (B * G)
+    return adv.view(-1).detach()
 
 
 # =============================================================================
@@ -111,6 +113,7 @@ def compute_token_logprobs(
     pad_token_id: int | None = None,
     stop_token_id: int | None = None,
     padding_side: str = "left",
+    response_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Forward pass + per-token log-prob extraction + response mask.
 
@@ -197,26 +200,51 @@ def compute_token_logprobs(
     - For entropy: probs = log_probs.exp(); entropy = -(probs * log_probs).sum(dim=-1)
 
     """
-    attention_mask = torch.ones_like(full_ids) # (B, S)
-    if padding_side == "left":
-        is_pad = full_ids == pad_token_id
-        attention_mask = 1 - is_pad.cumprod(dim=-1).long()
+    if padding_side != "left":
+        raise ValueError(f"unknown padding {padding_side!r}, only left padding is supported at the moment")
+
+    B, S = full_ids.shape
+    device = full_ids.device
+
+    # Attention mask: 1 at real tokens (left-unpadded prompt + first resp_len response tokens).
+    # Strips BOTH leading left-pads AND trailing right-pads. Without response_lengths
+    # we can't distinguish right-pads from real EOS tokens (pad_id == eos_id commonly),
+    # so we fall back to the left-pad-only cumprod trick.
+    is_pad = full_ids == pad_token_id
+    left_pad_mask = 1 - is_pad.cumprod(dim=-1).long()  # 1 after first non-pad
+    if response_lengths is not None:
+        resp_lens = response_lengths.to(device).long().unsqueeze(1)  # (B, 1)
+        pos = torch.arange(S, device=device).unsqueeze(0)             # (1, S)
+        within_content = pos < (prompt_len + resp_lens)                # True for prompt + real response
+        attention_mask = (left_pad_mask.bool() & within_content).long()
     else:
-        raise ValueError(f"unknown padding {padding_side}, only left padding is supported at the moment")
+        attention_mask = left_pad_mask
 
-    logits = model(full_ids, attention_mask=attention_mask).logits[:, :-1, :] / temperature # (B, S-1, V)
-    targets = full_ids[:, 1:] # (B, S-1)
+    logits = model(full_ids, attention_mask=attention_mask).logits[:, :-1, :] / temperature  # (B, S-1, V)
+    targets = full_ids[:, 1:]  # (B, S-1)
 
-    log_probs = F.log_softmax(logits.float(), dim=-1) # (B, S-1, V)
+    log_probs = F.log_softmax(logits.float(), dim=-1)  # (B, S-1, V)
     token_log_prob = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
-    stop_id = stop_token_id if stop_token_id else pad_token_id
-    mask = torch.zeros_like(token_log_prob)
+    # Loss mask: which target positions count toward PG/KL.
+    # Targets are shifted by 1 — target index t corresponds to full_ids[t+1].
+    # Response target range (inclusive): [prompt_len-1, prompt_len-1 + resp_len - 1].
     start = max(prompt_len - 1, 0)
-    is_eos = targets == stop_id # (B, S-1)
-    is_eos[:, :start] = False
-    no_prior_eos = (is_eos[:, start:].cumsum(dim=-1) - is_eos[:, start:].long()) == 0
-    mask[:, start:] = no_prior_eos.float()
+    mask = torch.zeros_like(token_log_prob)
+    if response_lengths is not None:
+        resp_lens = response_lengths.to(device).long().unsqueeze(1)            # (B, 1)
+        pos = torch.arange(S - 1, device=device).unsqueeze(0)                   # (1, S-1)
+        in_response = (pos >= start) & (pos < start + resp_lens)
+        mask = in_response.float()
+    else:
+        # Fallback: stop-token heuristic. Correct when EOS genuinely terminates the
+        # sequence; off-by-one (includes first right-pad) for max_tokens-truncated
+        # sequences where pad_id == eos_id. Prefer passing response_lengths.
+        stop_id = stop_token_id if stop_token_id else pad_token_id
+        is_eos = targets == stop_id  # (B, S-1)
+        is_eos[:, :start] = False
+        no_prior_eos = (is_eos[:, start:].cumsum(dim=-1) - is_eos[:, start:].long()) == 0
+        mask[:, start:] = no_prior_eos.float()
 
     entropy = None
     if return_entropy:
@@ -404,14 +432,14 @@ def compute_loss(
             per_seq = (obj * mask).sum(dim=1) / token_count
             loss = -per_seq.mean()
         elif cfg.loss_type == "dr_grpo":
-            per_seq = (obj * mask).sum(dim=1) / cfg.max_token_count
+            per_seq = (obj * mask).sum(dim=1) / cfg.max_new_tokens
             loss = -per_seq.mean()
         elif cfg.loss_type == "cispo":
-            raise NotImplemented
+            raise NotImplementedError("cispo loss not yet implemented")
         elif cfg.loss_type == "dg":
-            raise NotImplemented
+            raise NotImplementedError("dg loss not yet implemented")
         elif cfg.loss_type == "dg_cispo":
-            raise NotImplemented
+            raise NotImplementedError("dg_cispo loss not yet implemented")
         else:
             raise ValueError(f"unknown loss: {cfg.loss_type!r}")
 
@@ -498,6 +526,7 @@ def rl_step(
                 return_entropy=last,
                 pad_token_id=mb.get("pad_token_id"),
                 stop_token_id=mb.get("stop_token_id"),
+                response_lengths=mb.get("response_lengths"),
             )
             kl = compute_kl(policy_logp, mb["ref_logp"], mb["mask"])
             pg_loss = compute_loss(

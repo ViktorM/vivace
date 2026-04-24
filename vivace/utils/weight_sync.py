@@ -70,26 +70,73 @@ class ParamSpec:
     shape: tuple[int, ...]
     dtype: torch.dtype
 
+# Fusion rules for trainer→vLLM name mapping. Suffix-based so they match
+# any layer prefix (model.layers.{i}.self_attn.q_proj, etc.).
+FUSION_GROUPS = [
+    # (component_suffixes, fused_suffix)
+    (("q_proj", "k_proj", "v_proj"), "qkv_proj"),
+    (("gate_proj", "up_proj"),       "gate_up_proj"),
+]
 
-def build_param_specs(model: nn.Module, filter_fn=None) -> list[ParamSpec]:
+
+def build_param_specs(model: nn.Module, filter_fn=None, fuse=True) -> list[ParamSpec]:
     """Build a sorted list of ParamSpec. `filter_fn(name, p) -> bool` to keep
     only a subset (e.g. LoRA). Sort is what guarantees sender/receiver order match.
     """
     base = unwrap_model(model)
+    named = dict(base.named_parameters())
+
     specs = []
-    for name, p in base.named_parameters():
-        if filter_fn is not None and not filter_fn(name, p):
-            continue
-        specs.append(ParamSpec(name=name, shape=tuple(p.shape), dtype=p.dtype))
+    fusion_map = {}
+    if fuse:
+        # Fusion is applied to trainable tensors unconditionally — filter_fn
+        # is deliberately NOT consulted here to keep groups all-or-nothing.
+        # (If you later want filtered fusion, build a filter-aware version.)
+        consumed = set()
+        for comps, fused in FUSION_GROUPS:
+            # Iterate both suffixes so qkv_proj.bias gets fused when present
+            # (Qwen2.5 has bias on q/k/v). gate/up have bias=False in the same
+            # family, so the `all-members-present` check below skips them.
+            for suffix in ("weight", "bias"):
+                for name in named:
+                    if not name.endswith(f".{comps[0]}.{suffix}"):
+                        continue
+
+                    prefix = name[: -len(f".{comps[0]}.{suffix}")]
+                    member_names = [f"{prefix}.{c}.{suffix}" for c in comps]
+
+                    if not all(n in named for n in member_names):
+                        continue  # partial group (e.g. no bias) — skip cleanly
+
+                    fused_name = f"{prefix}.{fused}.{suffix}"
+                    shapes = [named[n].shape for n in member_names]
+                    # dim 0 is out-features for .weight ([h_out, h_in]) and the
+                    # only dim for .bias ([h_out]); concat along dim 0 in both cases.
+                    fused_shape = (sum(s[0] for s in shapes), *shapes[0][1:])
+                    specs.append(ParamSpec(name=fused_name, shape=fused_shape,
+                                            dtype=named[member_names[0]].dtype))
+                    fusion_map[fused_name] = member_names
+                    consumed.update(member_names)
+
+        # Everything that wasn't consumed goes through as-is.
+        for name, p in base.named_parameters():
+            if filter_fn is not None and not filter_fn(name, p):
+                continue
+
+            if name not in consumed:
+                specs.append(ParamSpec(name=name, shape=tuple(p.shape), dtype=p.dtype))
+    else:
+        for name, p in base.named_parameters():
+            if filter_fn is not None and not filter_fn(name, p):
+                continue
+            specs.append(ParamSpec(name=name, shape=tuple(p.shape), dtype=p.dtype))
     specs.sort(key=lambda s: s.name)
-    return specs
+
+    return specs, fusion_map
 
 
 def allocate_fused_buffers(model, specs, device):
     """Pre-allocate persistent buffers for QKV/gate_up fusion. Call once at startup.
-
-    TODO: fusion logic (sender-side cat into these buffers) not wired yet;
-    needed for full FT sync. LoRA-only sync doesn't use this.
     """
     fused = {}
     for spec in specs:
@@ -108,6 +155,8 @@ def sender_broadcast_loop(
     specs: list[ParamSpec],
     comm,
     src_rank: int = 0,
+    fusion_map=None,
+    fused_buffers=None
 ) -> None:
     """Trainer-side NCCL broadcast over `comm` (PyNcclCommunicator).
 
@@ -119,10 +168,15 @@ def sender_broadcast_loop(
     named = dict(base.named_parameters())
 
     for spec in specs:
-        tensor = named[spec.name]
-        assert tensor.shape == spec.shape, f"{spec.name}: shape mismatch"
-        assert tensor.dtype == spec.dtype, f"{spec.name}: dtype mismatch"
-        comm.broadcast(tensor.data, src=src_rank)
+        if fusion_map and spec.name in fusion_map:
+            # Fused spec: cat components into preallocated buffer.
+            # Use .data views — trainer params have requires_grad=True, and
+            # torch.cat(out=...) refuses autograd-tracked inputs.
+            components = [named[n].data for n in fusion_map[spec.name]]
+            torch.cat(components, dim=0, out=fused_buffers[spec.name])
+            comm.broadcast(fused_buffers[spec.name], src=src_rank)
+        else:
+            comm.broadcast(named[spec.name].data, src=src_rank)
 
     torch.cuda.synchronize()
 
