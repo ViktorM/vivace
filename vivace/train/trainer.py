@@ -298,11 +298,18 @@ class Trainer:
             self.compiled_ref = None  # LoRA: use compiled_model with disable_adapter()
 
         if cfg.use_vllm:
+            # vLLM only needs Punica (enable_lora=True) when we're pushing LoRA
+            # adapters to it via LoRARequest (disk path). For NCCL sync with LoRA
+            # we merge on the trainer and broadcast merged base weights — vLLM
+            # runs pure base generation, and enable_lora=True would re-parent
+            # its linear weights under `.base_layer.weight`, breaking name
+            # matching in the NCCL broadcast loop.
+            vllm_enable_lora = cfg.use_lora and cfg.weight_sync_method == "disk"
             self.rollout_worker = VLLMRolloutWorker(
                 model_name=cfg.model_name,
                 gpu_ids=cfg.rollout_gpus,
                 gpu_memory_utilization=cfg.gpu_memory_utilization,
-                enable_lora=cfg.use_lora,
+                enable_lora=vllm_enable_lora,
                 colocated=(cfg.mode == "colocated"),
                 enforce_eager=cfg.enforce_eager,
             )
@@ -366,18 +373,6 @@ class Trainer:
         # See docs/training_theory.md and docs/weight_sync_approaches.md.
         self._nccl_sync_state = None
         if cfg.weight_sync_method == "nccl" and cfg.mode == "disaggregated":
-            if cfg.use_lora:
-                # LoRA A/B matrices live in vLLM's PunicaWrapper, not in the
-                # base model's named_parameters(). NCCL broadcast can't reach
-                # them without vLLM-internals hooks. Use disk sync for LoRA.
-                raise NotImplementedError(
-                    "weight_sync_method='nccl' with use_lora=True is not supported. "
-                    "vLLM stores LoRA adapters in its PunicaWrapper, not in the base "
-                    "model's named_parameters, so NCCL broadcast can't target them. "
-                    "Use weight_sync_method='disk' for LoRA training — it's fast "
-                    "enough (~300ms) and hits vLLM's LoRARequest API directly. "
-                    "NCCL sync is designed for full FT (use_lora=False)."
-                )
             from vllm.distributed.utils import StatelessProcessGroup
             from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
             from vivace.utils.weight_sync import build_param_specs, allocate_fused_buffers
@@ -553,7 +548,6 @@ class Trainer:
                     )
                 torch.cuda.empty_cache()
 
-
             # Compute rewards for ALL responses (needed for adaptive sampling spread)
             # reward_fn takes (response, Example) — full example available for
             # problem-aware rewards (e.g. bonus for using numbers from the problem)
@@ -696,21 +690,31 @@ class Trainer:
             "the weight_sync_method='nccl' setup block"
         )
 
-        def _trigger_receiver():
-            self.rollout_worker.update_weights(state["specs"])
+        # For LoRA: fold A @ B into base so `named_parameters()` yields the full
+        # current policy. Must unmerge in `finally` — if broadcast raises and we
+        # skip unmerge, the next training step treats merged weights as base
+        # and applies the adapter a second time on top.
+        if self.cfg.use_lora:
+            self.model.merge_adapter()
+        try:
+            def _trigger_receiver():
+                self.rollout_worker.update_weights(state["specs"])
 
-        receiver_thread = threading.Thread(target=_trigger_receiver, daemon=True)
-        receiver_thread.start()
+            receiver_thread = threading.Thread(target=_trigger_receiver, daemon=True)
+            receiver_thread.start()
 
-        sender_broadcast_loop(
-            self.model,
-            state["specs"],
-            comm=state["comm"],
-            src_rank=0,
-            fusion_map=state["fusion_map"],
-            fused_buffers=state["fused_buffers"],
-        )
-        receiver_thread.join()
+            sender_broadcast_loop(
+                self.model,
+                state["specs"],
+                comm=state["comm"],
+                src_rank=0,
+                fusion_map=state["fusion_map"],
+                fused_buffers=state["fused_buffers"],
+            )
+            receiver_thread.join()
+        finally:
+            if self.cfg.use_lora:
+                self.model.unmerge_adapter()
 
     def train(self) -> None:
         """Main training loop: optional SFT warmup, baseline eval, N steps of

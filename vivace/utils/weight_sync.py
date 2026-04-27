@@ -42,6 +42,41 @@ def strip_wrapper_prefixes(name: str) -> str:
     return name
 
 
+# peft LoRA adapter names (A/B for linear, A/B for embedding, DoRA magnitude).
+# When merge_adapter() has folded these into base_layer.weight, we don't broadcast
+# them — they'd have no matching tensor on vLLM's enable_lora=False side.
+_LORA_ADAPTER_TAGS = (
+    ".lora_A.",
+    ".lora_B.",
+    ".lora_embedding_A.",
+    ".lora_embedding_B.",
+    ".lora_magnitude_vector.",
+)
+
+
+def _is_lora_adapter_param(name: str) -> bool:
+    return any(tag in name for tag in _LORA_ADAPTER_TAGS)
+
+
+def canonical_named_parameters(model: nn.Module):
+    """Yield (canonical_name, parameter) from a possibly-peft-wrapped model.
+
+    peft applies LoRA by replacing target modules with LoraLinear wrappers, so
+    `q_proj` becomes a wrapper holding `base_layer` (the original Linear) plus
+    `lora_A`/`lora_B`. `named_parameters()` then yields names like
+    `...q_proj.base_layer.weight` for the base, plus the adapter params.
+
+    For NCCL sync after `merge_adapter()`:
+      - Strip `.base_layer.` so the name matches vLLM's plain HF naming.
+      - Drop adapter params — their effect is in base_layer.weight already.
+    """
+    base = unwrap_model(model)
+    for name, p in base.named_parameters():
+        if _is_lora_adapter_param(name):
+            continue
+        yield name.replace(".base_layer.", "."), p
+
+
 class BufferPool:
     """Reusable CUDA buffers keyed by (shape, dtype). Reuse across broadcasts —
     allocating per-param per-step would be slower than the disk-sync baseline.
@@ -82,9 +117,13 @@ FUSION_GROUPS = [
 def build_param_specs(model: nn.Module, filter_fn=None, fuse=True) -> list[ParamSpec]:
     """Build a sorted list of ParamSpec. `filter_fn(name, p) -> bool` to keep
     only a subset (e.g. LoRA). Sort is what guarantees sender/receiver order match.
+
+    Names are canonical HF names (peft `.base_layer.` segments stripped, LoRA
+    adapter params skipped). For NCCL sync of LoRA models, callers must call
+    `merge_adapter()` before broadcasting so that the canonical-named tensors
+    contain the merged base+LoRA values.
     """
-    base = unwrap_model(model)
-    named = dict(base.named_parameters())
+    named = dict(canonical_named_parameters(model))
 
     specs = []
     fusion_map = {}
@@ -119,14 +158,14 @@ def build_param_specs(model: nn.Module, filter_fn=None, fuse=True) -> list[Param
                     consumed.update(member_names)
 
         # Everything that wasn't consumed goes through as-is.
-        for name, p in base.named_parameters():
+        for name, p in named.items():
             if filter_fn is not None and not filter_fn(name, p):
                 continue
 
             if name not in consumed:
                 specs.append(ParamSpec(name=name, shape=tuple(p.shape), dtype=p.dtype))
     else:
-        for name, p in base.named_parameters():
+        for name, p in named.items():
             if filter_fn is not None and not filter_fn(name, p):
                 continue
             specs.append(ParamSpec(name=name, shape=tuple(p.shape), dtype=p.dtype))
@@ -164,8 +203,11 @@ def sender_broadcast_loop(
     is a rendezvous. `specs` is the contract: sender + receiver iterate in the
     same order, or they deadlock / misroute tensors.
     """
-    base = unwrap_model(model)
-    named = dict(base.named_parameters())
+    # Canonical names match what's in `specs` and `fusion_map` (peft `.base_layer.`
+    # stripped, LoRA adapter params dropped). For LoRA + NCCL, the caller has
+    # already merge_adapter()'d so the canonical-named base tensors hold the
+    # merged base+LoRA values.
+    named = dict(canonical_named_parameters(model))
 
     for spec in specs:
         if fusion_map and spec.name in fusion_map:
