@@ -178,18 +178,20 @@ def compute_token_logprobs(
     - With LEFT-PADDING (the default in HF tokenizer for generation), the
       attention mask must be 1 - cumprod(is_pad). With right-padding, it's
       different. This codebase uses left-padding throughout — stick with it.
-    - Cast logits to .float() before log_softmax for numerical stability
-      with bf16 forward.
+    - log_softmax runs in bf16 to match the rest of the pipeline (model
+      forward, vLLM, gradients). Saves ~Vx memory on the [B, S-1, V] tensor
+      and avoids an extra cast vs. fp32. Importance ratios and KL still
+      reduce in fp32 downstream where it matters.
     - The entropy computation re-uses log_probs — compute probs as
-      log_probs.exp() (reuses the stable fp32 log_softmax result; no
-      precision loss vs a separate F.softmax call, and no redundant work).
+      log_probs.exp() (no redundant softmax) and cast the [B, S-1] reduction
+      to fp32 for stable accumulation across the vocab dim.
 
     HINTS
     -----
     - Build attention_mask from pad_token_id (for the forward pass).
     - logits = model(full_ids, attention_mask=...).logits[:, :-1, :] / temperature
     - targets = full_ids[:, 1:]
-    - log_probs = F.log_softmax(logits.float(), dim=-1)
+    - log_probs = F.log_softmax(logits, dim=-1)   # bf16
     - token_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     - For the RESPONSE MASK, use stop_token_id (not pad_token_id):
         stop_id = stop_token_id if stop_token_id is not None else pad_token_id
@@ -223,7 +225,7 @@ def compute_token_logprobs(
     logits = model(full_ids, attention_mask=attention_mask).logits[:, :-1, :] / temperature  # (B, S-1, V)
     targets = full_ids[:, 1:]  # (B, S-1)
 
-    log_probs = F.log_softmax(logits.float(), dim=-1)  # (B, S-1, V)
+    log_probs = F.log_softmax(logits, dim=-1)  # (B, S-1, V)
     token_log_prob = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
 
     # Loss mask: which target positions count toward PG/KL.
@@ -235,7 +237,7 @@ def compute_token_logprobs(
         resp_lens = response_lengths.to(device).long().unsqueeze(1)            # (B, 1)
         pos = torch.arange(S - 1, device=device).unsqueeze(0)                   # (1, S-1)
         in_response = (pos >= start) & (pos < start + resp_lens)
-        mask = in_response.float()
+        mask = in_response
     else:
         # Fallback: stop-token heuristic. Correct when EOS genuinely terminates the
         # sequence; off-by-one (includes first right-pad) for max_tokens-truncated
@@ -248,8 +250,7 @@ def compute_token_logprobs(
 
     entropy = None
     if return_entropy:
-        probs = log_probs.exp()
-        entropy = - (probs * log_probs).sum(dim=-1)
+        entropy = -(log_probs.exp() * log_probs).sum(dim=-1).float()
 
     return token_log_prob, mask, entropy
 
