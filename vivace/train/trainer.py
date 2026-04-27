@@ -121,9 +121,11 @@ class TrainerConfig:
     profiling: dict | None = None    # maps to ProfilingConfig; None = disabled
 
     # ----- weight sync -----
-    # "disk": save adapter to disk, vLLM reloads via LoRARequest (simple, slow, works today)
-    # "nccl": direct GPU->GPU broadcast via vLLM collective_rpc (fast, scaffold in weight_sync.py)
-    weight_sync_method: str = "disk"
+    # "nccl": direct GPU->GPU broadcast via vLLM collective_rpc (default, fast).
+    #         Works for full FT and LoRA (LoRA via merge-broadcast-unmerge).
+    # "disk": LoRA adapter save + vLLM LoRARequest reload (simple, slower, kept
+    #         as a fallback for debugging and as a reference path).
+    weight_sync_method: str = "nccl"
 
     # ----- misc -----
     seed: int = 42

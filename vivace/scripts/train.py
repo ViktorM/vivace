@@ -59,6 +59,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--num-steps", type=int, default=None, help="override TrainerConfig.num_steps")
     p.add_argument("--run-dir", type=str, default=None, help="override TrainerConfig.run_dir")
     p.add_argument("--seed", type=int, default=None, help="override TrainerConfig.seed")
+    p.add_argument("--weight-sync-method", choices=["disk", "nccl"], default=None,
+                   help="override TrainerConfig.weight_sync_method (disk | nccl)")
     return p.parse_args(argv)
 
 
@@ -73,6 +75,8 @@ def main(argv: list[str] | None = None) -> None:
         cfg_dict["run_dir"] = args.run_dir
     if args.seed is not None:
         cfg_dict["seed"] = args.seed
+    if args.weight_sync_method is not None:
+        cfg_dict["weight_sync_method"] = args.weight_sync_method
 
     _maybe_enable_vllm_callable_rpc(cfg_dict)
 

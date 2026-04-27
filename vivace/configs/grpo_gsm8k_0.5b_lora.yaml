@@ -25,6 +25,7 @@ log_interval: 1
 eval_interval: 50
 checkpoint_interval: 100
 run_dir: runs/grpo_gsm8k_0.5b_lora
+weight_sync_method: disk
 seed: 42
 rl:
   loss_type: gspo
