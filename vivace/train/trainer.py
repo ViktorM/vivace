@@ -467,35 +467,46 @@ class Trainer:
         rl = self.cfg.rl
         B, G = rl.batch_size, rl.group_size
 
+        n_prompts_per_mb = int(rl.oversample_factor * B) if rl.adaptive_sampling else B
+        n_prompts = n_prompts_per_mb * rl.grad_accum_steps # generate all prompts at once
+        idxs = np.random.choice(len(self.train_data), size=n_prompts, replace=False)
+
+        batch_ex_all = [self.train_data[i] for i in idxs]
+
+        if self.rollout_worker is not None:
+            # --- vLLM path ---
+            # 1. Build unique_prompts (B, no G-repeat — vLLM handles n=G internally)
+            unique_prompts = [self.env.format_prompt(ex) for ex in batch_ex_all]
+
+            # 2. Tokenize with HF tokenizer for consistent token IDs
+            prompt_enc = self.tokenizer(unique_prompts, return_tensors="pt", padding=True)
+            prompt_ids_batch_all = prompt_enc.input_ids.tolist()
+            plen = prompt_enc.input_ids.shape[1]
+
+            # 3. Generate via the worker (handles lora_request, tqdm, etc.)
+            with record_function("vllm_generate"):
+                vllm_outputs_all, _ = self.rollout_worker.generate(
+                    prompt_token_ids=prompt_ids_batch_all,
+                    temperature=rl.temperature, top_p=rl.top_p,
+                    max_tokens=rl.max_new_tokens, n=G,
+                )
+
+        pad_id = self.tokenizer.pad_token_id
+
         # {full_ids, plen, adv, old_logp, ref_logp, mask, token_count, responses, rewards}
         for i in range(rl.grad_accum_steps):
-            n_prompts = int(rl.oversample_factor * B) if rl.adaptive_sampling else B
 
-            idxs = np.random.choice(len(self.train_data), size=n_prompts, replace=False)
-            batch_ex = [self.train_data[i] for i in idxs]
+            start, end = i * n_prompts_per_mb, (i + 1) * n_prompts_per_mb
+            batch_ex = batch_ex_all[start : end]
+            vllm_outputs = vllm_outputs_all[start : end]
+            prompt_ids_batch = prompt_ids_batch_all[start : end]
 
             if self.rollout_worker is not None:
-                # --- vLLM path ---
-                # 1. Build unique_prompts (B, no G-repeat — vLLM handles n=G internally)
-                unique_prompts = [self.env.format_prompt(ex) for ex in batch_ex]
-
-                # 2. Tokenize with HF tokenizer for consistent token IDs
-                prompt_enc = self.tokenizer(unique_prompts, return_tensors="pt", padding=True)
-                prompt_ids_batch = prompt_enc.input_ids.tolist()
-                plen = prompt_enc.input_ids.shape[1]
-
-                # 3. Generate via the worker (handles lora_request, tqdm, etc.)
-                with record_function("vllm_generate"):
-                    vllm_outputs, _ = self.rollout_worker.generate(
-                        prompt_token_ids=prompt_ids_batch,
-                        temperature=rl.temperature, top_p=rl.top_p,
-                        max_tokens=rl.max_new_tokens, n=G,
-                    )
 
                 # 4. Build full_ids + responses from vLLM output.
                 # Pad all responses to the same length so plen works as a
                 # single int (same structure as HF generate output).
-                pad_id = self.tokenizer.pad_token_id
+                
                 all_resp_ids = []
                 responses = []
                 for req_output in vllm_outputs:
@@ -560,12 +571,12 @@ class Trainer:
                 )
 
             if rl.adaptive_sampling:
-                rg = rewards.view(n_prompts, G)
+                rg = rewards.view(n_prompts_per_mb, G)
                 spread = rg.max(dim=1).values - rg.min(dim=1).values
                 top_idx = spread.argsort(descending=True)[:B]
 
                 alive_count = (spread > rl.min_reward_spread).sum().item()
-                alive_rates_step.append(alive_count / n_prompts)
+                alive_rates_step.append(alive_count / n_prompts_per_mb)
                 spread_step.append((spread.mean().item(), spread.max().item()))
 
                 keep = [j for idx in top_idx for j in range(idx * G, (idx + 1) * G)]
@@ -781,7 +792,8 @@ class Trainer:
                     prof = None  # done profiling, no further overhead
 
             # --- Log everything in one stats.log() call ---
-            rollout_tokens = int(sum(mb["mask"].sum().item() for mb in micro_batches))
+            with record_function("rollout_token_count"):
+                rollout_tokens = int(sum(mb["mask"].sum().item() for mb in micro_batches))
             rollout_samples = int(sum(mb["mask"].shape[0] for mb in micro_batches))
             cur_lr = self.optimizer.param_groups[0]["lr"]
 

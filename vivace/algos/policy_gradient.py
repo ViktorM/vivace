@@ -45,6 +45,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
+from torch.profiler import record_function
 
 from vivace.algos.types import RLConfig
 
@@ -576,28 +577,31 @@ def rl_step(
 
     # Build the full metrics dict — returned to the trainer, which is the
     # single place that calls stats.log() (avoids double-entry in stats.steps).
-    metrics = {
-        # Core
-        "loss": (tot_pg / n + cfg.kl_coef * tot_kl / n).item(),
-        "reward": all_rewards.mean().item(),
-        "kl": (tot_kl / n).item(),
-        "clip_frac": (tot_clip / tot_tok).item() if tot_tok > 0 else 0.0,
-        "grad_norm": grad_norm.item(),
-        "entropy": (tot_ent / n).item(),
-        # Lengths
-        "length_mean": all_token_counts.mean().item(),
-        "length_std": all_token_counts.std().item() if len(all_token_counts) > 1 else 0.0,
-        "length_max": all_token_counts.max().item(),
-        "length_min": all_token_counts.min().item(),
-        # Reward distribution
-        "reward_std": all_rewards.std().item() if len(all_rewards) > 1 else 0.0,
-        "reward_max": all_rewards.max().item(),
-        "reward_min": all_rewards.min().item(),
-        # Advantage signal
-        "advantage_std": all_advantages.std().item() if len(all_advantages) > 1 else 0.0,
-        # Format rate
-        "format_rate": fmt_ok / len(all_responses) if all_responses else 0.0,
-    }
+    # Wrapped: the first .item() forces a sync waiting for backward+optim,
+    # so this block dominates cudaDeviceSynchronize attribution.
+    with record_function("metrics_dict"):
+        metrics = {
+            # Core
+            "loss": (tot_pg / n + cfg.kl_coef * tot_kl / n).item(),
+            "reward": all_rewards.mean().item(),
+            "kl": (tot_kl / n).item(),
+            "clip_frac": (tot_clip / tot_tok).item() if tot_tok > 0 else 0.0,
+            "grad_norm": grad_norm.item(),
+            "entropy": (tot_ent / n).item(),
+            # Lengths
+            "length_mean": all_token_counts.mean().item(),
+            "length_std": all_token_counts.std().item() if len(all_token_counts) > 1 else 0.0,
+            "length_max": all_token_counts.max().item(),
+            "length_min": all_token_counts.min().item(),
+            # Reward distribution
+            "reward_std": all_rewards.std().item() if len(all_rewards) > 1 else 0.0,
+            "reward_max": all_rewards.max().item(),
+            "reward_min": all_rewards.min().item(),
+            # Advantage signal
+            "advantage_std": all_advantages.std().item() if len(all_advantages) > 1 else 0.0,
+            # Format rate
+            "format_rate": fmt_ok / len(all_responses) if all_responses else 0.0,
+        }
 
     if cfg.use_adaptive_lr:
         pass  # skipped for now — add later

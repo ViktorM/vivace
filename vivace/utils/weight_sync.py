@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from torch.profiler import record_function
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
@@ -220,7 +221,8 @@ def sender_broadcast_loop(
         else:
             comm.broadcast(named[spec.name].data, src=src_rank)
 
-    torch.cuda.synchronize()
+    with record_function("nccl_sender_sync"):
+        torch.cuda.synchronize()
 
 
 def receiver_broadcast_loop(
