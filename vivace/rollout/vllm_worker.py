@@ -104,10 +104,16 @@ class VLLMRolloutWorker:
         old_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
 
+        # logprobs_mode="processed_logprobs": return log_softmax(logits/T) AFTER
+        # temperature + top_p/top_k. vLLM v1's default is "raw_logprobs" which
+        # ignores temperature — that breaks (3) since our compute_token_logprobs
+        # uses logits/T. With "processed_logprobs" the sampled-token logprob from
+        # vLLM matches our HF recompute within bf16 floor.
         self.llm = LLM(model=model_name, tensor_parallel_size=tp_size,
                        gpu_memory_utilization=gpu_memory_utilization, dtype=dtype,
                        enable_lora=enable_lora, max_lora_rank=max_lora_rank,
                        enforce_eager=enforce_eager,
+                       logprobs_mode="processed_logprobs",
                        disable_log_stats=True)
 
         if old_visible is not None:

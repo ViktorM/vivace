@@ -473,25 +473,36 @@ class Trainer:
 
         batch_ex_all = [self.train_data[i] for i in idxs]
 
+        pad_id = self.tokenizer.pad_token_id
+
         if self.rollout_worker is not None:
             # --- vLLM path ---
             # 1. Build unique_prompts (B, no G-repeat — vLLM handles n=G internally)
             unique_prompts = [self.env.format_prompt(ex) for ex in batch_ex_all]
 
-            # 2. Tokenize with HF tokenizer for consistent token IDs
+            # 2. Tokenize with HF tokenizer for consistent token IDs.
+            # Left-padded version (used to build full_ids — keeps `plen` a single int
+            # downstream so HF forwards process the batch in one shot).
             prompt_enc = self.tokenizer(unique_prompts, return_tensors="pt", padding=True)
             prompt_ids_batch_all = prompt_enc.input_ids.tolist()
             plen = prompt_enc.input_ids.shape[1]
 
+            # 2b. vLLM has no concept of left-padding — it would condition generation
+            # on `[pad ... pad | prompt]` and produce different logits than HF (which
+            # masks the pads via attention_mask). Strip leading pads per-prompt before
+            # handing to vLLM so both sides condition on the actual prompt.
+            prompt_ids_for_vllm = []
+            for ids in prompt_ids_batch_all:
+                first_real = next((j for j, t in enumerate(ids) if t != pad_id), len(ids))
+                prompt_ids_for_vllm.append(ids[first_real:])
+
             # 3. Generate via the worker (handles lora_request, tqdm, etc.)
             with record_function("vllm_generate"):
                 vllm_outputs_all, _ = self.rollout_worker.generate(
-                    prompt_token_ids=prompt_ids_batch_all,
+                    prompt_token_ids=prompt_ids_for_vllm,
                     temperature=rl.temperature, top_p=rl.top_p,
                     max_tokens=rl.max_new_tokens, n=G,
                 )
-
-        pad_id = self.tokenizer.pad_token_id
 
         # {full_ids, plen, adv, old_logp, ref_logp, mask, token_count, responses, rewards}
         for i in range(rl.grad_accum_steps):
@@ -506,7 +517,6 @@ class Trainer:
                 # 4. Build full_ids + responses from vLLM output.
                 # Pad all responses to the same length so plen works as a
                 # single int (same structure as HF generate output).
-                
                 all_resp_ids = []
                 responses = []
                 for req_output in vllm_outputs:
@@ -589,6 +599,14 @@ class Trainer:
             with record_function("advantages"):
                 adv = compute_advantages(rewards.view(B, G), self.rl_cfg)
 
+            # old_logp via recompute (peft separate-matmul forward). For LoRA, this
+            # matches policy_logp's forward path → ratio is well-behaved. We tried
+            # using vLLM's old_logp directly (skips the recompute, ~700ms/step win)
+            # but the peft-vs-vLLM-merged bf16 numerical gap biases importance ratios
+            # by an irreducible amount that grows with ‖B@A‖, degrading sample
+            # efficiency. Until weight sync supports vLLM enable_lora=True (whose
+            # Punica fused-LoRA forward matches peft's separate-matmul numerics),
+            # recompute is the principled choice for LoRA.
             with record_function("logprob_recompute"), torch.no_grad():
                 with record_function("logprob_policy"):
                     self.compiled_model.eval()
@@ -607,7 +625,6 @@ class Trainer:
                             response_lengths=response_lengths,
                         )
                     else:
-                        # LoRA: disable adapter to forward through base weights
                         with self.model.disable_adapter():
                             self.compiled_model.eval()
                             ref_logp, _, _ = compute_token_logprobs(
