@@ -35,39 +35,59 @@ uv pip install -e ".[dev]"
 uv pip install -e ".[qwen35]"
 ```
 
-vLLM needs a CUDA toolkit; use `uv pip install -e ".[dev]" --extra-index-url https://download.pytorch.org/whl/cu124`
-if the default resolve breaks.
+vLLM 0.20 hard-pins `torch==2.11.0`. If the default resolve breaks, force the
+matching torch CUDA build, e.g.:
+`uv pip install -e ".[dev]" --extra-index-url https://download.pytorch.org/whl/cu130`.
 
 ### Upgrading an existing venv
-
-If you cloned earlier and need newer `vllm` / `transformers` (e.g. for the `qwen3_5`
-architecture), run:
 
 ```bash
 uv pip install -e ".[dev]" --upgrade
 ```
 
-Or upgrade the load-bearing pair specifically:
-
+Or upgrade load-bearing packages explicitly:
 ```bash
-uv pip install --upgrade "vllm>=0.20" "transformers>=4.58"
+uv pip install --upgrade "vllm>=0.20" "transformers>=4.58" "torch>=2.11" "peft>=0.19"
 ```
 
 ## Quickstart
 
+Two end-to-end recipes to verify your setup. Both train Qwen2.5-0.5B-Instruct on
+GSM8K with LoRA r=16, DAPO + RLOO loss.
+
+### Colocated — single GPU (trainer + vLLM share one device)
+
 ```bash
-# GSPO+RLOO on GSM8K with Qwen3.5-0.8B-Base, LoRA, single GPU
-vivace-train --config vivace/configs/gspo_gsm8k_0.8b_lora.yaml
-
-# Smaller model for quick iteration
-vivace-train --config vivace/configs/grpo_gsm8k_0.5b_lora.yaml
-
-# Full fine-tuning instead of LoRA
-vivace-train --config vivace/configs/grpo_gsm8k_0.5b_full.yaml
-
-# Dry run to sanity-check the full pipeline
-vivace-train --config vivace/configs/grpo_gsm8k_0.5b_lora.yaml --num-steps 5
+python -m vivace.scripts.train \
+    --config vivace/configs/dapo_gsm8k_qw25_0.5b_lora_colo.yaml \
+    --num-steps 200 \
+    --run-dir "runs/colo_$(date +%Y%m%d_%H%M%S)"
 ```
+~440s wall-clock on a 4090, baseline 0% → 43% accuracy in 200 steps.
+Uses `weight_sync_method: ipc` (CUDA IPC zero-copy on the same GPU).
+
+### Disaggregated — two GPUs (trainer on GPU 0, vLLM on GPU 1)
+
+```bash
+python -m vivace.scripts.train \
+    --config vivace/configs/dapo_gsm8k_1.5b_lowkl.yaml \
+    --num-steps 200 \
+    --run-dir "runs/disagg_$(date +%Y%m%d_%H%M%S)"
+```
+Qwen2.5-1.5B + LoRA. Uses `weight_sync_method: nccl` (direct GPU→GPU broadcast).
+
+### Smoke test
+
+```bash
+python -m vivace.scripts.train \
+    --config vivace/configs/dapo_gsm8k_qw25_0.5b_lora_colo.yaml \
+    --num-steps 5 \
+    --run-dir "runs/smoke_$(date +%Y%m%d_%H%M%S)"
+```
+
+`WANDB_MODE=disabled` if you want to skip wandb. See
+[docs/running_experiments.md](docs/running_experiments.md) for the full launch
+pattern, sync-method overrides, and comparison commands.
 
 ## Layout
 
@@ -96,47 +116,45 @@ vivace/                    # installable package
 │   └── distributed.py     # init, ranks, barriers, weight-sync subgroup
 ├── configs/               # YAML configs (one per experiment)
 └── scripts/               # CLI entry points (vivace-train, vivace-sft, vivace-eval)
-tests/                     # Unit tests + integration scripts (weight-sync verify, NCCL smoke)
-docs/                      # Implementation notes
+tests/                     # Unit tests, weight-sync verification, vLLM↔HF probes, run comparison plotting
+docs/                      # running_experiments, weight_sync_approaches, training_theory, profiling
 ```
 
 ## Execution modes
 
 ### Colocated
 
-Each GPU runs both training and rollout, time-multiplexed. On a rollout
-step, the trainer releases activations, vLLM generates completions,
-then vLLM's KV cache is released and training resumes. Slower
-(no overlap between generation and training) but uses fewer GPUs.
+Trainer and vLLM share GPUs, time-multiplexed via `vllm.sleep()` / `wake_up()`.
+Fewer GPUs needed; uses CUDA IPC for zero-copy weight sync on the same device.
 
 ```
-GPU 0: [ trainer shard 0 ] <-> [ vllm worker 0 ]
-GPU 1: [ trainer shard 1 ] <-> [ vllm worker 1 ]
+GPU 0: [ trainer ] <-> [ vllm worker ]   (single-GPU)
 ```
+
+Weight sync: `ipc` (default for colocated). NCCL doesn't work for two ranks on
+the same GPU, so disk is the only fallback.
 
 ### Disaggregated
 
-Rollout and training run on separate GPUs. The trainer pushes updated
-weights to the vLLM workers over NCCL after each optimizer step.
-Rollouts and gradient updates can overlap — one batch is generating
-while the previous batch is being trained on.
+Rollout and training on separate GPUs. Trainer pushes updated weights to vLLM
+over NCCL after each optimizer step.
 
-Simple setup (2+2):
+Two-GPU setup:
 ```
-GPUs 0-1: [ vllm tp=2 rollout worker  ] --generations-->
-GPUs 2-3: [ FSDP trainer dp=2         ] <--weight sync--
+GPU 0: [ trainer        ] <--weight sync (NCCL)-- 
+GPU 1: [ vllm worker    ] --generations-->
 ```
 
-Larger setup (2+4+2):
-```
-GPUs 0-1: [ vllm tp=2 rollout worker  ] --generations-->
-GPUs 2-5: [ FSDP trainer dp=4         ] <--weight sync--
-GPUs 6-7: [ eval workers (optional)   ] --accuracy, pass@k-->
-```
+Weight sync: `nccl` (default). `disk` works as a fallback in either topology.
 
-The optional eval workers run continuous evaluation (greedy pass@1 and
-sampled pass@k / maj@k) on the latest checkpoint without blocking the
-training loop. They use their own vLLM instance for fast inference.
+### Picking a config
+
+| where you are | use |
+|---|---|
+| 1 GPU, debugging | `dapo_gsm8k_qw25_0.5b_lora_colo.yaml` (IPC, 0.5B) |
+| 1 GPU, more capacity | `dapo_gsm8k_qw35_0.8b_lora_colo.yaml` (IPC, 0.8B Qwen3.5) |
+| 2 GPUs, faster | `dapo_gsm8k_1.5b_lowkl.yaml` (NCCL, 1.5B) |
+| 2 GPUs, full FT | `grpo_gsm8k_0.5b_full_nccl.yaml` (NCCL, 0.5B no-LoRA) |
 
 ## Adding a new loss variant
 
@@ -160,29 +178,37 @@ writing anything new.
 
 The reward function and the verifier are the contract. Everything else is up to you.
 
-## Testing weight sync
-
-Two scripts. See `docs/weight_sync_approaches.md` §Testing for details and
-failure-mode diagnostics.
+## Testing
 
 ```bash
-# 1. Low-level smoke test: scalar NCCL broadcast between trainer + vLLM worker
-.venv/bin/python -m tests.test_nccl_sync
+# Low-level NCCL broadcast smoke
+python -m tests.test_nccl_sync
 
-# 2. End-to-end: 3-step verify (fresh / perturb / sync) against the backend under test
-.venv/bin/python -m tests.test_weight_sync --config <path> --method disk
-.venv/bin/python -m tests.test_weight_sync --config <path> --method nccl
+# 3-step weight-sync end-to-end (fresh / perturb / sync) against a backend
+python -m tests.test_weight_sync --config <path> --method disk
+python -m tests.test_weight_sync --config <path> --method nccl
+
+# vLLM↔HF logprob equivalence probe (e.g. when debugging RL ratios)
+python -m tests.probe_vllm_hf_logprob --model Qwen/Qwen2.5-0.5B-Instruct
+
+# Compare two runs (per-step time, throughput, cumulative wall, training reward)
+python -m tests.compare_sync_perf    --a runs/<a> --b runs/<b> --out runs/cmp.png
+python -m tests.compare_sync_perf_n  --runs runs/<a> runs/<b> runs/<c> \
+                                     --labels A B C --out runs/cmp.png
 ```
+
+See [`docs/weight_sync_approaches.md`](docs/weight_sync_approaches.md) for
+the design rationale and failure-mode diagnostics.
 
 ## Roadmap
 
 - [x] Composable PG zoo: GRPO / DAPO / GSPO / RLOO / Dr.GRPO / CISPO / DG
 - [x] GSM8K env + reward functions
 - [x] Single-GPU training with HF sampler
+- [x] vLLM rollout backend with LoRA hot-swap (disk + NCCL + CUDA IPC paths)
+- [x] Disaggregated mode (separate rollout + trainer GPUs)
+- [ ] DDP / FSDP distributed training (in progress)
 - [ ] MATH-500 + AIME + Omni-MATH + DeepMath-103K envs
-- [ ] vLLM rollout backend with LoRA hot-swap
-- [ ] Disaggregated mode (separate rollout + trainer GPUs)
-- [ ] DDP / FSDP distributed training
 - [ ] Optional SFT warmup path
 - [ ] Agentic tasks: tool-use rollout hooks (calculator, Python, search)
 - [ ] RL with self-distillation
