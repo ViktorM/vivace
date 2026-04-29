@@ -38,6 +38,21 @@ uv pip install -e ".[qwen35]"
 vLLM needs a CUDA toolkit; use `uv pip install -e ".[dev]" --extra-index-url https://download.pytorch.org/whl/cu124`
 if the default resolve breaks.
 
+### Upgrading an existing venv
+
+If you cloned earlier and need newer `vllm` / `transformers` (e.g. for the `qwen3_5`
+architecture), run:
+
+```bash
+uv pip install -e ".[dev]" --upgrade
+```
+
+Or upgrade the load-bearing pair specifically:
+
+```bash
+uv pip install --upgrade "vllm>=0.20" "transformers>=4.58"
+```
+
 ## Quickstart
 
 ```bash

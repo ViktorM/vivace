@@ -223,7 +223,16 @@ def compute_token_logprobs(
     else:
         attention_mask = left_pad_mask
 
-    logits = model(full_ids, attention_mask=attention_mask).logits[:, :-1, :] / temperature  # (B, S-1, V)
+
+    # RoPE rotates by absolute position regardless of attention_mask. With left-padding,
+    # default position_ids = arange(S) puts real tokens at K, K+1, ... where K is the
+    # leading-pad count — different from vLLM's unpadded 0, 1, ... and from the same
+    # prompt in a differently-padded batch. Build position_ids 0-indexed at first real
+    # token so RoPE is invariant to padding.
+    position_ids = attention_mask.long().cumsum(-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 0)
+
+    logits = model(full_ids, attention_mask=attention_mask, position_ids=position_ids).logits[:, :-1, :] / temperature  # (B, S-1, V)
     targets = full_ids[:, 1:]  # (B, S-1)
 
     log_probs = F.log_softmax(logits, dim=-1)  # (B, S-1, V)

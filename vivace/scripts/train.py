@@ -13,6 +13,38 @@ import sys
 
 import yaml
 
+
+def _peek_mode_from_argv() -> str:
+    """Read `mode` from the YAML pointed to by --config without importing torch.
+
+    We need to set PYTORCH_CUDA_ALLOC_CONF *before* torch initializes its CUDA
+    allocator, but the right value depends on `mode`:
+      - disaggregated: `expandable_segments:True` reduces fragmentation OOMs
+        on long runs (we hit this at step 12 with the default allocator).
+      - colocated: `expandable_segments` is INCOMPATIBLE with vLLM's sleep()
+        which uses CUDA memory pools (PyTorch issue #147851). Must stay default.
+    Returns "colocated" if config can't be parsed — safer default.
+    """
+    try:
+        argv = sys.argv
+        for i, a in enumerate(argv):
+            if a == "--config" and i + 1 < len(argv):
+                with open(argv[i + 1]) as f:
+                    return yaml.safe_load(f).get("mode", "colocated")
+            if a.startswith("--config="):
+                with open(a.split("=", 1)[1]) as f:
+                    return yaml.safe_load(f).get("mode", "colocated")
+    except Exception:
+        pass
+    return "colocated"
+
+
+if _peek_mode_from_argv() == "disaggregated":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Colocated: don't set; expandable_segments breaks vLLM sleep/wake. If you want
+# fragmentation mitigation in colocated mode, try `max_split_size_mb:512`
+# manually — that's pool-compatible.
+
 from vivace.algos.types import RLConfig
 from vivace.train.trainer import Trainer, TrainerConfig
 

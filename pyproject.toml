@@ -8,12 +8,12 @@ authors = [{ name = "Viktor Makoviichuk" }]
 license = { text = "MIT" }
 
 dependencies = [
-    "torch>=2.10",
-    "transformers>=4.56",
+    "torch>=2.11",             # vllm 0.20 hard-pins torch==2.11.0 anyway
+    "transformers>=4.58",      # 4.58+ adds qwen3_5; vllm 0.20 will pull in 5.6.x in fresh installs
     "datasets>=4.0",
     "accelerate>=1.13",
-    "peft>=0.18",              # LoRA
-    "vllm>=0.19",              # rollout inference
+    "peft>=0.19",              # LoRA
+    "vllm>=0.20",              # rollout inference (also brings torch==2.11)
     "wandb>=0.25",
     "pyyaml>=6.0",
     "numpy>=2.2",

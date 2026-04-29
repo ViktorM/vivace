@@ -89,6 +89,8 @@ class VLLMRolloutWorker:
         max_lora_rank: int = 64,
         colocated: bool = True,
         enforce_eager: bool = False,
+        max_model_len: int | None = None,
+        max_num_seqs: int | None = None,
     ):
         """Build the `vllm.LLM` once. `enforce_eager=True` disables CUDA graphs —
         slower but sometimes needed during dev when graphs and hot weight updates
@@ -104,17 +106,35 @@ class VLLMRolloutWorker:
         old_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
 
+        # Silence per-step INFO chatter from EngineCore (sleep/wake_up/CuMemAllocator).
+        # In colocated mode these fire every step and drown out training logs.
+        # `setdefault` lets the user override with VLLM_LOGGING_LEVEL=INFO when debugging.
+        os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+
         # logprobs_mode="processed_logprobs": return log_softmax(logits/T) AFTER
         # temperature + top_p/top_k. vLLM v1's default is "raw_logprobs" which
         # ignores temperature — that breaks (3) since our compute_token_logprobs
         # uses logits/T. With "processed_logprobs" the sampled-token logprob from
         # vLLM matches our HF recompute within bf16 floor.
-        self.llm = LLM(model=model_name, tensor_parallel_size=tp_size,
-                       gpu_memory_utilization=gpu_memory_utilization, dtype=dtype,
-                       enable_lora=enable_lora, max_lora_rank=max_lora_rank,
-                       enforce_eager=enforce_eager,
-                       logprobs_mode="processed_logprobs",
-                       disable_log_stats=True)
+        # max_model_len=None lets vLLM use the model's max_position_embeddings,
+        # which on Qwen3.5 / long-context models is huge and balloons KV cache size.
+        # Set it explicitly (prompt + max_new_tokens) to size KV cache appropriately.
+        llm_kwargs = dict(
+            model=model_name, tensor_parallel_size=tp_size,
+            gpu_memory_utilization=gpu_memory_utilization, dtype=dtype,
+            enable_lora=enable_lora, max_lora_rank=max_lora_rank,
+            enforce_eager=enforce_eager,
+            logprobs_mode="processed_logprobs",
+            disable_log_stats=True,
+        )
+        if max_model_len is not None:
+            llm_kwargs["max_model_len"] = max_model_len
+        # Qwen3.5 DeltaNet uses Mamba cache blocks (one per concurrent decode seq).
+        # vLLM's default max_num_seqs=256 needs 256 blocks, which doesn't fit at
+        # gpu_memory_utilization<=0.5. Cap to actual concurrency.
+        if max_num_seqs is not None:
+            llm_kwargs["max_num_seqs"] = max_num_seqs
+        self.llm = LLM(**llm_kwargs)
 
         if old_visible is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = old_visible

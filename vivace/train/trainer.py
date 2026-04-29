@@ -93,6 +93,8 @@ class TrainerConfig:
     use_vllm: bool = True
     gpu_memory_utilization: float = 0.4  # only used when use_vllm = True
     enforce_eager: bool = False          # disable CUDA graphs in vLLM (safer for weight updates, slower)
+    vllm_max_model_len: int | None = None   # cap vLLM's context window. None → use model default (huge for Qwen3.5)
+    vllm_max_num_seqs: int | None = None    # cap vLLM's concurrent-decode count. Qwen3.5 needs this to fit Mamba cache.
 
     # ----- RL hyperparameters (algorithm, optimizer, clipping, generation, adaptive sampling/LR) -----
     # Previously ~25 fields were duplicated here and copied into RLConfig at __init__.
@@ -126,6 +128,12 @@ class TrainerConfig:
     # "disk": LoRA adapter save + vLLM LoRARequest reload (simple, slower, kept
     #         as a fallback for debugging and as a reference path).
     weight_sync_method: str = "nccl"
+    # Where the disk-sync path writes the adapter. None auto-picks /dev/shm (tmpfs,
+    # RAM-backed) on Linux, falling back to run_dir if /dev/shm isn't a directory.
+    # tmpfs is ~10× faster than NVMe for the small adapter files; persistence isn't
+    # needed (each step overwrites). Override to a regular path if you want the
+    # adapter on disk for inspection.
+    weight_sync_disk_path: str | None = None
 
     # ----- misc -----
     seed: int = 42
@@ -314,6 +322,8 @@ class Trainer:
                 enable_lora=vllm_enable_lora,
                 colocated=(cfg.mode == "colocated"),
                 enforce_eager=cfg.enforce_eager,
+                max_model_len=cfg.vllm_max_model_len,
+                max_num_seqs=cfg.vllm_max_num_seqs,
             )
         else:
             self.rollout_worker = None  # HF sampler path
@@ -374,7 +384,20 @@ class Trainer:
         # Pattern A = StatelessProcessGroup (TCP rendezvous) + PyNcclCommunicator.
         # See docs/training_theory.md and docs/weight_sync_approaches.md.
         self._nccl_sync_state = None
-        if cfg.weight_sync_method == "nccl" and cfg.mode == "disaggregated":
+        if cfg.weight_sync_method == "nccl" and self.rollout_worker is not None:
+            # NCCL can't communicate between two ranks on the same GPU device
+            # (ncclCommInitRank rejects with NCCL_INVALID_USAGE). For colocated
+            # mode, disk sync is the only working option.
+            if cfg.mode == "colocated":
+                shared = set(cfg.trainer_gpus) & set(cfg.rollout_gpus)
+                if shared:
+                    raise ValueError(
+                        f"weight_sync_method='nccl' requires distinct trainer/rollout GPUs, "
+                        f"but mode='colocated' and trainer_gpus={cfg.trainer_gpus} share "
+                        f"{sorted(shared)} with rollout_gpus={cfg.rollout_gpus}. "
+                        f"Use weight_sync_method='disk' for colocated mode, or set "
+                        f"mode='disaggregated' with separate GPUs."
+                    )
             from vllm.distributed.utils import StatelessProcessGroup
             from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
             from vivace.utils.weight_sync import build_param_specs, allocate_fused_buffers
@@ -421,7 +444,11 @@ class Trainer:
             if worker_err:
                 raise worker_err[0]
 
-            # Full FT: all trainable params. (LoRA path is guarded above.)
+            # Build broadcast specs from the (peft-wrapped) model. For LoRA, the
+            # `merge_adapter` call in `_sync_weights_nccl` folds B@A into base before
+            # broadcast and `unmerge_adapter` undoes it after, so vLLM (enable_lora=False
+            # on this path) receives the full merged weights via these specs. Full FT
+            # path ignores merge/unmerge and broadcasts the live trainable params.
             specs, fusion_map = build_param_specs(self.model, fuse=True)
             fused_buffers = allocate_fused_buffers(self.model, specs, self.device)
             self._nccl_sync_state = {
@@ -433,7 +460,20 @@ class Trainer:
             }
             print(f"[trainer init] NCCL weight sync ready: {len(specs)} params")
 
+        # Resolve disk-sync path once. Default: /dev/shm/vivace_sync_<run_basename>
+        # (RAM-backed tmpfs). If /dev/shm isn't a dir (non-Linux) or user supplied
+        # a path, use that instead.
+        if cfg.weight_sync_disk_path is not None:
+            self._resolved_sync_disk_path = cfg.weight_sync_disk_path
+        elif os.path.isdir("/dev/shm"):
+            run_tag = os.path.basename(cfg.run_dir.rstrip("/")) or "default"
+            self._resolved_sync_disk_path = f"/dev/shm/vivace_sync_{run_tag}"
+        else:
+            self._resolved_sync_disk_path = os.path.join(cfg.run_dir, "adapter_sync")
+
         _print_training_info(cfg, self.model, self.trainer_devices, self.rollout_devices)
+        if cfg.weight_sync_method == "disk":
+            print(f"  [disk-sync] adapter path: {self._resolved_sync_disk_path}")
 
     def _run_eval(self, eval_data: list, label: str = "") -> tuple[dict, list, list]:
         """Run evaluation using the best available backend."""
@@ -509,10 +549,10 @@ class Trainer:
 
             start, end = i * n_prompts_per_mb, (i + 1) * n_prompts_per_mb
             batch_ex = batch_ex_all[start : end]
-            vllm_outputs = vllm_outputs_all[start : end]
-            prompt_ids_batch = prompt_ids_batch_all[start : end]
 
             if self.rollout_worker is not None:
+                vllm_outputs = vllm_outputs_all[start : end]
+                prompt_ids_batch = prompt_ids_batch_all[start : end]
 
                 # 4. Build full_ids + responses from vLLM output.
                 # Pad all responses to the same length so plen works as a
@@ -668,22 +708,19 @@ class Trainer:
           - "nccl": direct GPU->GPU broadcast via vLLM collective_rpc.
                    Fast, supports full FT. See vivace/utils/weight_sync.py.
 
-        No-op when there is no rollout worker (HFSampler shares weights by
-        reference) and in colocated mode (trainer and vLLM share tensors in
-        the same process; updates are visible without explicit sync).
+        No-op only when there's no rollout worker (HF sampler shares weights
+        by reference). Colocated mode still needs sync: vLLM runs in a separate
+        EngineCore subprocess with its own memory, so trainer updates do NOT
+        propagate by reference even on the same GPU.
         """
         # No rollout worker (HF sampler) — model shared by reference, nothing to sync.
         if self.rollout_worker is None:
             return
 
-        # Colocated mode: vLLM loaded the same model on the same GPU.
-        # For LoRA, the optimizer updates the adapter weights in-place —
-        # vLLM sees the same tensors. No sync needed.
-        # For full FT in colocated: same — weights are shared by reference.
-        if self.cfg.mode == "colocated":
-            return
-
-        # Disaggregated mode: dispatch to the configured backend.
+        # Both colocated and disaggregated need explicit sync — vLLM is a separate
+        # subprocess in either case. (Earlier code returned early for colocated based
+        # on a false "shared tensors" assumption; that left vLLM permanently on the
+        # weights it loaded at __init__ and produced bit-identical pre/post eval.)
         if self.cfg.weight_sync_method == "disk":
             self._sync_weights_disk()
         elif self.cfg.weight_sync_method == "nccl":
@@ -695,12 +732,17 @@ class Trainer:
             )
 
     def _sync_weights_disk(self) -> None:
-        """Disk-based LoRA adapter sync. Rank 0 saves; vLLM reloads via update_lora."""
+        """Disk-based LoRA adapter sync. Rank 0 saves; vLLM reloads via update_lora.
+
+        Uses /dev/shm (RAM-backed tmpfs) by default — the adapter is overwritten
+        every step and never needs to persist to real disk. Override by setting
+        cfg.weight_sync_disk_path to a regular path.
+        """
         if not self.cfg.use_lora:
             raise NotImplementedError(
                 "full FT weight sync requires weight_sync_method='nccl'"
             )
-        adapter_path = os.path.join(self.cfg.run_dir, "adapter_sync")
+        adapter_path = self._resolved_sync_disk_path
         os.makedirs(adapter_path, exist_ok=True)
         if is_main_process():
             self.model.save_pretrained(adapter_path)
@@ -905,7 +947,14 @@ class Trainer:
 
                 # --- Periodic eval ---
                 if step > 0 and step % self.cfg.eval_interval == 0:
+                    # In colocated mode the rollout phase put vLLM to sleep; wake it
+                    # before eval (which calls vllm.generate) and sleep again after so
+                    # the next step's rollout starts in the expected (asleep) state.
+                    if self.rollout_worker and self.rollout_worker.colocated:
+                        self.rollout_worker.wake_up()
                     eval_metrics, _, _ = self._run_eval(eval_data)
+                    if self.rollout_worker and self.rollout_worker.colocated:
+                        self.rollout_worker.sleep()
                     print(f"  [eval] Step {step:04d} | accuracy={eval_metrics['accuracy_pct']:.1f}%  format={eval_metrics['format_rate_pct']:.1f}%  reward={eval_metrics['avg_reward']:.3f}  ({eval_metrics.get('eval_time_s', 0):.1f}s)")
                     log_metrics({"eval/" + k: v for k, v in eval_metrics.items()}, step)
                     # Store in stats for offline analysis
@@ -927,7 +976,12 @@ class Trainer:
 
         # --- Final eval ---
         print("\nFinal evaluation...")
+        # Same wake/sleep dance as periodic eval (vLLM is asleep after the last step).
+        if self.rollout_worker and self.rollout_worker.colocated:
+            self.rollout_worker.wake_up()
         final_metrics, final_correct, final_incorrect = self._run_eval(eval_data)
+        if self.rollout_worker and self.rollout_worker.colocated:
+            self.rollout_worker.sleep()
         print(f"Final accuracy: {final_metrics['accuracy_pct']:.1f}%  format: {final_metrics['format_rate_pct']:.1f}%  ({final_metrics.get('eval_time_s', 0):.1f}s)")
         compare_metrics(baseline_metrics, final_metrics, label="RL training")
 
