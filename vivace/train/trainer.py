@@ -471,6 +471,31 @@ class Trainer:
         else:
             self._resolved_sync_disk_path = os.path.join(cfg.run_dir, "adapter_sync")
 
+        # IPC sync state. Same-GPU zero-copy via CUDA IPC handles.
+        self._ipc_sync_state = None
+        if cfg.weight_sync_method == "ipc" and self.rollout_worker is not None:
+            if cfg.mode != "colocated":
+                raise ValueError(
+                    "weight_sync_method='ipc' is only meaningful in colocated mode. "
+                    "For disaggregated, use 'nccl' (faster) or 'disk'."
+                )
+            from vivace.utils.weight_sync import build_param_specs, allocate_fused_buffers
+            from vivace.utils.ipc_sync import pack_ipc_handles
+
+            specs, fusion_map = build_param_specs(self.model, fuse=True)
+            fused_buffers = allocate_fused_buffers(self.model, specs, self.device)
+            # Build IPC handles ONCE: storages are stable across the run because
+            # peft merge/unmerge mutate base.weight.data in place and fused buffers
+            # are preallocated. vLLM keeps these handles open for the whole run.
+            handles = pack_ipc_handles(self.model, specs, fusion_map, fused_buffers)
+            self.rollout_worker.init_ipc_sync(handles, specs)
+            self._ipc_sync_state = {
+                "specs": specs,
+                "fusion_map": fusion_map,
+                "fused_buffers": fused_buffers,
+            }
+            print(f"[trainer init] IPC weight sync ready: {len(specs)} params")
+
         _print_training_info(cfg, self.model, self.trainer_devices, self.rollout_devices)
         if cfg.weight_sync_method == "disk":
             print(f"  [disk-sync] adapter path: {self._resolved_sync_disk_path}")
@@ -725,10 +750,12 @@ class Trainer:
             self._sync_weights_disk()
         elif self.cfg.weight_sync_method == "nccl":
             self._sync_weights_nccl()
+        elif self.cfg.weight_sync_method == "ipc":
+            self._sync_weights_ipc()
         else:
             raise ValueError(
                 f"unknown weight_sync_method {self.cfg.weight_sync_method!r}, "
-                f"expected 'disk' or 'nccl'"
+                f"expected 'disk', 'nccl', or 'ipc'"
             )
 
     def _sync_weights_disk(self) -> None:
@@ -784,6 +811,39 @@ class Trainer:
                 fused_buffers=state["fused_buffers"],
             )
             receiver_thread.join()
+        finally:
+            if self.cfg.use_lora:
+                self.model.unmerge_adapter()
+
+    def _sync_weights_ipc(self) -> None:
+        """Same-GPU CUDA IPC weight sync. Trainer fills stable buffers; vLLM's
+        worker copies from aliased views via collective_rpc.
+
+        Init in `__init__` builds + pushes IPC handles once (storages stable).
+        Per step: merge → fill fused buffers → trainer-side cuda.synchronize →
+        vLLM copy_ via aliased views (worker-side cuda.synchronize too) →
+        unmerge in `finally`.
+        """
+        from vivace.utils.ipc_sync import fill_fused_buffers
+
+        state = self._ipc_sync_state
+        assert state is not None, (
+            "IPC sync state not initialized — check Trainer.__init__ for "
+            "the weight_sync_method='ipc' setup block"
+        )
+
+        if self.cfg.use_lora:
+            self.model.merge_adapter()
+        try:
+            # Trainer-side: fill fused buffers; non-fused params are already
+            # aliased directly via IPC, no copy needed on this side.
+            fill_fused_buffers(
+                self.model, state["specs"], state["fusion_map"], state["fused_buffers"]
+            )
+            # Make sure the merge_adapter writes + fused-buffer cats are
+            # globally visible before vLLM reads them through its alias.
+            torch.cuda.synchronize()
+            self.rollout_worker.update_weights_via_ipc()
         finally:
             if self.cfg.use_lora:
                 self.model.unmerge_adapter()

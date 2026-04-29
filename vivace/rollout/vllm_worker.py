@@ -42,6 +42,52 @@ def _init_nccl_on_vllm_worker(worker_self, master_addr, master_port, rank_offset
     return True
 
 
+def _init_ipc_on_vllm_worker(worker_self, handles, specs):
+    """Open trainer-side CUDA IPC handles inside the vLLM worker subprocess.
+
+    Called once at init via `collective_rpc`. Caches the resulting aliased
+    tensors on the model_runner so per-step `_apply_ipc_on_vllm_worker` can
+    just do `vllm_param.copy_(aliased)` without re-opening handles.
+
+    Module-scope to avoid cloudpickle capturing VLLMRolloutWorker (whose `llm`
+    holds non-picklable internals).
+    """
+    from vivace.utils.ipc_sync import open_ipc_handles_to_aliased_tensors
+    from vivace.utils.weight_sync import ParamSpec
+
+    # vLLM RPC may downgrade ParamSpec dataclass to dict — coerce back.
+    specs = [s if isinstance(s, ParamSpec) else ParamSpec(**s) for s in specs]
+
+    mr = worker_self.model_runner
+    mr._ipc_aliased = open_ipc_handles_to_aliased_tensors(handles)
+    mr._ipc_specs = specs
+    return True
+
+
+def _apply_ipc_on_vllm_worker(worker_self):
+    """Per-step: copy aliased trainer tensors into vLLM's params.
+
+    Trainer must have already filled fused buffers + done cuda.synchronize()
+    before invoking this RPC (see Trainer._sync_weights_ipc).
+    """
+    import torch
+    from vivace.utils.ipc_sync import receiver_copy_loop
+
+    mr = worker_self.model_runner
+    aliased = getattr(mr, "_ipc_aliased", None)
+    specs = getattr(mr, "_ipc_specs", None)
+    assert aliased is not None and specs is not None, (
+        "init_ipc_sync must be called before update_weights_via_ipc"
+    )
+
+    vllm_named = dict(mr.model.named_parameters())
+    receiver_copy_loop(aliased, vllm_named, specs)
+    # Same-device memcpy may launch async; ensure all copies committed before
+    # the trainer's unmerge_adapter() runs (which mutates the source storage).
+    torch.cuda.synchronize()
+    return True
+
+
 def _receive_nccl_on_vllm_worker(worker_self, specs):
     """Run the per-step NCCL receive loop inside the vLLM worker subprocess.
 
@@ -225,6 +271,24 @@ class VLLMRolloutWorker:
         `sender_broadcast_loop` (see `Trainer._sync_weights_nccl`).
         """
         self.llm.collective_rpc(_receive_nccl_on_vllm_worker, args=(specs,))
+
+    def init_ipc_sync(self, handles, specs) -> None:
+        """One-shot: open trainer's CUDA IPC handles in the vLLM worker subprocess.
+
+        Persistent: handles are kept on the model_runner and re-used by every
+        `update_weights_via_ipc` call. Trainer must keep the underlying storages
+        alive (peft merge/unmerge is in-place; fused buffers are preallocated —
+        both invariants met by the trainer-side caller).
+        """
+        self.llm.collective_rpc(_init_ipc_on_vllm_worker, args=(handles, specs))
+
+    def update_weights_via_ipc(self) -> None:
+        """Per-step: copy aliased trainer tensors into vLLM's params (same-GPU).
+
+        Trainer must have filled fused buffers and done `torch.cuda.synchronize()`
+        before this call so that the bytes vLLM reads are the post-merge values.
+        """
+        self.llm.collective_rpc(_apply_ipc_on_vllm_worker)
 
     def update_lora(self, adapter_path: str) -> None:
         """Register a new LoRA adapter for subsequent `generate` calls.

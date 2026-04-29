@@ -74,14 +74,13 @@ def build_trainer_config(cfg_dict: dict) -> TrainerConfig:
 def _maybe_enable_vllm_callable_rpc(cfg_dict: dict) -> None:
     """Allow pickling user callables through vLLM's collective_rpc.
 
-    vLLM 0.19's default serializer rejects user-defined callables — without
-    this flag, the NCCL weight-sync path (which ships Python callables to the
-    vLLM worker subprocess) fails at encode time. Must be set before the vLLM
-    subprocess is spawned (i.e., before Trainer is instantiated) so the
-    subprocess inherits it. Only set when NCCL sync is actually configured —
-    don't relax serialization defaults when not needed.
+    vLLM's default serializer rejects user-defined callables — without this flag,
+    sync paths that ship Python callables (NCCL receiver loop, IPC apply loop)
+    fail at encode time. Must be set before the vLLM subprocess is spawned
+    (i.e., before Trainer is instantiated) so the subprocess inherits it.
+    Only set when actually needed — don't relax serialization defaults otherwise.
     """
-    if cfg_dict.get("weight_sync_method") == "nccl":
+    if cfg_dict.get("weight_sync_method") in ("nccl", "ipc"):
         os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 
@@ -91,8 +90,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--num-steps", type=int, default=None, help="override TrainerConfig.num_steps")
     p.add_argument("--run-dir", type=str, default=None, help="override TrainerConfig.run_dir")
     p.add_argument("--seed", type=int, default=None, help="override TrainerConfig.seed")
-    p.add_argument("--weight-sync-method", choices=["disk", "nccl"], default=None,
-                   help="override TrainerConfig.weight_sync_method (disk | nccl)")
+    p.add_argument("--weight-sync-method", choices=["disk", "nccl", "ipc"], default=None,
+                   help="override TrainerConfig.weight_sync_method (disk | nccl | ipc)")
+    p.add_argument("--weight-sync-disk-path", type=str, default=None,
+                   help="override TrainerConfig.weight_sync_disk_path. Defaults to "
+                        "/dev/shm/vivace_sync_<run_basename>; pass e.g. 'runs/<tag>/adapter' "
+                        "to force NVMe.")
     return p.parse_args(argv)
 
 
@@ -109,6 +112,8 @@ def main(argv: list[str] | None = None) -> None:
         cfg_dict["seed"] = args.seed
     if args.weight_sync_method is not None:
         cfg_dict["weight_sync_method"] = args.weight_sync_method
+    if args.weight_sync_disk_path is not None:
+        cfg_dict["weight_sync_disk_path"] = args.weight_sync_disk_path
 
     _maybe_enable_vllm_callable_rpc(cfg_dict)
 

@@ -1,4 +1,8 @@
-model_name: Qwen/Qwen3.5-0.8B
+# Smaller, simpler colocated config for disk-vs-nccl weight-sync comparisons.
+# Qwen2.5-0.5B-Instruct is a standard transformer (no DeltaNet/Mamba), so the
+# Qwen3.5-specific knobs (vllm_max_num_seqs, max_model_len cap, enforce_eager)
+# aren't needed — vLLM defaults work, more memory headroom for the trainer side.
+model_name: Qwen/Qwen2.5-0.5B-Instruct
 env_name: gsm8k
 algo_name: dapo
 mode: colocated
@@ -7,10 +11,10 @@ trainer_gpus:
 rollout_gpus:
 - 0
 use_vllm: true
-gpu_memory_utilization: 0.5
+gpu_memory_utilization: 0.4
 enforce_eager: false
-vllm_max_model_len: 1024   # GSM8K prompts ≤ 256 tok + max_new_tokens 192; Qwen3.5's default is huge and blows KV cache on a 24GB 4090
-vllm_max_num_seqs: 24      # Qwen3.5 DeltaNet needs Mamba cache blocks per concurrent seq; default 256 doesn't fit at gpu_mem_util=0.5. Peak concurrency: grad_accum × G = 4×6 = 24.
+vllm_max_model_len: 1024
+vllm_max_num_seqs: 32
 use_lora: true
 lora_rank: 16
 lora_alpha: 32
@@ -20,21 +24,21 @@ lora_target_modules:
 - k_proj
 - v_proj
 - o_proj
-num_steps: 500
+num_steps: 200
 sft_warmup: false
 sft_warmup_steps: 0
 wandb_project: vivace
 log_interval: 1
 eval_interval: 100
 checkpoint_interval: 100
-run_dir: runs/dapo_qw35_0.8b_lora_colo
-weight_sync_method: ipc
+run_dir: runs/dapo_qw25_0.5b_lora_colo
+weight_sync_method: ipc   # same-GPU zero-copy. NCCL fails on shared GPU; disk works but is ~26% slower at 200 steps.
 seed: 42
 rl:
   loss_type: dapo
   adv_type: rloo
   batch_size: 1
-  group_size: 6
+  group_size: 8
   lr: 4.0e-05
   grad_accum_steps: 4
   optim_epochs: 2
@@ -50,8 +54,8 @@ rl:
   kl_coef: 0.01
   adv_eps: 0.0001
   dg_eta: 1.0
-  adaptive_sampling: True
-  oversample_factor: 1.5 # to fit 24 GB
+  adaptive_sampling: true
+  oversample_factor: 2.0
   min_reward_spread: 0.5
   use_adaptive_lr: false
   kl_target: 0.05
