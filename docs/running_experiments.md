@@ -43,18 +43,11 @@ The trainer prints which path actually ran at startup:
 ## Comparing runs
 
 ```bash
-# Pair (a vs b)
 python -m tests.compare_sync_perf \
-    --a runs/<a> --a-label "A" \
-    --b runs/<b> --b-label "B" \
-    --out runs/compare.png
-
-# N-way
-python -m tests.compare_sync_perf_n \
     --runs   runs/<a> runs/<b> runs/<c> \
     --labels "A"      "B"      "C"      \
     --out    runs/compare.png
 ```
 
-Both accept either a run-dir (newest `stats_*.pt` is used) or an explicit
-`stats_*.pt` path.
+Accepts N ≥ 2 runs (first is the baseline for wall-clock deltas) and either
+run-dirs (newest `stats_*.pt` used) or explicit `stats_*.pt` paths.

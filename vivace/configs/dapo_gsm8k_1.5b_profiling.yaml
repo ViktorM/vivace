@@ -2,10 +2,8 @@ model_name: Qwen/Qwen2.5-1.5B
 env_name: gsm8k
 algo_name: dapo
 mode: disaggregated
-trainer_gpus:
-- 0
-rollout_gpus:
-- 1
+trainer_gpus: [0]
+rollout_gpus: [1]
 use_vllm: true
 gpu_memory_utilization: 0.8
 enforce_eager: true

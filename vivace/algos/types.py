@@ -96,6 +96,15 @@ class RLConfig:
     reward_threshold: float = 1.8  # responses above this count as "correct"
     min_reward_spread: float = 0.5
 
+    # --- Memory / numerics ---
+    # Chunk entropy along the time axis in `compute_token_logprobs` to bound
+    # the [B, T, V] temporaries to ~C/T of full size. 0 = single-shot.
+    entropy_chunk_size: int = 64
+    # True keeps entropy in the autograd graph (needed for entropy-bonus
+    # loss variants). False uses a no_grad pre-alloc path for extra memory
+    # savings — backprop through entropy then silently yields zero gradients.
+    entropy_grad: bool = False
+
     # --- Logging ---
     log_interval: int = 10
     preview_interval: int = 100

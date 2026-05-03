@@ -2,10 +2,8 @@ model_name: Qwen/Qwen3.5-0.8B-Base
 env_name: gsm8k
 algo_name: gspo
 mode: colocated
-trainer_gpus:
-- 0
-rollout_gpus:
-- 0
+trainer_gpus: [0]
+rollout_gpus: [0]
 use_lora: true
 lora_rank: 16
 lora_alpha: 32

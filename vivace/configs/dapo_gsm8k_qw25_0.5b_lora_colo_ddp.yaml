@@ -1,14 +1,14 @@
-model_name: Qwen/Qwen3.5-0.8B
+model_name: Qwen/Qwen2.5-0.5B-Instruct
 env_name: gsm8k
 algo_name: dapo
 mode: colocated
-trainer_gpus: [0]
-rollout_gpus: [0]
+trainer_gpus: [0, 1]
+rollout_gpus: [0, 1]
 use_vllm: true
-gpu_memory_utilization: 0.5
+gpu_memory_utilization: 0.35
 enforce_eager: false
-vllm_max_model_len: 1024   # GSM8K prompts ≤ 256 tok + max_new_tokens 192; Qwen3.5's default is huge and blows KV cache on a 24GB 4090
-vllm_max_num_seqs: 24      # Qwen3.5 DeltaNet needs Mamba cache blocks per concurrent seq; default 256 doesn't fit at gpu_mem_util=0.5. Peak concurrency: grad_accum × G = 4×6 = 24.
+vllm_max_model_len: 1024
+vllm_max_num_seqs: 32
 use_lora: true
 lora_rank: 16
 lora_alpha: 32
@@ -18,22 +18,22 @@ lora_target_modules:
 - k_proj
 - v_proj
 - o_proj
-num_steps: 500
+num_steps: 200
 sft_warmup: false
 sft_warmup_steps: 0
 wandb_project: vivace
 log_interval: 1
 eval_interval: 100
 checkpoint_interval: 100
-run_dir: runs/dapo_qw35_0.8b_lora_colo
+run_dir: runs/dapo_qw25_0.5b_lora_colo_ddp
 weight_sync_method: ipc
 seed: 42
 rl:
   loss_type: dapo
   adv_type: rloo
   batch_size: 1
-  group_size: 6
-  lr: 4.0e-05
+  group_size: 8
+  lr: 6.0e-05
   grad_accum_steps: 4
   optim_epochs: 2
   grad_clip: 1.0
@@ -48,8 +48,10 @@ rl:
   kl_coef: 0.01
   adv_eps: 0.0001
   dg_eta: 1.0
-  adaptive_sampling: True
-  oversample_factor: 1.5 # to fit 24 GB
+  entropy_chunk_size: 64    # 0 = single-shot; 64 fits Qwen2.5 V on 4090 in DDP
+  entropy_grad: false       # false saves ~50% more peak mem but only safe for logging-only entropy
+  adaptive_sampling: true
+  oversample_factor: 2.0
   min_reward_spread: 0.5
   use_adaptive_lr: false
   kl_target: 0.05

@@ -6,10 +6,8 @@ model_name: Qwen/Qwen2.5-0.5B-Instruct
 env_name: gsm8k
 algo_name: dapo
 mode: colocated
-trainer_gpus:
-- 0
-rollout_gpus:
-- 0
+trainer_gpus: [0]
+rollout_gpus: [0]
 use_vllm: true
 gpu_memory_utilization: 0.4
 enforce_eager: false

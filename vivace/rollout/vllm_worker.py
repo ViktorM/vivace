@@ -152,6 +152,20 @@ class VLLMRolloutWorker:
         old_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
 
+        # Under torchrun, env vars like MASTER_ADDR/MASTER_PORT/RANK/WORLD_SIZE/
+        # LOCAL_RANK get set on the trainer process. The vLLM EngineCore
+        # subprocess inherits them and gets confused — it tries to bind/connect
+        # to a TCPStore at MASTER_ADDR:MASTER_PORT for its own internal setup,
+        # which has nothing to do with torchrun's rendezvous. Unset them while
+        # we spawn LLM(...), restore after.
+        _torchrun_env_keys = ("RANK", "LOCAL_RANK", "WORLD_SIZE",
+                              "MASTER_ADDR", "MASTER_PORT", "GROUP_RANK",
+                              "TORCHELASTIC_USE_AGENT_STORE",
+                              "TORCHELASTIC_RUN_ID", "TORCHELASTIC_MAX_RESTARTS",
+                              "ROLE_RANK", "ROLE_WORLD_SIZE", "ROLE_NAME")
+        saved_torchrun_env = {k: os.environ.pop(k) for k in _torchrun_env_keys
+                              if k in os.environ}
+
         # Silence per-step INFO chatter from EngineCore (sleep/wake_up/CuMemAllocator).
         # In colocated mode these fire every step and drown out training logs.
         # `setdefault` lets the user override with VLLM_LOGGING_LEVEL=INFO when debugging.
@@ -186,6 +200,8 @@ class VLLMRolloutWorker:
             os.environ["CUDA_VISIBLE_DEVICES"] = old_visible
         else:
             del os.environ["CUDA_VISIBLE_DEVICES"]
+        # Restore torchrun env vars in the trainer process
+        os.environ.update(saved_torchrun_env)
 
         self.colocated = colocated
         self.gpu_ids = gpu_ids

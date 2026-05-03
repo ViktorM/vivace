@@ -2,12 +2,8 @@ model_name: Qwen/Qwen2.5-0.5B
 env_name: gsm8k
 algo_name: grpo
 mode: colocated
-trainer_gpus:
-- 0
-- 1
-rollout_gpus:
-- 0
-- 1
+trainer_gpus: [0, 1]
+rollout_gpus: [0, 1]
 use_lora: false
 num_steps: 500
 sft_warmup: false

@@ -21,6 +21,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.profiler import record_function
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from vivace.algos.types import RLConfig, SFTConfig, validate_rl_config
@@ -38,7 +40,7 @@ from vivace.utils.logging import ConsoleLogger, init_wandb, log_metrics, finish_
 from vivace.utils.perf import Timer, throughput
 from vivace.utils.profiling import ProfilingConfig, create_profiler, export_and_summarize
 from vivace.utils.weight_sync import sender_broadcast_loop
-from vivace.utils.distributed import is_main_process, barrier
+from vivace.utils.distributed import is_main_process, barrier, init_distributed, reduce_metrics
 from vivace.utils.checkpointing import save_checkpoint
 
 from peft import LoraConfig, get_peft_model, TaskType
@@ -76,6 +78,9 @@ class TrainerConfig:
     mode: str = "colocated"          # "colocated" | "disaggregated"
     trainer_gpus: list[int] = field(default_factory=lambda: [0])
     rollout_gpus: list[int] = field(default_factory=lambda: [0])
+    # Tensor parallelism within a single inference backend instance (vLLM today,
+    # possibly SGLang later). v1 supports only 1.
+    tensor_parallel_size: int = 1
 
     # ----- model dtype + compilation -----
     dtype: str = "bfloat16"          # bfloat16 | float16 | float32
@@ -135,8 +140,23 @@ class TrainerConfig:
     # adapter on disk for inspection.
     weight_sync_disk_path: str | None = None
 
+    # ----- DDP -----
+    # Set True when not every trainable parameter participates in every forward
+    # pass (e.g. LoRA on `embed_tokens` with conditional paths, or full-FT with
+    # frozen layer ranges). False is correct for typical LoRA on attention/MLP
+    # projections — every forward touches every adapter, and the extra graph
+    # traversal `True` triggers slows each step. DDP itself warns at run time
+    # if you have it set to True with no actual unused params.
+    find_unused_parameters: bool = False
+
     # ----- misc -----
     seed: int = 42
+
+
+def _set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def _find_free_port() -> int:
@@ -182,10 +202,26 @@ def _print_training_info(
     trainer_devices: list[torch.device],
     rollout_devices: list[torch.device],
 ) -> None:
-    """Print model + training config summary after model load."""
+    """Print model + training config summary after model load. Rank 0 only."""
+    if not is_main_process():
+        return
+
+    # Unwrap DDP / torch.compile / peft to reach the underlying HF model's .config.
+    inner = model
+    for _ in range(4):
+        if hasattr(inner, "_orig_mod"):              # torch.compile
+            inner = inner._orig_mod
+        elif hasattr(inner, "module") and not isinstance(inner, nn.ModuleList):
+            inner = inner.module                      # DDP / FSDP
+        elif hasattr(inner, "base_model") and hasattr(inner.base_model, "model"):
+            inner = inner.base_model.model            # peft
+        else:
+            break
+    hf_config = inner.config
+
     n_total = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    mode = "LoRA" if cfg.use_lora else "full FT"
+    train_mode = "LoRA" if cfg.use_lora else "full FT"
 
     def _fmt_devices(devs: list[torch.device]) -> str:
         return ", ".join(str(d) for d in devs)
@@ -198,12 +234,12 @@ def _print_training_info(
     print(f"  Rollout devices: {_fmt_devices(rollout_devices)}")
     print(f"  Dtype:           {cfg.dtype}")
     print(f"  Compile:         {cfg.compile_model}")
-    print(f"  Params:          {n_total / 1e6:.1f}M total, {n_trainable / 1e6:.1f}M trainable ({mode})")
-    print(f"  Vocab:           {model.config.vocab_size}")
-    print(f"  Hidden:          {model.config.hidden_size}")
-    print(f"  Layers:          {model.config.num_hidden_layers}")
-    if hasattr(model.config, 'layer_types'):
-        print(f"  Layer types:     {model.config.layer_types}")
+    print(f"  Params:          {n_total / 1e6:.1f}M total, {n_trainable / 1e6:.1f}M trainable ({train_mode})")
+    print(f"  Vocab:           {hf_config.vocab_size}")
+    print(f"  Hidden:          {hf_config.hidden_size}")
+    print(f"  Layers:          {hf_config.num_hidden_layers}")
+    if hasattr(hf_config, 'layer_types'):
+        print(f"  Layer types:     {hf_config.layer_types}")
     print(f"  Env:             {cfg.env_name}")
     print(f"  Algo:            {cfg.rl.loss_type} / {cfg.rl.adv_type}")
     print(f"  Batch:           {cfg.rl.batch_size} prompts x {cfg.rl.group_size} group x {cfg.rl.grad_accum_steps} accum")
@@ -242,23 +278,43 @@ class Trainer:
 
         _print_system_info()
         torch.backends.cuda.matmul.allow_tf32 = True
-        random.seed(cfg.seed)
-        np.random.seed(cfg.seed)
-        torch.manual_seed(cfg.seed)
+
+        # --- Distributed init (must come BEFORE any validation that uses world_size) ---
+        rank, local_rank, world_size = init_distributed()
+        self.rank, self.local_rank, self.world_size = rank, local_rank, world_size
+
+        # --- Validation (now world_size is in scope) ---
+        if cfg.tensor_parallel_size != 1:
+            raise NotImplementedError("vLLM TP > 1 not supported yet")
+        if len(cfg.trainer_gpus) != world_size:
+            raise ValueError(
+                f"len(trainer_gpus)={len(cfg.trainer_gpus)} must equal WORLD_SIZE={world_size}"
+            )
+        if cfg.mode == "colocated":
+            if cfg.trainer_gpus != cfg.rollout_gpus:
+                raise ValueError(
+                    f"colocated mode requires trainer_gpus == rollout_gpus, got "
+                    f"{cfg.trainer_gpus} vs {cfg.rollout_gpus}"
+                )
+        elif cfg.mode == "disaggregated":
+            raise NotImplementedError("disaggregated DDP — Phase 2")
 
         # --- Resolve devices ---
-        # Full lists: for DDP/FSDP (training) and vLLM TP (rollout).
-        # Primary device: where the model gets loaded initially and where
-        # single-GPU ops (optimizer step, non-distributed forward) happen.
-        # In DDP, each rank gets its own primary via LOCAL_RANK; for now
-        # (single-process) we use [0] from each list.
+        # trainer_gpus / rollout_gpus are the full GPU pools (per cfg). For DDP,
+        # each rank picks its own primary by LOCAL_RANK from these pools.
+        # trainer_devices / rollout_devices are kept only for the startup banner
+        # (_print_training_info) — not used for any GPU op.
         if torch.cuda.is_available():
             self.trainer_devices = [torch.device(f"cuda:{g}") for g in cfg.trainer_gpus]
             self.rollout_devices = [torch.device(f"cuda:{g}") for g in cfg.rollout_gpus]
+            self.device = torch.device(f"cuda:{cfg.trainer_gpus[local_rank]}")
         else:
             self.trainer_devices = [torch.device("cpu")]
             self.rollout_devices = [torch.device("cpu")]
-        self.device = self.trainer_devices[0]  # primary — model load target
+            self.device = self.trainer_devices[0]
+
+        self.seed = cfg.seed + rank
+        _set_seed(self.seed)
 
         # --- Tokenizer ---
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
@@ -271,6 +327,7 @@ class Trainer:
             cfg.model_name, dtype=model_dtype,
             low_cpu_mem_usage=True, trust_remote_code=True,
         ).to(self.device)
+
         self.model.config.use_cache = False
         self.model.train()
 
@@ -297,6 +354,15 @@ class Trainer:
             for p in self.ref_model.parameters():
                 p.requires_grad_(False)
 
+        # Keep a handle to the peft (or bare HF) model so we can call peft methods
+        # like merge_adapter / unmerge_adapter / disable_adapter / save_pretrained
+        # without hitting DDP's __getattr__ wall after wrapping.
+        self._inner_model = self.model
+
+        if world_size > 1:
+            self.model = DDP(self.model, device_ids=[local_rank],
+                             find_unused_parameters=cfg.find_unused_parameters)
+
         # --- Compile (optional) ---
         # Use compiled versions for forward passes (rl_step, log-prob recomputation),
         # raw self.model for generate() — torch.compile and generate() don't mix well.
@@ -317,7 +383,7 @@ class Trainer:
             vllm_enable_lora = cfg.use_lora and cfg.weight_sync_method == "disk"
             self.rollout_worker = VLLMRolloutWorker(
                 model_name=cfg.model_name,
-                gpu_ids=cfg.rollout_gpus,
+                gpu_ids=[cfg.rollout_gpus[local_rank]],
                 gpu_memory_utilization=cfg.gpu_memory_utilization,
                 enable_lora=vllm_enable_lora,
                 colocated=(cfg.mode == "colocated"),
@@ -338,7 +404,7 @@ class Trainer:
 
         # --- Optimizer + scheduler ---
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.rl.lr)
-        warmup_steps = 10
+        warmup_steps = cfg.rl.warmup_iters
         warmup = torch.optim.lr_scheduler.LinearLR(
             self.optimizer, start_factor=0.1, total_iters=warmup_steps)
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -358,7 +424,8 @@ class Trainer:
         label += f" ep={cfg.rl.optim_epochs}"
         self.stats = TrainingStats(method=label)
         self.console = ConsoleLogger(label=label)
-        init_wandb(cfg, project=cfg.wandb_project, run_name=cfg.wandb_run_name)
+        if is_main_process():
+            init_wandb(cfg, project=cfg.wandb_project, run_name=cfg.wandb_run_name)
 
         # --- Eval worker ---
         # For now, reuse the rollout worker for eval when available.
@@ -690,7 +757,7 @@ class Trainer:
                             response_lengths=response_lengths,
                         )
                     else:
-                        with self.model.disable_adapter():
+                        with self._inner_model.disable_adapter():
                             self.compiled_model.eval()
                             ref_logp, _, _ = compute_token_logprobs(
                                 self.compiled_model, full_ids, plen, rl.temperature,
@@ -772,7 +839,7 @@ class Trainer:
         adapter_path = self._resolved_sync_disk_path
         os.makedirs(adapter_path, exist_ok=True)
         if is_main_process():
-            self.model.save_pretrained(adapter_path)
+            self._inner_model.save_pretrained(adapter_path)
         barrier()
         self.rollout_worker.update_lora(adapter_path)
 
@@ -794,7 +861,7 @@ class Trainer:
         # skip unmerge, the next training step treats merged weights as base
         # and applies the adapter a second time on top.
         if self.cfg.use_lora:
-            self.model.merge_adapter()
+            self._inner_model.merge_adapter()
         try:
             def _trigger_receiver():
                 self.rollout_worker.update_weights(state["specs"])
@@ -813,7 +880,7 @@ class Trainer:
             receiver_thread.join()
         finally:
             if self.cfg.use_lora:
-                self.model.unmerge_adapter()
+                self._inner_model.unmerge_adapter()
 
     def _sync_weights_ipc(self) -> None:
         """Same-GPU CUDA IPC weight sync. Trainer fills stable buffers; vLLM's
@@ -833,7 +900,7 @@ class Trainer:
         )
 
         if self.cfg.use_lora:
-            self.model.merge_adapter()
+            self._inner_model.merge_adapter()
         try:
             # Trainer-side: fill fused buffers; non-fused params are already
             # aliased directly via IPC, no copy needed on this side.
@@ -846,7 +913,7 @@ class Trainer:
             self.rollout_worker.update_weights_via_ipc()
         finally:
             if self.cfg.use_lora:
-                self.model.unmerge_adapter()
+                self._inner_model.unmerge_adapter()
 
     def train(self) -> None:
         """Main training loop: optional SFT warmup, baseline eval, N steps of
@@ -855,17 +922,23 @@ class Trainer:
         self.maybe_sft_warmup()
 
         # --- Baseline eval ---
+        # TODO: shard eval across ranks for ~world_size× speedup. v1 runs only on
+        # rank 0 (~5-10s on 0.5B/500-example GSM8K, fine). For larger eval sets
+        # or models this becomes a real cost — see docs/architecture.md notes.
         eval_data = self.env.load_split("eval")
-        print("Evaluating baseline...")
-        baseline_metrics, baseline_correct, baseline_incorrect = self._run_eval(eval_data)
-        backend = baseline_metrics.get("eval_backend", "hf")
-        print(f"Baseline accuracy: {baseline_metrics['accuracy_pct']:.1f}%  format: {baseline_metrics['format_rate_pct']:.1f}%  ({backend}, {baseline_metrics.get('eval_time_s', 0):.1f}s)")
+        baseline_metrics = None
+        baseline_correct = baseline_incorrect = None
         if is_main_process():
+            print("Evaluating baseline...")
+            baseline_metrics, baseline_correct, baseline_incorrect = self._run_eval(eval_data)
+            backend = baseline_metrics.get("eval_backend", "hf")
+            print(f"Baseline accuracy: {baseline_metrics['accuracy_pct']:.1f}%  format: {baseline_metrics['format_rate_pct']:.1f}%  ({backend}, {baseline_metrics.get('eval_time_s', 0):.1f}s)")
             log_metrics({"eval/" + k: v for k, v in baseline_metrics.items()}, step=0)
-        self.stats.eval_steps.append(0)
-        self.stats.eval_accuracy.append(baseline_metrics["accuracy_pct"])
-        self.stats.eval_format_rate.append(baseline_metrics["format_rate_pct"])
-        self.stats.eval_reward.append(baseline_metrics["avg_reward"])
+            self.stats.eval_steps.append(0)
+            self.stats.eval_accuracy.append(baseline_metrics["accuracy_pct"])
+            self.stats.eval_format_rate.append(baseline_metrics["format_rate_pct"])
+            self.stats.eval_reward.append(baseline_metrics["avg_reward"])
+        barrier()
 
         # --- Initial weight sync ---
         # vLLM starts with the base model only. Sync the initial LoRA adapter
@@ -876,7 +949,8 @@ class Trainer:
         prof = create_profiler(self.profiling_cfg)
         if prof is not None:
             prof.__enter__()
-            print(f"Profiler armed: will profile steps {self.profiling_cfg.start_step}-{self.profiling_cfg.end_step}")
+            if is_main_process():
+                print(f"Profiler armed: will profile steps {self.profiling_cfg.start_step}-{self.profiling_cfg.end_step}")
 
         # --- Training loop ---
         self.kl_ema = self.cfg.rl.kl_target
@@ -898,6 +972,15 @@ class Trainer:
                     metrics = self.train_phase(micro_batches)
                 with record_function("weight_sync"):
                     self.sync_weights()
+                # Release the trainer's cached-but-unused CUDA blocks so vLLM
+                # can grow into them at the next wake_up. In colocated mode
+                # PyTorch and vLLM have separate allocator pools sharing one
+                # GPU; without this, the trainer's pool drifts upward across
+                # steps (variable T → cached blocks of many shapes), squeezes
+                # vLLM, and eventually trips its sleep-time `freed_bytes >= 0`
+                # assertion. No-op cost when there's nothing to release.
+                if self.rollout_worker and self.rollout_worker.colocated:
+                    torch.cuda.empty_cache()
 
             self.scheduler.step()
 
@@ -915,6 +998,28 @@ class Trainer:
                 rollout_tokens = int(sum(mb["mask"].sum().item() for mb in micro_batches))
             rollout_samples = int(sum(mb["mask"].shape[0] for mb in micro_batches))
             cur_lr = self.optimizer.param_groups[0]["lr"]
+
+            # Throughput is per-rank work happening concurrently → SUM across ranks
+            # for system-level numbers. Wall-clock times are bottlenecked by the
+            # slowest rank → MAX. No-op in single-rank runs.
+            perf_raw = {
+                "rollout_tokens": rollout_tokens,
+                "rollout_samples": rollout_samples,
+                "tokens_per_sec": throughput(rollout_tokens, rollout_t.dt),
+                "samples_per_sec": throughput(rollout_samples, rollout_t.dt),
+                "rollout_time": rollout_t.dt,
+                "train_time": train_t.dt,
+                "step_time": step_t.dt,
+            }
+            perf = reduce_metrics(perf_raw, {
+                "rollout_tokens": "sum",
+                "rollout_samples": "sum",
+                "tokens_per_sec": "sum",
+                "samples_per_sec": "sum",
+                "rollout_time": "max",
+                "train_time": "max",
+                "step_time": "max",
+            })
 
             self.stats.log(
                 step=step,
@@ -938,25 +1043,25 @@ class Trainer:
                 advantage_std=metrics["advantage_std"],
                 # Adaptive sampling (0 if disabled)
                 alive_rates=self._last_alive_rate,
-                # Performance
-                rollout_time=rollout_t.dt,
-                train_time=train_t.dt,
-                step_time=step_t.dt,
-                rollout_tokens=rollout_tokens,
-                rollout_samples=rollout_samples,
-                tokens_per_sec=throughput(rollout_tokens, rollout_t.dt),
-                samples_per_sec=throughput(rollout_samples, rollout_t.dt),
+                # Performance (cross-rank reduced — see perf_raw above)
+                rollout_time=perf["rollout_time"],
+                train_time=perf["train_time"],
+                step_time=perf["step_time"],
+                rollout_tokens=perf["rollout_tokens"],
+                rollout_samples=perf["rollout_samples"],
+                tokens_per_sec=perf["tokens_per_sec"],
+                samples_per_sec=perf["samples_per_sec"],
                 # LR
                 lrs=cur_lr,
             )
 
             # --- Logging ---
             perf_info = {
-                "tokens_per_sec": throughput(rollout_tokens, rollout_t.dt),
-                "samples_per_sec": throughput(rollout_samples, rollout_t.dt),
-                "step_time": step_t.dt,
-                "rollout_time": rollout_t.dt,
-                "train_time": train_t.dt,
+                "tokens_per_sec": perf["tokens_per_sec"],
+                "samples_per_sec": perf["samples_per_sec"],
+                "step_time": perf["step_time"],
+                "rollout_time": perf["rollout_time"],
+                "train_time": perf["train_time"],
             }
 
             if is_main_process():
@@ -1028,6 +1133,10 @@ class Trainer:
                 #     save_checkpoint(self.model, self.optimizer, self.scheduler,
                 #                     step, f"{self.cfg.run_dir}/ckpt-{step}")
 
+            # Non-rank-0 ranks wait here so they don't race ahead during rank 0's
+            # eval/log/checkpoint work above. Cheap when eval doesn't fire.
+            barrier()
+
         # --- Clean up profiler if training ended before profiling window ---
         if prof is not None:
             prof.__exit__(None, None, None)
@@ -1035,58 +1144,62 @@ class Trainer:
             prof = None
 
         # --- Final eval ---
-        print("\nFinal evaluation...")
-        # Same wake/sleep dance as periodic eval (vLLM is asleep after the last step).
-        if self.rollout_worker and self.rollout_worker.colocated:
-            self.rollout_worker.wake_up()
-        final_metrics, final_correct, final_incorrect = self._run_eval(eval_data)
-        if self.rollout_worker and self.rollout_worker.colocated:
-            self.rollout_worker.sleep()
-        print(f"Final accuracy: {final_metrics['accuracy_pct']:.1f}%  format: {final_metrics['format_rate_pct']:.1f}%  ({final_metrics.get('eval_time_s', 0):.1f}s)")
-        compare_metrics(baseline_metrics, final_metrics, label="RL training")
-
-        self.stats.eval_steps.append(self.cfg.num_steps)
-        self.stats.eval_accuracy.append(final_metrics["accuracy_pct"])
-        self.stats.eval_format_rate.append(final_metrics["format_rate_pct"])
-        self.stats.eval_reward.append(final_metrics["avg_reward"])
-
+        final_metrics = None
+        final_correct = final_incorrect = None
         if is_main_process():
+            print("\nFinal evaluation...")
+            # Same wake/sleep dance as periodic eval (vLLM is asleep after the last step).
+            if self.rollout_worker and self.rollout_worker.colocated:
+                self.rollout_worker.wake_up()
+            final_metrics, final_correct, final_incorrect = self._run_eval(eval_data)
+            if self.rollout_worker and self.rollout_worker.colocated:
+                self.rollout_worker.sleep()
+            print(f"Final accuracy: {final_metrics['accuracy_pct']:.1f}%  format: {final_metrics['format_rate_pct']:.1f}%  ({final_metrics.get('eval_time_s', 0):.1f}s)")
+            compare_metrics(baseline_metrics, final_metrics, label="RL training")
+
+            self.stats.eval_steps.append(self.cfg.num_steps)
+            self.stats.eval_accuracy.append(final_metrics["accuracy_pct"])
+            self.stats.eval_format_rate.append(final_metrics["format_rate_pct"])
+            self.stats.eval_reward.append(final_metrics["avg_reward"])
+
             log_metrics({"eval/" + k: v for k, v in final_metrics.items()},
                         step=self.cfg.num_steps)
             finish_wandb()
+        barrier()
 
-        # --- Save stats + plots ---
-        from datetime import datetime
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from vivace.utils.stats import plot_stats, plot_perf, plot_health, plot_wallclock
+        # --- Save stats + plots (rank 0 only) ---
+        if is_main_process():
+            from datetime import datetime
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from vivace.utils.stats import plot_stats, plot_perf, plot_health, plot_wallclock
 
-        os.makedirs(self.cfg.run_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_label = f"{self.cfg.rl.loss_type}_{self.cfg.rl.adv_type}_{self.cfg.num_steps}steps"
-        stats_path = os.path.join(self.cfg.run_dir, f"stats_{run_label}_{timestamp}.pt")
-        torch.save(self.stats, stats_path)
-        print(f"\nStats saved to {stats_path}")
+            os.makedirs(self.cfg.run_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_label = f"{self.cfg.rl.loss_type}_{self.cfg.rl.adv_type}_{self.cfg.num_steps}steps"
+            stats_path = os.path.join(self.cfg.run_dir, f"stats_{run_label}_{timestamp}.pt")
+            torch.save(self.stats, stats_path)
+            print(f"\nStats saved to {stats_path}")
 
-        # Save plots as PNGs (always works, no GUI needed)
-        title = f"{self.stats.method} — {self.cfg.num_steps} steps"
-        for plot_fn, name in [(plot_stats, "stats"), (plot_perf, "perf"), (plot_health, "health"), (plot_wallclock, "wallclock")]:
-            plot_fn(self.stats, title=title)
-            plot_path = os.path.join(self.cfg.run_dir, f"plot_{name}_{run_label}_{timestamp}.png")
-            plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-            plt.close()
-        print(f"Plots saved to {self.cfg.run_dir}/plot_*_{timestamp}.png")
+            # Save plots as PNGs (always works, no GUI needed)
+            title = f"{self.stats.method} — {self.cfg.num_steps} steps"
+            for plot_fn, name in [(plot_stats, "stats"), (plot_perf, "perf"), (plot_health, "health"), (plot_wallclock, "wallclock")]:
+                plot_fn(self.stats, title=title)
+                plot_path = os.path.join(self.cfg.run_dir, f"plot_{name}_{run_label}_{timestamp}.png")
+                plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+                plt.close()
+            print(f"Plots saved to {self.cfg.run_dir}/plot_*_{timestamp}.png")
 
-        print("To view stats interactively:")
-        print(f"  stats = torch.load('{stats_path}', weights_only=False)")
-        print(f"  from vivace.utils.stats import plot_stats, plot_perf, plot_health")
-        print(f"  plot_stats(stats)")
+            print("To view stats interactively:")
+            print(f"  stats = torch.load('{stats_path}', weights_only=False)")
+            print(f"  from vivace.utils.stats import plot_stats, plot_perf, plot_health")
+            print(f"  plot_stats(stats)")
 
         # --- Cleanup ---
         if self.rollout_worker is not None:
             del self.rollout_worker.llm  # shut down vLLM engine + subprocess
             self.rollout_worker = None
-        import torch.distributed as dist
+
         if dist.is_initialized():
             dist.destroy_process_group()

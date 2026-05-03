@@ -191,10 +191,10 @@ python -m tests.test_weight_sync --config <path> --method nccl
 # vLLM↔HF logprob equivalence probe (e.g. when debugging RL ratios)
 python -m tests.probe_vllm_hf_logprob --model Qwen/Qwen2.5-0.5B-Instruct
 
-# Compare two runs (per-step time, throughput, cumulative wall, training reward)
-python -m tests.compare_sync_perf    --a runs/<a> --b runs/<b> --out runs/cmp.png
-python -m tests.compare_sync_perf_n  --runs runs/<a> runs/<b> runs/<c> \
-                                     --labels A B C --out runs/cmp.png
+# Compare N runs (per-step time, throughput, cumulative wall, training reward).
+# First run is treated as the baseline for the wall-clock delta numbers.
+python -m tests.compare_sync_perf  --runs runs/<a> runs/<b> runs/<c> \
+                                   --labels A B C --out runs/cmp.png
 ```
 
 See [`docs/weight_sync_approaches.md`](docs/weight_sync_approaches.md) for

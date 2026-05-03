@@ -32,12 +32,20 @@ def pack_ipc_handles(
     specs: list[ParamSpec],
     fusion_map: dict | None,
     fused_buffers: dict | None,
+    receiver_device_ordinal: int = 0,
 ) -> list[dict]:
     """Trainer side: build a list of IPC-handle dicts aligned with `specs`.
 
     For fused specs (qkv_proj, gate_up_proj), the source tensor is the
     preallocated fused buffer (must be filled before each sync — see
     `fill_fused_buffers`). For non-fused, the source is the live param `.data`.
+
+    `receiver_device_ordinal` is what the vLLM EngineCore subprocess sees its
+    GPU as. Since we set `CUDA_VISIBLE_DEVICES=<single_gpu>` for the EngineCore,
+    it always sees its assigned GPU as cuda:0 — so default 0. The trainer's
+    own ordinal can be anything (cuda:N for N=local_rank under torchrun); we
+    rewrite the IPC handle's device field so the receiver opens on the correct
+    (relative) ordinal, not the sender's absolute one.
 
     Each dict carries enough info for the receiver to recreate a tensor that
     aliases this exact storage. Sent via vLLM's `collective_rpc` once at init.
@@ -59,7 +67,8 @@ def pack_ipc_handles(
         # picklable across processes:
         # (device, handle, size_bytes, offset, ref_counter_handle,
         #  ref_counter_offset, event_handle, event_sync_required)
-        info = storage._share_cuda_()
+        info = list(storage._share_cuda_())
+        info[0] = receiver_device_ordinal   # rewrite to receiver's relative ordinal
         handles.append({
             "name": spec.name,
             "ipc_info": tuple(info),
