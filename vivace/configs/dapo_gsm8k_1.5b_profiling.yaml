@@ -7,6 +7,7 @@ rollout_gpus: [1]
 use_vllm: true
 gpu_memory_utilization: 0.8
 enforce_eager: true
+compile_model: false      # torch.compile — flip to true to test ~10-30% speedup; can interact badly with peft/DDP/variable-T
 use_lora: true
 lora_rank: 16
 lora_alpha: 32
@@ -37,8 +38,11 @@ rl:
   batch_size: 1
   group_size: 8
   lr: 2.0e-05
+  warmup_steps: 10        # initial linear warmup; also used as the restart ramp length when lr_restart=true
   grad_accum_steps: 4
   optim_epochs: 2
+  eta_min_ratio: 0.2     # cosine floor as fraction of peak lr (peak * ratio = eta_min)
+  lr_restart: false      # True: CosineAnnealingWarmRestarts with T_0 = (num_steps - warmup) // 2
   grad_clip: 1.0
   max_new_tokens: 192
   temperature: 0.9

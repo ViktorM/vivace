@@ -24,11 +24,13 @@ def init_wandb(
     cfg: Any,
     project: str = "vivace",
     run_name: str | None = None,
+    group: str | None = None,
     is_main: bool = True,
 ) -> None:
     """Initialise a wandb run if available + enabled + main process.
 
     `cfg` may be a dataclass (turned into a dict) or a plain dict.
+    `group` clusters runs together in the wandb UI (e.g. seed sweeps).
     """
     global _WANDB_RUN, _WANDB_OK
     if not is_main:
@@ -41,7 +43,7 @@ def init_wandb(
         return
 
     cfg_dict = asdict(cfg) if is_dataclass(cfg) else dict(cfg)
-    _WANDB_RUN = wandb.init(project=project, name=run_name, config=cfg_dict)
+    _WANDB_RUN = wandb.init(project=project, name=run_name, group=group, config=cfg_dict)
     _WANDB_OK = True
 
 

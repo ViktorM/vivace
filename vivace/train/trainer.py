@@ -119,6 +119,10 @@ class TrainerConfig:
     # ----- logging -----
     wandb_project: str = "vivace"
     wandb_run_name: str | None = None
+    # Optional wandb group: runs that share a group cluster together in the
+    # wandb UI (good for seed sweeps — set the group in the YAML once, vary
+    # --seed and --run-dir per launch, all runs show up grouped).
+    wandb_group: str | None = None
     log_interval: int = 1
     eval_interval: int = 50
     checkpoint_interval: int = 100
@@ -367,9 +371,9 @@ class Trainer:
         # Use compiled versions for forward passes (rl_step, log-prob recomputation),
         # raw self.model for generate() — torch.compile and generate() don't mix well.
         # For LoRA: compiled_ref is None (use compiled_model with disable_adapter).
-        self.compiled_model = torch.compile(self.model) if cfg.compile_model else self.model
+        self.compiled_model = torch.compile(self.model, dynamic=True) if cfg.compile_model else self.model
         if self.ref_model is not None:
-            self.compiled_ref = torch.compile(self.ref_model) if cfg.compile_model else self.ref_model
+            self.compiled_ref = torch.compile(self.ref_model, dynamic=True) if cfg.compile_model else self.ref_model
         else:
             self.compiled_ref = None  # LoRA: use compiled_model with disable_adapter()
 
@@ -403,15 +407,34 @@ class Trainer:
         validate_rl_config(self.rl_cfg)
 
         # --- Optimizer + scheduler ---
+        # Two modes: plain cosine, or cosine→linear-ramp-restart→cosine. The restart
+        # uses `warmup_steps` for the ramp length, matching the initial warmup.
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.rl.lr)
-        warmup_steps = cfg.rl.warmup_iters
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            self.optimizer, start_factor=0.1, total_iters=warmup_steps)
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=max(cfg.num_steps - warmup_steps, 1),
-            eta_min=cfg.rl.lr * 0.2)
+        warmup_steps = cfg.rl.warmup_steps
+        post_warmup = max(cfg.num_steps - warmup_steps, 1)
+        eta_min = cfg.rl.lr * cfg.rl.eta_min_ratio
+        scheds = [torch.optim.lr_scheduler.LinearLR(
+            self.optimizer, start_factor=0.1, total_iters=warmup_steps)]
+        milestones = [warmup_steps]
+        if cfg.rl.lr_restart:
+            restart_at = post_warmup // 2
+            scheds.append(torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=restart_at, eta_min=eta_min))
+            # LinearLR factors multiply against base lr (cfg.rl.lr): start at eta_min, end at peak.
+            scheds.append(torch.optim.lr_scheduler.LinearLR(
+                self.optimizer, start_factor=cfg.rl.eta_min_ratio,
+                end_factor=1.0, total_iters=warmup_steps))
+            milestones.append(warmup_steps + restart_at)
+            milestones.append(warmup_steps + restart_at + warmup_steps)
+            scheds.append(torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=max(post_warmup - restart_at - warmup_steps, 1),
+                eta_min=eta_min))
+        else:
+            scheds.append(torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=post_warmup, eta_min=eta_min))
         self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-            self.optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
+            self.optimizer, schedulers=scheds, milestones=milestones)
 
         # --- Stats + logging ---
         # Label includes key config differences for comparison plots
@@ -425,7 +448,10 @@ class Trainer:
         self.stats = TrainingStats(method=label)
         self.console = ConsoleLogger(label=label)
         if is_main_process():
-            init_wandb(cfg, project=cfg.wandb_project, run_name=cfg.wandb_run_name)
+            # Default run name to run_dir basename; else wandb generates a random slug.
+            run_name = cfg.wandb_run_name or os.path.basename(cfg.run_dir.rstrip("/"))
+            init_wandb(cfg, project=cfg.wandb_project, run_name=run_name,
+                       group=cfg.wandb_group)
 
         # --- Eval worker ---
         # For now, reuse the rollout worker for eval when available.
@@ -932,7 +958,7 @@ class Trainer:
             print("Evaluating baseline...")
             baseline_metrics, baseline_correct, baseline_incorrect = self._run_eval(eval_data)
             backend = baseline_metrics.get("eval_backend", "hf")
-            print(f"Baseline accuracy: {baseline_metrics['accuracy_pct']:.1f}%  format: {baseline_metrics['format_rate_pct']:.1f}%  ({backend}, {baseline_metrics.get('eval_time_s', 0):.1f}s)")
+            print(f"Baseline accuracy: {baseline_metrics['accuracy_pct']:.1f}%  format: {baseline_metrics['format_rate_pct']:.1f}%  capped: {baseline_metrics.get('cap_rate_pct', 0):.1f}%  ({backend}, {baseline_metrics.get('eval_time_s', 0):.1f}s)")
             log_metrics({"eval/" + k: v for k, v in baseline_metrics.items()}, step=0)
             self.stats.eval_steps.append(0)
             self.stats.eval_accuracy.append(baseline_metrics["accuracy_pct"])
@@ -966,8 +992,16 @@ class Trainer:
                             self.rollout_worker.wake_up()
                     micro_batches = self.rollout_phase()
                     if self.rollout_worker and self.rollout_worker.colocated:
+                        # Drain trainer cache before sleep so vLLM's `freed_bytes >= 0`
+                        # invariant sees a stable baseline. See colocated allocator note below.
+                        gc.collect()
+                        torch.cuda.empty_cache()
                         with record_function("vllm_sleep"):
                             self.rollout_worker.sleep()
+                        # Also after sleep — clears any blocks freed by sleep itself,
+                        # so the next wake_up starts on a clean trainer pool.
+                        gc.collect()
+                        torch.cuda.empty_cache()
                 with record_function("train_phase"), Timer() as train_t:
                     metrics = self.train_phase(micro_batches)
                 with record_function("weight_sync"):
@@ -1119,8 +1153,10 @@ class Trainer:
                         self.rollout_worker.wake_up()
                     eval_metrics, _, _ = self._run_eval(eval_data)
                     if self.rollout_worker and self.rollout_worker.colocated:
+                        gc.collect()
+                        torch.cuda.empty_cache()
                         self.rollout_worker.sleep()
-                    print(f"  [eval] Step {step:04d} | accuracy={eval_metrics['accuracy_pct']:.1f}%  format={eval_metrics['format_rate_pct']:.1f}%  reward={eval_metrics['avg_reward']:.3f}  ({eval_metrics.get('eval_time_s', 0):.1f}s)")
+                    print(f"  [eval] Step {step:04d} | accuracy={eval_metrics['accuracy_pct']:.1f}%  format={eval_metrics['format_rate_pct']:.1f}%  capped={eval_metrics.get('cap_rate_pct', 0):.1f}%  reward={eval_metrics['avg_reward']:.3f}  ({eval_metrics.get('eval_time_s', 0):.1f}s)")
                     log_metrics({"eval/" + k: v for k, v in eval_metrics.items()}, step)
                     # Store in stats for offline analysis
                     self.stats.eval_steps.append(step)
@@ -1153,8 +1189,10 @@ class Trainer:
                 self.rollout_worker.wake_up()
             final_metrics, final_correct, final_incorrect = self._run_eval(eval_data)
             if self.rollout_worker and self.rollout_worker.colocated:
+                gc.collect()
+                torch.cuda.empty_cache()
                 self.rollout_worker.sleep()
-            print(f"Final accuracy: {final_metrics['accuracy_pct']:.1f}%  format: {final_metrics['format_rate_pct']:.1f}%  ({final_metrics.get('eval_time_s', 0):.1f}s)")
+            print(f"Final accuracy: {final_metrics['accuracy_pct']:.1f}%  format: {final_metrics['format_rate_pct']:.1f}%  capped: {final_metrics.get('cap_rate_pct', 0):.1f}%  ({final_metrics.get('eval_time_s', 0):.1f}s)")
             compare_metrics(baseline_metrics, final_metrics, label="RL training")
 
             self.stats.eval_steps.append(self.cfg.num_steps)
@@ -1165,6 +1203,16 @@ class Trainer:
             log_metrics({"eval/" + k: v for k, v in final_metrics.items()},
                         step=self.cfg.num_steps)
             finish_wandb()
+
+            # Persist eval samples for offline inspection (length-cap diagnosis,
+            # response-quality reads, debugging). JSON keeps it human-greppable.
+            import json
+            os.makedirs(self.cfg.run_dir, exist_ok=True)
+            samples_path = os.path.join(self.cfg.run_dir, "eval_samples_final.json")
+            with open(samples_path, "w") as f:
+                json.dump({"correct": final_correct, "incorrect": final_incorrect},
+                          f, indent=2, default=str)
+            print(f"Eval samples saved to {samples_path}")
         barrier()
 
         # --- Save stats + plots (rank 0 only) ---

@@ -69,7 +69,8 @@ def evaluate_model(
         model.train()
 
     # --- Score responses ---
-    for ex, resp in zip(subset, all_responses):
+    n_capped = 0
+    for ex, (resp, n_tok) in zip(subset, all_responses):
         ans = extract_answer(resp)
         if ans:
             format_ok += 1
@@ -78,15 +79,18 @@ def evaluate_model(
         r = env.reward_fn(resp, ex)
         reward_sum += r
         char_lengths.append(len(resp))
-        # add_special_tokens=False: we only want the generated content length,
-        # not BOS/EOS that the tokenizer would insert
-        token_lengths.append(len(tokenizer.encode(resp, add_special_tokens=False)))
+        token_lengths.append(n_tok)
+        capped = n_tok >= max_new_tokens
+        if capped:
+            n_capped += 1
         detail = {
             "question": ex.problem,
             "ground_truth": gt,
             "predicted": pred,
             "reward": r,
             "response": resp,
+            "length_tokens": n_tok,
+            "capped": capped,
         }
         if answer_match(gt, pred):
             correct += 1
@@ -105,6 +109,8 @@ def evaluate_model(
             "avg_reward": reward_sum / total,
             "avg_length_tokens": float(np.mean(token_lengths)) if token_lengths else 0.0,
             "avg_length_chars": float(np.mean(char_lengths)) if char_lengths else 0.0,
+            "n_capped": n_capped,
+            "cap_rate_pct": 100.0 * n_capped / total if total else 0.0,
             "eval_time_s": elapsed,
             "eval_backend": backend,
         },
@@ -116,9 +122,10 @@ def evaluate_model(
 def _eval_generate_hf(
     model, tokenizer, examples, env,
     batch_size: int, max_new_tokens: int, device: str,
-) -> list[str]:
-    """Generate greedy responses using HF model.generate()."""
-    all_responses = []
+) -> list[tuple[str, int]]:
+    """Greedy HF generation. Returns (text, generated_token_count) per example.
+    Token count is the unpadded generated-portion length (excludes prompt + right-pad)."""
+    all_out = []
     for i in range(0, len(examples), batch_size):
         batch = examples[i : i + batch_size]
         prompts = [env.format_prompt(ex) for ex in batch]
@@ -130,24 +137,29 @@ def _eval_generate_hf(
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.eos_token_id,
         )
-        responses = tokenizer.batch_decode(gen[:, plen:], skip_special_tokens=True)
-        all_responses.extend(responses)
-    return all_responses
+        gen_only = gen[:, plen:]
+        responses = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+        # Per-row real length: count non-pad positions. pad_id == eos_id with HF's
+        # default => collapses EOS into pad, but that's the same first-stop signal.
+        real_lens = (gen_only != tokenizer.eos_token_id).sum(dim=1).tolist()
+        # If a row has zero pad/eos, it filled the budget — clamp to max_new_tokens.
+        real_lens = [min(rl, max_new_tokens) if rl > 0 else max_new_tokens for rl in real_lens]
+        all_out.extend(zip(responses, real_lens))
+    return all_out
 
 
 def _eval_generate_vllm(
     vllm_worker, tokenizer, examples, env,
     batch_size: int, max_new_tokens: int,
-) -> list[str]:
-    """Generate greedy responses using vLLM worker. Much faster than HF."""
+) -> list[tuple[str, int]]:
+    """Greedy vLLM generation. Returns (text, generated_token_count) per example."""
     from vllm import SamplingParams
 
-    all_responses = []
+    all_out = []
     for i in range(0, len(examples), batch_size):
         batch = examples[i : i + batch_size]
         prompts = [env.format_prompt(ex) for ex in batch]
 
-        # Use vLLM's generate directly — greedy (temperature=0), n=1
         sp = SamplingParams(temperature=0.0, max_tokens=max_new_tokens, n=1)
         outputs = vllm_worker.llm.generate(
             prompts, sp,
@@ -155,8 +167,9 @@ def _eval_generate_vllm(
             use_tqdm=False,
         )
         for req_output in outputs:
-            all_responses.append(req_output.outputs[0].text)
-    return all_responses
+            comp = req_output.outputs[0]
+            all_out.append((comp.text, len(comp.token_ids)))
+    return all_out
 
 
 def sample_evaluate(

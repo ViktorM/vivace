@@ -112,7 +112,7 @@ def sft_train_loop(model, tokenizer, train_data: list[dict], cfg: SFTConfig, opt
     - loader = DataLoader(train_data, batch_size=cfg.batch_size, shuffle=True,
                           collate_fn=lambda b: encode_sft_batch(b, tokenizer, device))
     - scheduler = torch.optim.lr_scheduler.LinearLR(
-                      optimizer, start_factor=0.1, total_iters=cfg.warmup_iters)
+                      optimizer, start_factor=0.1, total_iters=cfg.warmup_steps)
     - Loop until cfg.steps reached, then return.
     """
     # TODO: implement.

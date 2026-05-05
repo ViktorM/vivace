@@ -5,8 +5,9 @@ mode: colocated
 trainer_gpus: [0, 1]
 rollout_gpus: [0, 1]
 use_vllm: true
-gpu_memory_utilization: 0.35
+gpu_memory_utilization: 0.32
 enforce_eager: false
+compile_model: false      # torch.compile; can interact badly with peft/DDP/variable-T
 vllm_max_model_len: 1024
 vllm_max_num_seqs: 32
 use_lora: true
@@ -24,6 +25,9 @@ sft_warmup_steps: 0
 wandb_project: vivace
 log_interval: 1
 eval_interval: 100
+eval_n: 500
+eval_batch_size: 32
+eval_use_vllm: true
 checkpoint_interval: 100
 run_dir: runs/dapo_qw25_0.5b_lora_colo_ddp
 weight_sync_method: ipc
@@ -34,10 +38,13 @@ rl:
   batch_size: 1
   group_size: 8
   lr: 6.0e-05
+  warmup_steps: 10        # initial linear warmup; also used as the restart ramp length when lr_restart=true
   grad_accum_steps: 4
   optim_epochs: 2
+  eta_min_ratio: 0.2     # cosine floor as fraction of peak lr (peak * ratio = eta_min)
+  lr_restart: true      # True: CosineAnnealingWarmRestarts with T_0 = (num_steps - warmup) // 2
   grad_clip: 1.0
-  max_new_tokens: 192
+  max_new_tokens: 256
   temperature: 0.7
   top_p: 0.95
   top_k: -1

@@ -96,6 +96,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="override TrainerConfig.weight_sync_disk_path. Defaults to "
                         "/dev/shm/vivace_sync_<run_basename>; pass e.g. 'runs/<tag>/adapter' "
                         "to force NVMe.")
+    p.add_argument("--wandb-project", type=str, default=None,
+                   help="override TrainerConfig.wandb_project")
+    p.add_argument("--wandb-run-name", type=str, default=None,
+                   help="override TrainerConfig.wandb_run_name (defaults to run_dir basename)")
+    p.add_argument("--wandb-group", type=str, default=None,
+                   help="override TrainerConfig.wandb_group (clusters runs in wandb UI)")
     return p.parse_args(argv)
 
 
@@ -114,6 +120,12 @@ def main(argv: list[str] | None = None) -> None:
         cfg_dict["weight_sync_method"] = args.weight_sync_method
     if args.weight_sync_disk_path is not None:
         cfg_dict["weight_sync_disk_path"] = args.weight_sync_disk_path
+    if args.wandb_project is not None:
+        cfg_dict["wandb_project"] = args.wandb_project
+    if args.wandb_run_name is not None:
+        cfg_dict["wandb_run_name"] = args.wandb_run_name
+    if args.wandb_group is not None:
+        cfg_dict["wandb_group"] = args.wandb_group
 
     _maybe_enable_vllm_callable_rpc(cfg_dict)
 

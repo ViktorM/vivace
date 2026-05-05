@@ -57,10 +57,14 @@ class RLConfig:
     batch_size: int = 1
     group_size: int = 8
     lr: float = 1e-6
-    warmup_iters: int = 10
+    warmup_steps: int = 10
     grad_clip: float = 1.0
     grad_accum_steps: int = 4
     optim_epochs: int = 2          # RLOO should use 1
+
+    # --- LR schedule (post-warmup cosine) ---
+    eta_min_ratio: float = 0.2     # cosine floor as fraction of peak lr (peak * ratio = eta_min)
+    lr_restart: bool = False       # True: cosine to mid, linear ramp eta_min→peak over `warmup_steps`, cosine again
 
     # --- Adaptive LR (DAPO-style) ---
     use_adaptive_lr: bool = False
@@ -177,6 +181,6 @@ class SFTConfig:
     lr: float = 1e-5
     steps: int = 200
     batch_size: int = 4
-    warmup_iters: int = 5
+    warmup_steps: int = 5
     grad_clip: float = 1.0
     n_examples: int = 2000

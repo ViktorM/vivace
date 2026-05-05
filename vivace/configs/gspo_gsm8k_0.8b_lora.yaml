@@ -13,12 +13,16 @@ lora_target_modules:
 - k_proj
 - v_proj
 - o_proj
+compile_model: false      # torch.compile — flip to true to test ~10-30% speedup; can interact badly with peft/DDP/variable-T
 num_steps: 500
 sft_warmup: false
 sft_warmup_steps: 0
 wandb_project: vivace
 log_interval: 1
 eval_interval: 50
+eval_n: 500
+eval_batch_size: 32
+eval_use_vllm: true
 checkpoint_interval: 100
 run_dir: runs/gspo_gsm8k_0.8b_lora
 weight_sync_method: nccl
@@ -29,8 +33,11 @@ rl:
   batch_size: 1
   group_size: 6
   lr: 2.0e-05
+  warmup_steps: 10        # initial linear warmup; also used as the restart ramp length when lr_restart=true
   grad_accum_steps: 4
   optim_epochs: 2
+  eta_min_ratio: 0.2     # cosine floor as fraction of peak lr (peak * ratio = eta_min)
+  lr_restart: false      # True: CosineAnnealingWarmRestarts with T_0 = (num_steps - warmup) // 2
   grad_clip: 1.0
   max_new_tokens: 192
   temperature: 0.9
