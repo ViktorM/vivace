@@ -42,6 +42,7 @@ class TrainingStats:
     length_std: list[float] = field(default_factory=list)       # drops to 0 alongside reward_std → identical outputs
     length_max: list[float] = field(default_factory=list)       # = max_new_tokens every time → model never stops
     length_min: list[float] = field(default_factory=list)       # → 1 means model learned to output one token and stop
+    cap_rates: list[float] = field(default_factory=list)        # fraction of rollouts hitting max_new_tokens — leading indicator of length-gaming
     advantage_std: list[float] = field(default_factory=list)    # ~0 means no learning signal (all samples equally good/bad)
     # --- performance (wall-clock + throughput) ---
     # Populated by the trainer using vivace.utils.perf.Timer around each phase.

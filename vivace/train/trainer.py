@@ -1051,6 +1051,10 @@ class Trainer:
                 "rollout_time": rollout_t.dt,
                 "train_time": train_t.dt,
                 "step_time": step_t.dt,
+                "cap_rate": self._last_cap_rate,
+                "alive_rate": self._last_alive_rate,
+                "spread_mean": self._last_spread_mean,
+                "spread_max": self._last_spread_max,
             }
             perf = reduce_metrics(perf_raw, {
                 "rollout_tokens": "sum",
@@ -1060,6 +1064,10 @@ class Trainer:
                 "rollout_time": "max",
                 "train_time": "max",
                 "step_time": "max",
+                "cap_rate": "mean",
+                "alive_rate": "mean",
+                "spread_mean": "mean",
+                "spread_max": "max",
             })
 
             self.stats.log(
@@ -1081,9 +1089,10 @@ class Trainer:
                 length_std=metrics["length_std"],
                 length_max=metrics["length_max"],
                 length_min=metrics["length_min"],
+                cap_rates=perf["cap_rate"],
                 advantage_std=metrics["advantage_std"],
                 # Adaptive sampling (0 if disabled)
-                alive_rates=self._last_alive_rate,
+                alive_rates=perf["alive_rate"],
                 # Performance (cross-rank reduced — see perf_raw above)
                 rollout_time=perf["rollout_time"],
                 train_time=perf["train_time"],
@@ -1108,11 +1117,11 @@ class Trainer:
             if is_main_process():
                 if step % self.cfg.log_interval == 0:
                     self.console.log(step, perf=perf_info, **metrics)
-                    aux = [f"capped={self._last_cap_rate:.1%}"]
+                    aux = [f"capped={perf['cap_rate']:.1%}"]
                     if self.cfg.rl.adaptive_sampling:
-                        aux = [f"alive={self._last_alive_rate:.1%}",
-                               f"spread_mean={self._last_spread_mean:.3f}",
-                               f"spread_max={self._last_spread_max:.3f}"] + aux
+                        aux = [f"alive={perf['alive_rate']:.1%}",
+                               f"spread_mean={perf['spread_mean']:.3f}",
+                               f"spread_max={perf['spread_max']:.3f}"] + aux
                     print("    " + " ".join(aux))
                     # Core metrics (flat — wandb top level)
                     log_metrics({
@@ -1130,7 +1139,7 @@ class Trainer:
                         "length/std": metrics["length_std"],
                         "length/max": metrics["length_max"],
                         "length/min": metrics["length_min"],
-                        "length/cap_rate": self._last_cap_rate,
+                        "length/cap_rate": perf["cap_rate"],
                     }, step)
                     # Reward distribution
                     log_metrics({
@@ -1142,9 +1151,9 @@ class Trainer:
                     # Adaptive sampling (logged even when disabled — 0 values)
                     if self.cfg.rl.adaptive_sampling:
                         log_metrics({
-                            "sampling/alive_rate": self._last_alive_rate,
-                            "sampling/spread_mean": self._last_spread_mean,
-                            "sampling/spread_max": self._last_spread_max,
+                            "sampling/alive_rate": perf["alive_rate"],
+                            "sampling/spread_mean": perf["spread_mean"],
+                            "sampling/spread_max": perf["spread_max"],
                         }, step)
                     # Performance
                     log_metrics({
