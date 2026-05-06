@@ -417,18 +417,21 @@ class Trainer:
             self.optimizer, start_factor=0.1, total_iters=warmup_steps)]
         milestones = [warmup_steps]
         if cfg.rl.lr_restart:
-            restart_at = post_warmup // 2
+            # Restart fires at the midpoint of the whole run (step num_steps // 2),
+            # so first cosine runs from end-of-warmup to that midpoint.
+            restart_step = cfg.num_steps // 2
+            cosine1_steps = max(restart_step - warmup_steps, 1)
             scheds.append(torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=restart_at, eta_min=eta_min))
+                self.optimizer, T_max=cosine1_steps, eta_min=eta_min))
             # LinearLR factors multiply against base lr (cfg.rl.lr): start at eta_min, end at peak.
             scheds.append(torch.optim.lr_scheduler.LinearLR(
                 self.optimizer, start_factor=cfg.rl.eta_min_ratio,
                 end_factor=1.0, total_iters=warmup_steps))
-            milestones.append(warmup_steps + restart_at)
-            milestones.append(warmup_steps + restart_at + warmup_steps)
+            milestones.append(restart_step)
+            milestones.append(restart_step + warmup_steps)
             scheds.append(torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                T_max=max(post_warmup - restart_at - warmup_steps, 1),
+                T_max=max(cfg.num_steps - restart_step - warmup_steps, 1),
                 eta_min=eta_min))
         else:
             scheds.append(torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -804,6 +807,10 @@ class Trainer:
         self._last_alive_rate = float(np.mean(alive_rates_step)) if alive_rates_step else 0.0
         self._last_spread_mean = float(np.mean([s[0] for s in spread_step])) if spread_step else 0.0
         self._last_spread_max = float(max(s[1] for s in spread_step)) if spread_step else 0.0
+        # Fraction of training rollouts that hit max_new_tokens — leading indicator
+        # of length-gaming or policy regression (lagging eval-time cap_rate_pct).
+        all_lens = torch.cat([mb["response_lengths"] for mb in micro_batches])
+        self._last_cap_rate = (all_lens >= self.cfg.rl.max_new_tokens).float().mean().item()
 
         return micro_batches
 
@@ -1101,8 +1108,12 @@ class Trainer:
             if is_main_process():
                 if step % self.cfg.log_interval == 0:
                     self.console.log(step, perf=perf_info, **metrics)
+                    aux = [f"capped={self._last_cap_rate:.1%}"]
                     if self.cfg.rl.adaptive_sampling:
-                        print(f"    alive={self._last_alive_rate:.1%} spread_mean={self._last_spread_mean:.3f} spread_max={self._last_spread_max:.3f}")
+                        aux = [f"alive={self._last_alive_rate:.1%}",
+                               f"spread_mean={self._last_spread_mean:.3f}",
+                               f"spread_max={self._last_spread_max:.3f}"] + aux
+                    print("    " + " ".join(aux))
                     # Core metrics (flat — wandb top level)
                     log_metrics({
                         "loss": metrics["loss"],
@@ -1119,6 +1130,7 @@ class Trainer:
                         "length/std": metrics["length_std"],
                         "length/max": metrics["length_max"],
                         "length/min": metrics["length_min"],
+                        "length/cap_rate": self._last_cap_rate,
                     }, step)
                     # Reward distribution
                     log_metrics({

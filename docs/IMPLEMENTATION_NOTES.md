@@ -75,22 +75,20 @@ reasoning gains are marginal at this model size on this env.
 - **Length penalty in reward function.** Discourage rambling explicitly.
   Small but consistent gains; cheap to add (modify `env.reward_fn` to
   subtract a coefficient × length).
-- **LR schedule experiments — done, both negative.** `cfg.rl.eta_min_ratio`
-  and `cfg.rl.lr_restart` are now exposed. Tested on Qwen2.5-0.5B / GSM8K /
-  DAPO-RLOO / LoRA-r16 / 500 steps:
+- **LR schedule experiments — done, all three negative.** `cfg.rl.eta_min_ratio`
+  and `cfg.rl.lr_restart` are exposed. Tested on Qwen2.5-0.5B / GSM8K /
+  DAPO-RLOO / LoRA-r16 / 500 steps, single seed=42:
   - `eta_min_ratio: 0.2 → 0.4`: within noise (53.2% → 52.4%).
-  - `lr_restart: True` (T_0 = (num_steps - warmup) // 2): meaningfully
-    worse (53.2% → 48.6%, ~2σ). Hard restart at step ~255 knocked the
-    policy into an inferior basin; kl/grad_norm spike at step 320, no
-    recovery. Conclusion: 50–53% ceiling is structural at this model size,
-    not LR-decay-limited.
-  - **Possible softer-restart variant to try later**: `T_0=100, T_mult=2`
-    (PyTorch's `CosineAnnealingWarmRestarts` second arg = period growth
-    factor). Shorter first cycle, doubling lengths after, gives gentler
-    perturbations earlier in training where the policy is still adapting.
-    Would need a small extension to the config schema (T_0/T_mult fields).
-    Low priority — the negative result above suggests this whole class of
-    knob isn't where the gains are.
+  - `lr_restart: True`, hard restart (jump from eta_min to peak in one
+    step): meaningfully worse (53.2% → 48.6%, ~2σ). kl/grad_norm spike at
+    step 320, no recovery. Hard restart knocked the policy into an
+    inferior basin.
+  - `lr_restart: True`, soft restart (linear ramp eta_min → peak over
+    `warmup_steps`): within noise (53.2% → 53.0%). Soft enough to not
+    destabilize, gentle enough not to shake the policy out of its basin.
+  - **Conclusion**: 50–53% ceiling is structural at this model size on
+    GSM8K. LR schedule isn't the bottleneck. Pushing past requires bigger
+    model, harder env, or different reward (PRM, length penalty).
 - **Larger model (1.5B disaggregated locally, 7B+ on cluster).** 0.5B is
   near its ceiling on GSM8K with this recipe. Configs exist for 1.5B and
   0.8B already; 7B+ needs the cluster path.
