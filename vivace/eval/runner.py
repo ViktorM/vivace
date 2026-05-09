@@ -113,6 +113,11 @@ def evaluate_model(
             "cap_rate_pct": 100.0 * n_capped / total if total else 0.0,
             "eval_time_s": elapsed,
             "eval_backend": backend,
+            "n_correct": correct,
+            "n_format_ok": format_ok,
+            "reward_sum": reward_sum,
+            "token_sum": float(np.sum(token_lengths)),
+            "char_sum": float(np.sum(char_lengths)),
         },
         correct_list,
         incorrect_list,
@@ -269,17 +274,28 @@ def _sample_generate_vllm(
 
 def compare_metrics(before: dict, after: dict, label: str = "") -> None:
     print(f"\n{'=' * 65}")
+    if "n" in before:
+        print(f"Eval set size: {int(before['n'])}")
     print(f"{'Metric':<25} {'Before':>10} {'After':>10} {'Delta':>10}")
     print(f"{'=' * 65}")
     for k in before:
+        if k == "n":
+            continue        # constant across before/after; printed once above
         b, a = before[k], after[k]
-        if isinstance(b, (int, float)):
-            d = a - b
-            arrow = "^" if d > 0.001 else "v" if d < -0.001 else "="
-            fmt = f"{b:>9.1f}%" if "pct" in k else f"{b:>10.3f}"
-            fmt2 = f"{a:>9.1f}%" if "pct" in k else f"{a:>10.3f}"
-            dfmt = f"{d:>+8.1f}%" if "pct" in k else f"{d:>+9.3f}"
-            print(f"{k:<25} {fmt} {fmt2} {dfmt} {arrow}")
+        if not isinstance(b, (int, float)):
+            continue
+        d = a - b
+        arrow = "^" if d > 0.001 else "v" if d < -0.001 else "="
+        is_int = isinstance(b, int) or (float(b).is_integer() and float(a).is_integer())
+        if "pct" in k:
+            fmt, fmt2, dfmt = f"{b:>9.1f}%", f"{a:>9.1f}%", f"{d:>+8.1f}%"
+        elif is_int:
+            fmt, fmt2, dfmt = f"{b:>10.0f}", f"{a:>10.0f}", f"{d:>+9.0f}"
+        elif "length" in k:
+            fmt, fmt2, dfmt = f"{b:>10.1f}", f"{a:>10.1f}", f"{d:>+9.1f}"
+        else:
+            fmt, fmt2, dfmt = f"{b:>10.3f}", f"{a:>10.3f}", f"{d:>+9.3f}"
+        print(f"{k:<25} {fmt} {fmt2} {dfmt} {arrow}")
     print(f"{'=' * 65}")
 
 

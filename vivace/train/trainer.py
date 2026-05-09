@@ -111,7 +111,7 @@ class TrainerConfig:
     sft_warmup_steps: int = 0
 
     # ----- eval -----
-    eval_n: int = 500               # number of eval examples (-1 = full eval set)
+    eval_n: int = 500               # number of eval examples; <=0 = full eval set
     eval_batch_size: int = 32        # batch size for eval generation
     eval_use_vllm: bool = True       # use vLLM for eval when available (much faster)
     eval_gpus: list[int] = field(default_factory=list)  # separate eval GPUs (empty = use rollout worker)
@@ -597,16 +597,87 @@ class Trainer:
             print(f"  [disk-sync] adapter path: {self._resolved_sync_disk_path}")
 
     def _run_eval(self, eval_data: list, label: str = "") -> tuple[dict, list, list]:
-        """Run evaluation using the best available backend."""
-        n = len(eval_data) if self.cfg.eval_n == -1 else self.cfg.eval_n
-        return evaluate_model(
-            self.model, self.tokenizer, eval_data, self.env,
-            n=n,
+        """Run evaluation using the best available backend.
+
+        `label` ("baseline" / "step_NNNN" / "final" / etc.) is attached to the
+        returned metrics dict and used by `_save_eval_samples` for the JSON
+        filename, so multiple eval moments can be persisted side by side.
+        """
+        n = len(eval_data) if self.cfg.eval_n <= 0 else self.cfg.eval_n
+        # Cached deterministic shuffle (cfg.seed, identical across ranks): keeps
+        # contiguous slices length/difficulty-balanced on sorted datasets.
+        if getattr(self, "_eval_shuffle_idxs", None) is None \
+                or len(self._eval_shuffle_idxs) != len(eval_data):
+            self._eval_shuffle_idxs = np.random.RandomState(self.cfg.seed).permutation(len(eval_data))
+
+        subset = [eval_data[i] for i in self._eval_shuffle_idxs[:n]]
+        data_per_rank = (n + self.world_size - 1) // self.world_size
+        offset = self.rank * data_per_rank
+        local = subset[offset : offset + data_per_rank]
+        local_metrics, local_correct, local_incorrect = evaluate_model(
+            self.model, self.tokenizer, local, self.env,
+            n=-1, # already sliced
             batch_size=self.cfg.eval_batch_size,
             max_new_tokens=self.cfg.rl.max_new_tokens,
             device=str(self.device),
             vllm_worker=self.eval_worker,
         )
+
+        # *_sum fields are aggregation plumbing only; never user-facing.
+        _raw_keys = ("reward_sum", "token_sum", "char_sum")
+        if self.world_size == 1:
+            local_metrics["label"] = label
+            for k in _raw_keys:
+                local_metrics.pop(k, None)
+            return local_metrics, local_correct, local_incorrect
+
+        # Cross-rank aggregation (every rank participates in the all_reduce)
+        raw = {k: local_metrics[k] for k in
+            ["n", "n_correct", "n_format_ok", "n_capped",
+                "reward_sum", "token_sum", "char_sum", "eval_time_s"]}
+        agg = reduce_metrics(raw, {
+            "n": "sum", "n_correct": "sum", "n_format_ok": "sum",
+            "n_capped": "sum", "reward_sum": "sum",
+            "token_sum": "sum", "char_sum": "sum",
+            "eval_time_s": "max",
+        })
+        metrics = {
+            "n":               int(agg["n"]),
+            "accuracy_pct":    100.0 * agg["n_correct"]   / agg["n"],
+            "format_rate_pct": 100.0 * agg["n_format_ok"] / agg["n"],
+            "cap_rate_pct":    100.0 * agg["n_capped"]    / agg["n"],
+            "avg_reward":      agg["reward_sum"] / agg["n"],
+            "avg_length_tokens": agg["token_sum"] / agg["n"],
+            "avg_length_chars":  agg["char_sum"]  / agg["n"],
+            "n_correct":       int(agg["n_correct"]),
+            "n_format_ok":     int(agg["n_format_ok"]),
+            "n_capped":        int(agg["n_capped"]),
+            "eval_time_s":     agg["eval_time_s"],
+            "eval_backend":    local_metrics["eval_backend"],
+            "label":           label,
+        }
+
+        # Gather per-sample lists for inspection JSON
+        gathered_correct = [None] * self.world_size
+        gathered_incorrect = [None] * self.world_size
+        dist.all_gather_object(gathered_correct, local_correct)
+        dist.all_gather_object(gathered_incorrect, local_incorrect)
+        correct = [x for sub in gathered_correct for x in sub]
+        incorrect = [x for sub in gathered_incorrect for x in sub]
+
+        return metrics, correct, incorrect
+
+    def _save_eval_samples(self, label: str, correct: list, incorrect: list) -> None:
+        """Persist eval samples as eval_samples_{label}.json in the run dir.
+        Rank-0-only; no-op if label is empty (caller opted out)."""
+        if not is_main_process() or not label:
+            return
+        import json
+        os.makedirs(self.cfg.run_dir, exist_ok=True)
+        path = os.path.join(self.cfg.run_dir, f"eval_samples_{label}.json")
+        with open(path, "w") as f:
+            json.dump({"correct": correct, "incorrect": incorrect}, f, indent=2, default=str)
+        print(f"Eval samples saved to {path}")
 
     def maybe_sft_warmup(self) -> None:
         """Run a short SFT pass before RL if `cfg.sft_warmup`. Unused by default.
@@ -955,15 +1026,12 @@ class Trainer:
         self.maybe_sft_warmup()
 
         # --- Baseline eval ---
-        # TODO: shard eval across ranks for ~world_size× speedup. v1 runs only on
-        # rank 0 (~5-10s on 0.5B/500-example GSM8K, fine). For larger eval sets
-        # or models this becomes a real cost — see docs/architecture.md notes.
         eval_data = self.env.load_split("eval")
-        baseline_metrics = None
-        baseline_correct = baseline_incorrect = None
+        baseline_metrics, baseline_correct, baseline_incorrect = self._run_eval(eval_data, label="baseline")
+        self._save_eval_samples("baseline", baseline_correct, baseline_incorrect)
+
         if is_main_process():
             print("Evaluating baseline...")
-            baseline_metrics, baseline_correct, baseline_incorrect = self._run_eval(eval_data)
             backend = baseline_metrics.get("eval_backend", "hf")
             print(f"Baseline accuracy: {baseline_metrics['accuracy_pct']:.1f}%  format: {baseline_metrics['format_rate_pct']:.1f}%  capped: {baseline_metrics.get('cap_rate_pct', 0):.1f}%  ({backend}, {baseline_metrics.get('eval_time_s', 0):.1f}s)")
             log_metrics({"eval/" + k: v for k, v in baseline_metrics.items()}, step=0)
@@ -1165,33 +1233,31 @@ class Trainer:
                         "perf/lr": cur_lr,
                     }, step)
 
-                # --- Periodic eval ---
-                if step > 0 and step % self.cfg.eval_interval == 0:
-                    # In colocated mode the rollout phase put vLLM to sleep; wake it
-                    # before eval (which calls vllm.generate) and sleep again after so
-                    # the next step's rollout starts in the expected (asleep) state.
-                    if self.rollout_worker and self.rollout_worker.colocated:
-                        self.rollout_worker.wake_up()
-                    eval_metrics, _, _ = self._run_eval(eval_data)
-                    if self.rollout_worker and self.rollout_worker.colocated:
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        self.rollout_worker.sleep()
+            # --- Periodic eval (out of is_main_process: all ranks must enter
+            # _run_eval to participate in its all_reduce) ---
+            if step > 0 and step % self.cfg.eval_interval == 0:
+                if self.rollout_worker and self.rollout_worker.colocated:
+                    self.rollout_worker.wake_up()
+                eval_metrics, _, _ = self._run_eval(eval_data, label=f"step_{step:04d}")
+                if self.rollout_worker and self.rollout_worker.colocated:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    self.rollout_worker.sleep()
+                if is_main_process():
                     print(f"  [eval] Step {step:04d} | accuracy={eval_metrics['accuracy_pct']:.1f}%  format={eval_metrics['format_rate_pct']:.1f}%  capped={eval_metrics.get('cap_rate_pct', 0):.1f}%  reward={eval_metrics['avg_reward']:.3f}  ({eval_metrics.get('eval_time_s', 0):.1f}s)")
                     log_metrics({"eval/" + k: v for k, v in eval_metrics.items()}, step)
-                    # Store in stats for offline analysis
                     self.stats.eval_steps.append(step)
                     self.stats.eval_accuracy.append(eval_metrics["accuracy_pct"])
                     self.stats.eval_format_rate.append(eval_metrics["format_rate_pct"])
                     self.stats.eval_reward.append(eval_metrics["avg_reward"])
 
-                # --- Periodic checkpoint (stub — save_checkpoint not implemented yet) ---
-                # if step > 0 and step % self.cfg.checkpoint_interval == 0:
-                #     save_checkpoint(self.model, self.optimizer, self.scheduler,
-                #                     step, f"{self.cfg.run_dir}/ckpt-{step}")
+            # --- Periodic checkpoint (stub — save_checkpoint not implemented yet) ---
+            # if step > 0 and step % self.cfg.checkpoint_interval == 0:
+            #     save_checkpoint(self.model, self.optimizer, self.scheduler,
+            #                     step, f"{self.cfg.run_dir}/ckpt-{step}")
 
             # Non-rank-0 ranks wait here so they don't race ahead during rank 0's
-            # eval/log/checkpoint work above. Cheap when eval doesn't fire.
+            # log/checkpoint work above.
             barrier()
 
         # --- Clean up profiler if training ended before profiling window ---
@@ -1200,40 +1266,27 @@ class Trainer:
             export_and_summarize(prof, self.profiling_cfg, self.cfg.run_dir)
             prof = None
 
-        # --- Final eval ---
-        final_metrics = None
-        final_correct = final_incorrect = None
+        # --- Final eval (all ranks participate in _run_eval's all_reduce) ---
         if is_main_process():
             print("\nFinal evaluation...")
-            # Same wake/sleep dance as periodic eval (vLLM is asleep after the last step).
-            if self.rollout_worker and self.rollout_worker.colocated:
-                self.rollout_worker.wake_up()
-            final_metrics, final_correct, final_incorrect = self._run_eval(eval_data)
-            if self.rollout_worker and self.rollout_worker.colocated:
-                gc.collect()
-                torch.cuda.empty_cache()
-                self.rollout_worker.sleep()
+        if self.rollout_worker and self.rollout_worker.colocated:
+            self.rollout_worker.wake_up()
+        final_metrics, final_correct, final_incorrect = self._run_eval(eval_data, label="final")
+        if self.rollout_worker and self.rollout_worker.colocated:
+            gc.collect()
+            torch.cuda.empty_cache()
+            self.rollout_worker.sleep()
+        if is_main_process():
             print(f"Final accuracy: {final_metrics['accuracy_pct']:.1f}%  format: {final_metrics['format_rate_pct']:.1f}%  capped: {final_metrics.get('cap_rate_pct', 0):.1f}%  ({final_metrics.get('eval_time_s', 0):.1f}s)")
             compare_metrics(baseline_metrics, final_metrics, label="RL training")
-
             self.stats.eval_steps.append(self.cfg.num_steps)
             self.stats.eval_accuracy.append(final_metrics["accuracy_pct"])
             self.stats.eval_format_rate.append(final_metrics["format_rate_pct"])
             self.stats.eval_reward.append(final_metrics["avg_reward"])
-
             log_metrics({"eval/" + k: v for k, v in final_metrics.items()},
                         step=self.cfg.num_steps)
             finish_wandb()
-
-            # Persist eval samples for offline inspection (length-cap diagnosis,
-            # response-quality reads, debugging). JSON keeps it human-greppable.
-            import json
-            os.makedirs(self.cfg.run_dir, exist_ok=True)
-            samples_path = os.path.join(self.cfg.run_dir, "eval_samples_final.json")
-            with open(samples_path, "w") as f:
-                json.dump({"correct": final_correct, "incorrect": final_incorrect},
-                          f, indent=2, default=str)
-            print(f"Eval samples saved to {samples_path}")
+        self._save_eval_samples("final", final_correct, final_incorrect)
         barrier()
 
         # --- Save stats + plots (rank 0 only) ---

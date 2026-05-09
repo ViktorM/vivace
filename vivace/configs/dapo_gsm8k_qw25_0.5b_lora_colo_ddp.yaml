@@ -25,7 +25,7 @@ sft_warmup_steps: 0
 wandb_project: vivace
 log_interval: 1
 eval_interval: 100
-eval_n: 500
+eval_n: 750
 eval_batch_size: 32
 eval_use_vllm: true
 checkpoint_interval: 100
@@ -42,7 +42,7 @@ rl:
   grad_accum_steps: 4
   optim_epochs: 2
   eta_min_ratio: 0.2     # cosine floor as fraction of peak lr (peak * ratio = eta_min)
-  lr_restart: true      # True: cosine to step num_steps // 2, linear ramp eta_min→peak over warmup_steps, then cosine again
+  lr_restart: false      # True: CosineAnnealingWarmRestarts with T_0 = (num_steps - warmup) // 2
   grad_clip: 1.0
   max_new_tokens: 256
   temperature: 0.7
