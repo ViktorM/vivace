@@ -888,12 +888,64 @@ class Trainer:
     def train_phase(self, micro_batches: list[dict]) -> dict:
         """Multi-epoch optimization. Thin wrapper around `rl_step`; lives here
         so Trainer owns the optimizer and `kl_ema` across steps.
+
+        Also reduces learning metrics across DDP ranks before returning so
+        wandb / stats see globally-correct numbers, not rank-0-local. Stds use
+        Σx²-based sufficient stats because mean-of-stds underestimates spread
+        (see reduce_metrics docstring); ratios like clip_frac and format_rate
+        are recomputed from globally-summed counts. grad_norm is already global
+        — DDP all-reduces gradients in backward, so clip_grad_norm matches on
+        every rank.
         """
         metrics, self.kl_ema = rl_step(
             self.rl_cfg, micro_batches, self.compiled_model, self.ref_model,
             self.optimizer, self.stats, self.step, self.kl_ema,
         )
-        return metrics
+        return self._reduce_learning_metrics(metrics)
+
+    @staticmethod
+    def _reduce_learning_metrics(metrics: dict) -> dict:
+        """Cross-rank reduction of training-loop metrics. No-op at world_size==1."""
+        ops = {
+            "loss": "mean", "reward": "mean", "kl": "mean", "entropy": "mean",
+            "length_mean": "mean",
+            "reward_max": "max", "length_max": "max",
+            "reward_min": "min", "length_min": "min",
+            "_reward_sum": "sum", "_reward_sumsq": "sum",
+            "_length_sum": "sum", "_length_sumsq": "sum",
+            "_advantage_sum": "sum", "_advantage_sumsq": "sum",
+            "_n": "sum", "_format_ok": "sum",
+            "_clip_count": "sum", "_clip_tokens": "sum",
+        }
+        agg = reduce_metrics(metrics, ops)
+
+        def _global_std(s: float, sq: float, n: float) -> float:
+            # Unbiased (ddof=1) to match torch.std default → single-rank values
+            # stay numerically identical to the pre-reduction implementation.
+            if n < 2:
+                return 0.0
+            var = (sq - s * s / n) / (n - 1)
+            return float(var ** 0.5) if var > 0 else 0.0
+
+        n_g = max(int(agg["_n"]), 1)
+        out = dict(metrics)
+        # Mean / extrema reductions overwrite the per-rank values.
+        for k in ("loss", "reward", "kl", "entropy", "length_mean",
+                  "reward_max", "reward_min", "length_max", "length_min"):
+            out[k] = agg[k]
+        out["reward_std"] = _global_std(agg["_reward_sum"], agg["_reward_sumsq"], n_g)
+        out["length_std"] = _global_std(agg["_length_sum"], agg["_length_sumsq"], n_g)
+        out["advantage_std"] = _global_std(agg["_advantage_sum"], agg["_advantage_sumsq"], n_g)
+        out["format_rate"] = agg["_format_ok"] / n_g
+        out["clip_frac"] = (agg["_clip_count"] / agg["_clip_tokens"]) if agg["_clip_tokens"] > 0 else 0.0
+        # grad_norm passes through unreduced (already global under DDP gradient sync).
+        for k in ("_n", "_format_ok",
+                  "_reward_sum", "_reward_sumsq",
+                  "_length_sum", "_length_sumsq",
+                  "_advantage_sum", "_advantage_sumsq",
+                  "_clip_count", "_clip_tokens"):
+            out.pop(k, None)
+        return out
     
     def sync_weights(self) -> None:
         """Push trainer weights to the rollout worker.

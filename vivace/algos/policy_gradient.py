@@ -30,14 +30,6 @@ WHAT THIS FILE DOES NOT OWN:
   - Reward computation (that's vivace/rewards.py)
   - Optimizer construction (that's the trainer)
   - Distributed setup (that's vivace/utils/distributed.py)
-
-==============================================================================
-NOTE
-==============================================================================
-
-`simple_rl_step` (educational scaffolding with no grad accumulation, no
-multi-epoch, no adaptive sampling) is intentionally omitted. The full
-`rl_step` below subsumes it.
 """
 
 from __future__ import annotations
@@ -646,7 +638,13 @@ def rl_step(
     # single place that calls stats.log() (avoids double-entry in stats.steps).
     # Wrapped: the first .item() forces a sync waiting for backward+optim,
     # so this block dominates cudaDeviceSynchronize attribution.
+    #
+    # `_*` keys are sufficient statistics (Σx, Σx², N, raw counts) used by the
+    # trainer to derive globally-correct mean / std / ratio under DDP. They
+    # never reach wandb or the user-facing stats — the trainer drops them
+    # after reduction. Same convention as the eval path's `_raw_keys` plumbing.
     with record_function("metrics_dict"):
+        n_samples = len(all_rewards)
         metrics = {
             # Core
             "loss": (tot_pg / n + cfg.kl_coef * tot_kl / n).item(),
@@ -668,6 +666,17 @@ def rl_step(
             "advantage_std": all_advantages.std().item() if len(all_advantages) > 1 else 0.0,
             # Format rate
             "format_rate": fmt_ok / len(all_responses) if all_responses else 0.0,
+            # Sufficient stats for DDP reduction (consumed and dropped by trainer)
+            "_n": n_samples,
+            "_format_ok": fmt_ok,
+            "_reward_sum": all_rewards.sum().item(),
+            "_reward_sumsq": (all_rewards * all_rewards).sum().item(),
+            "_length_sum": all_token_counts.sum().item(),
+            "_length_sumsq": (all_token_counts * all_token_counts).sum().item(),
+            "_advantage_sum": all_advantages.sum().item(),
+            "_advantage_sumsq": (all_advantages * all_advantages).sum().item(),
+            "_clip_count": tot_clip.item() if torch.is_tensor(tot_clip) else float(tot_clip),
+            "_clip_tokens": tot_tok.item() if torch.is_tensor(tot_tok) else float(tot_tok),
         }
 
     if cfg.use_adaptive_lr:
