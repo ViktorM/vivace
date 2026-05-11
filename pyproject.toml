@@ -19,6 +19,7 @@ dependencies = [
     "numpy>=2.2",
     "tqdm>=4.67",
     "matplotlib>=3.10",
+    "math-verify>=0.5",        # LaTeX-aware math answer verifier; backs MATHEnv / MATH500Env / AIME*Env rewards
 ]
 
 [project.optional-dependencies]

@@ -274,6 +274,8 @@ def _sample_generate_vllm(
 
 def compare_metrics(before: dict, after: dict, label: str = "") -> None:
     print(f"\n{'=' * 65}")
+    if label:
+        print(label)
     if "n" in before:
         print(f"Eval set size: {int(before['n'])}")
     print(f"{'Metric':<25} {'Before':>10} {'After':>10} {'Delta':>10}")

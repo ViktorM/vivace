@@ -30,6 +30,7 @@ from vivace.algos.policy_gradient import (
     compute_advantages, compute_token_logprobs, compute_kl, compute_loss, rl_step,
 )
 from vivace.envs.base import Env, Example
+from vivace.envs import Env, make_env
 from vivace.envs.gsm8k import GSM8KEnv
 from vivace.rollout.hf_sampler import sample_responses
 from vivace.rollout.vllm_worker import VLLMRolloutWorker
@@ -71,7 +72,15 @@ class TrainerConfig:
 
     # ----- what to train -----
     model_name: str = "Qwen/Qwen2.5-0.5B"
-    env_name: str = "gsm8k"
+    # Train env(s). Single string (existing configs) or list (mix corpora —
+    # train splits concatenated, uniform sampling). All training envs must
+    # share format_prompt + reward_fn (true within the math family).
+    env_name: str | list[str] = "gsm8k"
+    # Eval env(s). One or many; each runs every eval cycle, logged under
+    # `eval/{env_name}/...` in wandb. None → defaults to [env_name] when
+    # env_name is a single string (backward-compat); must be set explicitly
+    # when env_name is a list.
+    eval_envs: list[str] | None = None
     algo_name: str = "grpo"
 
     # ----- execution mode -----
@@ -85,6 +94,10 @@ class TrainerConfig:
     # ----- model dtype + compilation -----
     dtype: str = "bfloat16"          # bfloat16 | float16 | float32
     compile_model: bool = False      # torch.compile — can break generate(), off by default
+    # Gradient checkpointing: trades ~30% step-time for ~50% peak activation memory.
+    # Required for 1.5B + LoRA on a single 4090 with long sequences (math). Calls
+    # HF's `gradient_checkpointing_enable(use_reentrant=False)` after PEFT wrap.
+    gradient_checkpointing: bool = False
 
     # ----- LoRA -----
     use_lora: bool = True
@@ -115,6 +128,13 @@ class TrainerConfig:
     eval_batch_size: int = 32        # batch size for eval generation
     eval_use_vllm: bool = True       # use vLLM for eval when available (much faster)
     eval_gpus: list[int] = field(default_factory=list)  # separate eval GPUs (empty = use rollout worker)
+
+    # ----- training-data filter -----
+    # Drop training prompts whose tokenized length exceeds this. Bounds the
+    # worst-case forward-pass logits allocation under prompt-length variance
+    # (e.g. MATH has p99=707 vs p50=60 — one outlier in a microbatch tips the
+    # GPU budget). Eval data is never filtered. None = no filter.
+    max_prompt_tokens: int | None = None
 
     # ----- logging -----
     wandb_project: str = "vivace"
@@ -244,7 +264,9 @@ def _print_training_info(
     print(f"  Layers:          {hf_config.num_hidden_layers}")
     if hasattr(hf_config, 'layer_types'):
         print(f"  Layer types:     {hf_config.layer_types}")
-    print(f"  Env:             {cfg.env_name}")
+    train_str = cfg.env_name if isinstance(cfg.env_name, str) else "+".join(cfg.env_name)
+    eval_str = ",".join(cfg.eval_envs) if cfg.eval_envs else train_str
+    print(f"  Env:             train={train_str}  eval={eval_str}")
     print(f"  Algo:            {cfg.rl.loss_type} / {cfg.rl.adv_type}")
     print(f"  Batch:           {cfg.rl.batch_size} prompts x {cfg.rl.group_size} group x {cfg.rl.grad_accum_steps} accum")
     print(f"  LR:              {cfg.rl.lr}")
@@ -275,8 +297,16 @@ class Trainer:
         Full FT needs a frozen deepcopy (~2× model VRAM).
         """
         self.cfg = cfg
-        self.env = GSM8KEnv()  # TODO: dispatch on cfg.env_name for other envs
-        self.train_data = self.env.load_split("train")
+        self.train_envs, self.eval_envs = self._build_envs(cfg)
+        # `self.env` = first train env. Used by rollout/eval paths that need
+        # one env handle (format_prompt, reward_fn). Multi-train assumes these
+        # are uniform across train_envs (true within the math family).
+        self.env = self.train_envs[0]
+        self.train_data = [
+            ex for env in self.train_envs for ex in env.load_split("train")
+        ]
+        # Eval splits are loaded lazily per env on first use, then cached.
+        self._eval_data_cache: dict[str, list] = {}
 
         self.rollout_worker = None
 
@@ -300,8 +330,11 @@ class Trainer:
                     f"colocated mode requires trainer_gpus == rollout_gpus, got "
                     f"{cfg.trainer_gpus} vs {cfg.rollout_gpus}"
                 )
-        elif cfg.mode == "disaggregated":
-            raise NotImplementedError("disaggregated DDP — Phase 2")
+        elif cfg.mode == "disaggregated" and world_size > 1:
+            # Single-rank disaggregated works (existing 2-GPU configs); only the
+            # multi-rank variant is unimplemented (would need a separate process
+            # group split for trainer ranks vs vLLM ranks).
+            raise NotImplementedError("disaggregated DDP (multi-rank) — Phase 2")
 
         # --- Resolve devices ---
         # trainer_gpus / rollout_gpus are the full GPU pools (per cfg). For DDP,
@@ -324,6 +357,20 @@ class Trainer:
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
+
+        # --- Filter long-tail training prompts (memory-bounding, opt-in) ---
+        if cfg.max_prompt_tokens is not None:
+            before = len(self.train_data)
+            cap = cfg.max_prompt_tokens
+            self.train_data = [
+                ex for ex in self.train_data
+                if len(self.tokenizer.encode(self.env.format_prompt(ex))) <= cap
+            ]
+            after = len(self.train_data)
+            if is_main_process():
+                pct = 100.0 * (before - after) / before if before else 0.0
+                print(f"  Train filter:    max_prompt_tokens={cap}  "
+                      f"{before} → {after}  ({pct:.2f}% dropped)")
 
         # --- Model ---
         model_dtype = _resolve_dtype(cfg.dtype)
@@ -357,6 +404,21 @@ class Trainer:
             self.ref_model.eval()
             for p in self.ref_model.parameters():
                 p.requires_grad_(False)
+
+        # Gradient checkpointing (opt-in). Two pieces matter:
+        #  - enable_input_require_grads(): under PEFT/LoRA the embedding params
+        #    are frozen, so gradient_checkpointing's recomputed forward has no
+        #    requires_grad=True input and can't wire backward. The hook on
+        #    embed_tokens flips its output's requires_grad to True at forward
+        #    time, repairing the chain. Idempotent on full-FT.
+        #  - use_reentrant=False: the modern torch.utils.checkpoint path.
+        #    The legacy reentrant path is deprecated and breaks with DDP.
+        # use_cache=False is already set above (line ~354), which gc requires.
+        if cfg.gradient_checkpointing:
+            self.model.enable_input_require_grads()
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
         # Keep a handle to the peft (or bare HF) model so we can call peft methods
         # like merge_adapter / unmerge_adapter / disable_adapter / save_pretrained
@@ -596,7 +658,37 @@ class Trainer:
         if cfg.weight_sync_method == "disk":
             print(f"  [disk-sync] adapter path: {self._resolved_sync_disk_path}")
 
-    def _run_eval(self, eval_data: list, label: str = "") -> tuple[dict, list, list]:
+    @staticmethod
+    def _build_envs(cfg: "TrainerConfig") -> tuple[list[Env], list[tuple[str, Env]]]:
+        """Resolve cfg.env_name + cfg.eval_envs into concrete envs.
+
+        Returns (train_envs, eval_envs) where eval_envs is a list of
+        (name, env) pairs so the eval loop can prefix wandb keys per env.
+        """
+        train_names = [cfg.env_name] if isinstance(cfg.env_name, str) else list(cfg.env_name)
+        if not train_names:
+            raise ValueError("env_name must be a non-empty string or list[str]")
+        train_envs = [make_env(n) for n in train_names]
+
+        if cfg.eval_envs is not None:
+            eval_names = list(cfg.eval_envs)
+        elif len(train_names) == 1:
+            eval_names = train_names                  # backward-compat for str env_name
+        else:
+            raise ValueError(
+                "eval_envs must be set explicitly when env_name is a list "
+                "(no canonical default for multi-train mixes)"
+            )
+        eval_envs = [(n, make_env(n)) for n in eval_names]
+        return train_envs, eval_envs
+
+    def _eval_data_for(self, env_name: str, env: Env) -> list:
+        """Lazy-load and cache an env's eval split. Loaded once per process."""
+        if env_name not in self._eval_data_cache:
+            self._eval_data_cache[env_name] = env.load_split("eval")
+        return self._eval_data_cache[env_name]
+
+    def _run_eval(self, env: Env, eval_data: list, label: str = "") -> tuple[dict, list, list]:
         """Run evaluation using the best available backend.
 
         `label` ("baseline" / "step_NNNN" / "final" / etc.) is attached to the
@@ -615,7 +707,7 @@ class Trainer:
         offset = self.rank * data_per_rank
         local = subset[offset : offset + data_per_rank]
         local_metrics, local_correct, local_incorrect = evaluate_model(
-            self.model, self.tokenizer, local, self.env,
+            self.model, self.tokenizer, local, env,
             n=-1, # already sliced
             batch_size=self.cfg.eval_batch_size,
             max_new_tokens=self.cfg.rl.max_new_tokens,
@@ -666,6 +758,17 @@ class Trainer:
         incorrect = [x for sub in gathered_incorrect for x in sub]
 
         return metrics, correct, incorrect
+
+    def _run_eval_all(self, label: str) -> dict[str, tuple[dict, list, list]]:
+        """Run `_run_eval` on every cfg.eval_envs. Insertion order = config order;
+        the first env is the "primary" (the one that drives stats updates and
+        the baseline-vs-final comparison print). All ranks must call this so
+        every `_run_eval` collective fires on every rank."""
+        out: dict[str, tuple[dict, list, list]] = {}
+        for env_name, env in self.eval_envs:
+            data = self._eval_data_for(env_name, env)
+            out[env_name] = self._run_eval(env, data, label=f"{label}_{env_name}")
+        return out
 
     def _save_eval_samples(self, label: str, correct: list, incorrect: list) -> None:
         """Persist eval samples as eval_samples_{label}.json in the run dir.
@@ -1077,16 +1180,24 @@ class Trainer:
         """
         self.maybe_sft_warmup()
 
-        # --- Baseline eval ---
-        eval_data = self.env.load_split("eval")
-        baseline_metrics, baseline_correct, baseline_incorrect = self._run_eval(eval_data, label="baseline")
-        self._save_eval_samples("baseline", baseline_correct, baseline_incorrect)
+        # --- Baseline eval (every env in cfg.eval_envs; primary = first) ---
+        baseline_results = self._run_eval_all("baseline")
+        primary_name = self.eval_envs[0][0]
+        baseline_metrics = baseline_results[primary_name][0]
+        for env_name, (m, correct, incorrect) in baseline_results.items():
+            self._save_eval_samples(f"baseline_{env_name}", correct, incorrect)
 
         if is_main_process():
             print("Evaluating baseline...")
-            backend = baseline_metrics.get("eval_backend", "hf")
-            print(f"Baseline accuracy: {baseline_metrics['accuracy_pct']:.1f}%  format: {baseline_metrics['format_rate_pct']:.1f}%  capped: {baseline_metrics.get('cap_rate_pct', 0):.1f}%  ({backend}, {baseline_metrics.get('eval_time_s', 0):.1f}s)")
-            log_metrics({"eval/" + k: v for k, v in baseline_metrics.items()}, step=0)
+            for env_name, (m, _, _) in baseline_results.items():
+                backend = m.get("eval_backend", "hf")
+                print(
+                    f"  [{env_name}] accuracy={m['accuracy_pct']:.1f}%  "
+                    f"format={m['format_rate_pct']:.1f}%  "
+                    f"capped={m.get('cap_rate_pct', 0):.1f}%  "
+                    f"({backend}, {m.get('eval_time_s', 0):.1f}s)"
+                )
+                log_metrics({f"eval/{env_name}/{k}": v for k, v in m.items()}, step=0)
             self.stats.eval_steps.append(0)
             self.stats.eval_accuracy.append(baseline_metrics["accuracy_pct"])
             self.stats.eval_format_rate.append(baseline_metrics["format_rate_pct"])
@@ -1133,14 +1244,19 @@ class Trainer:
                     metrics = self.train_phase(micro_batches)
                 with record_function("weight_sync"):
                     self.sync_weights()
-                # Release the trainer's cached-but-unused CUDA blocks so vLLM
-                # can grow into them at the next wake_up. In colocated mode
-                # PyTorch and vLLM have separate allocator pools sharing one
-                # GPU; without this, the trainer's pool drifts upward across
-                # steps (variable T → cached blocks of many shapes), squeezes
-                # vLLM, and eventually trips its sleep-time `freed_bytes >= 0`
-                # assertion. No-op cost when there's nothing to release.
-                if self.rollout_worker and self.rollout_worker.colocated:
+                # Release the trainer's cached-but-unused CUDA blocks each step.
+                # Variable T (per-step prompt + response length) creates blocks
+                # of many shapes the allocator can't reuse — pool drifts upward
+                # across steps. In colocated mode this squeezes vLLM and trips
+                # its sleep-time `freed_bytes >= 0` assertion; in disaggregated
+                # mode it OOMs the trainer outright (~step 150-200 on 1.5B + MATH).
+                # gc.collect() before empty_cache() is necessary — Python ref
+                # cycles in rl_step's closures / stats accumulators keep tensors
+                # alive past their scope; empty_cache alone only frees cached
+                # blocks, not blocks still referenced through dead cycles.
+                # No-op cost when there's nothing to release.
+                if self.rollout_worker is not None:
+                    gc.collect()
                     torch.cuda.empty_cache()
 
             self.scheduler.step()
@@ -1242,6 +1358,20 @@ class Trainer:
                         aux = [f"alive={perf['alive_rate']:.1%}",
                                f"spread_mean={perf['spread_mean']:.3f}",
                                f"spread_max={perf['spread_max']:.3f}"] + aux
+                    # Memory-leak diagnostic (disagg OOMs at step ~170; track which
+                    # category grows). Tear down once the leak is found.
+                    # Peak is captured since last reset_peak_memory_stats — call
+                    # it AFTER reading so the next step's peak measurement is clean.
+                    if torch.cuda.is_available():
+                        mem_alloc = torch.cuda.memory_allocated() / 1e9
+                        mem_reserved = torch.cuda.memory_reserved() / 1e9
+                        mem_peak = torch.cuda.max_memory_allocated() / 1e9
+                        aux.append(
+                            f"mem_alloc={mem_alloc:.2f}G "
+                            f"mem_res={mem_reserved:.2f}G "
+                            f"mem_peak={mem_peak:.2f}G"
+                        )
+                        torch.cuda.reset_peak_memory_stats()
                     print("    " + " ".join(aux))
                     # Core metrics (flat — wandb top level)
                     log_metrics({
@@ -1290,18 +1420,27 @@ class Trainer:
             if step > 0 and step % self.cfg.eval_interval == 0:
                 if self.rollout_worker and self.rollout_worker.colocated:
                     self.rollout_worker.wake_up()
-                eval_metrics, _, _ = self._run_eval(eval_data, label=f"step_{step:04d}")
+                eval_results = self._run_eval_all(f"step_{step:04d}")
                 if self.rollout_worker and self.rollout_worker.colocated:
                     gc.collect()
                     torch.cuda.empty_cache()
                     self.rollout_worker.sleep()
                 if is_main_process():
-                    print(f"  [eval] Step {step:04d} | accuracy={eval_metrics['accuracy_pct']:.1f}%  format={eval_metrics['format_rate_pct']:.1f}%  capped={eval_metrics.get('cap_rate_pct', 0):.1f}%  reward={eval_metrics['avg_reward']:.3f}  ({eval_metrics.get('eval_time_s', 0):.1f}s)")
-                    log_metrics({"eval/" + k: v for k, v in eval_metrics.items()}, step)
+                    primary_metrics = eval_results[self.eval_envs[0][0]][0]
+                    for env_name, (m, _, _) in eval_results.items():
+                        print(
+                            f"  [eval/{env_name}] Step {step:04d} | "
+                            f"accuracy={m['accuracy_pct']:.1f}%  "
+                            f"format={m['format_rate_pct']:.1f}%  "
+                            f"capped={m.get('cap_rate_pct', 0):.1f}%  "
+                            f"reward={m['avg_reward']:.3f}  "
+                            f"({m.get('eval_time_s', 0):.1f}s)"
+                        )
+                        log_metrics({f"eval/{env_name}/{k}": v for k, v in m.items()}, step)
                     self.stats.eval_steps.append(step)
-                    self.stats.eval_accuracy.append(eval_metrics["accuracy_pct"])
-                    self.stats.eval_format_rate.append(eval_metrics["format_rate_pct"])
-                    self.stats.eval_reward.append(eval_metrics["avg_reward"])
+                    self.stats.eval_accuracy.append(primary_metrics["accuracy_pct"])
+                    self.stats.eval_format_rate.append(primary_metrics["format_rate_pct"])
+                    self.stats.eval_reward.append(primary_metrics["avg_reward"])
 
             # --- Periodic checkpoint (stub — save_checkpoint not implemented yet) ---
             # if step > 0 and step % self.cfg.checkpoint_interval == 0:
@@ -1323,22 +1462,38 @@ class Trainer:
             print("\nFinal evaluation...")
         if self.rollout_worker and self.rollout_worker.colocated:
             self.rollout_worker.wake_up()
-        final_metrics, final_correct, final_incorrect = self._run_eval(eval_data, label="final")
+        final_results = self._run_eval_all("final")
         if self.rollout_worker and self.rollout_worker.colocated:
             gc.collect()
             torch.cuda.empty_cache()
             self.rollout_worker.sleep()
+        primary_name = self.eval_envs[0][0]
+        final_metrics = final_results[primary_name][0]
         if is_main_process():
-            print(f"Final accuracy: {final_metrics['accuracy_pct']:.1f}%  format: {final_metrics['format_rate_pct']:.1f}%  capped: {final_metrics.get('cap_rate_pct', 0):.1f}%  ({final_metrics.get('eval_time_s', 0):.1f}s)")
-            compare_metrics(baseline_metrics, final_metrics, label="RL training")
+            for env_name, (m, _, _) in final_results.items():
+                print(
+                    f"  [final/{env_name}] accuracy={m['accuracy_pct']:.1f}%  "
+                    f"format={m['format_rate_pct']:.1f}%  "
+                    f"capped={m.get('cap_rate_pct', 0):.1f}%  "
+                    f"({m.get('eval_time_s', 0):.1f}s)"
+                )
+                log_metrics(
+                    {f"eval/{env_name}/{k}": v for k, v in m.items()},
+                    step=self.cfg.num_steps,
+                )
+            # One Before/After table per eval env so a multi-env run shows the
+            # full picture, not just the primary's delta.
+            for env_name, (final_metrics_env, _, _) in final_results.items():
+                baseline_metrics_env = baseline_results[env_name][0]
+                compare_metrics(baseline_metrics_env, final_metrics_env,
+                                label=f"RL training [{env_name}]")
             self.stats.eval_steps.append(self.cfg.num_steps)
             self.stats.eval_accuracy.append(final_metrics["accuracy_pct"])
             self.stats.eval_format_rate.append(final_metrics["format_rate_pct"])
             self.stats.eval_reward.append(final_metrics["avg_reward"])
-            log_metrics({"eval/" + k: v for k, v in final_metrics.items()},
-                        step=self.cfg.num_steps)
             finish_wandb()
-        self._save_eval_samples("final", final_correct, final_incorrect)
+        for env_name, (_, correct, incorrect) in final_results.items():
+            self._save_eval_samples(f"final_{env_name}", correct, incorrect)
         barrier()
 
         # --- Save stats + plots (rank 0 only) ---

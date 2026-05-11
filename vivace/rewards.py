@@ -160,3 +160,71 @@ def gsm8k_reward_single(response: str, example) -> float:
       - difficulty-weighted scoring via example.difficulty
     """
     return gsm8k_reward_batch([response], [example.answer])[0]
+
+
+# =============================================================================
+# Math (Hendrycks MATH / MATH-500 / AIME) — LaTeX-aware verifier
+# =============================================================================
+# `math_verify` (HF) is sympy-backed: ~50–500 ms per LaTeX comparison. A pure
+# numeric fast-path keeps AIME-style integer answers sub-millisecond and saves
+# real wall-clock at eval time over 30–500 problems.
+
+_PURE_NUM_RE = re.compile(r"^[-+]?\d+(?:\.\d+)?$")
+
+
+def _math_correct(gt: str, pred: str, tol: float = 1e-6) -> bool:
+    """LaTeX-aware equivalence with a numeric short-circuit.
+
+    Numeric short-circuit: when both sides parse cleanly as decimals, compare
+    with tolerance — covers AIME's integer answers and any GSM8K-style numeric
+    response without paying for sympy. Falls through to math_verify for LaTeX
+    expressions (fractions, radicals, intervals, etc.) where symbolic
+    equivalence is the only honest check.
+    """
+    if not gt or not pred:
+        return False
+    gt_s, pred_s = gt.strip(), pred.strip()
+    if _PURE_NUM_RE.match(gt_s) and _PURE_NUM_RE.match(pred_s):
+        try:
+            return abs(float(gt_s) - float(pred_s)) < tol
+        except ValueError:
+            pass
+    try:
+        from math_verify import parse, verify
+        return bool(verify(parse(gt_s), parse(pred_s)))
+    except Exception:
+        # math_verify throws on adversarial LaTeX or hangs sympy on rare
+        # inputs; treat any exception as "not equivalent" rather than
+        # poisoning the reward signal.
+        return False
+
+
+def math_correctness_reward(
+    responses: list[str], answers: list[str], cfg: RewardConfig = DEFAULT_REWARD_CONFIG
+) -> list[float]:
+    """correct_bonus on math_verify equivalence; wrong_penalty otherwise."""
+    extracted = [extract_answer(r) for r in responses]
+    return [
+        cfg.correct_bonus if _math_correct(a, e) else cfg.wrong_penalty
+        for a, e in zip(answers, extracted)
+    ]
+
+
+def math_reward_batch(
+    responses: list[str],
+    answers: list[str],
+    cfg: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> list[float]:
+    """Sum of correctness + format components. Skips int_format (GSM8K-specific)."""
+    components = [
+        math_correctness_reward(responses, answers, cfg),
+        strict_format_reward(responses, cfg),
+        soft_format_reward(responses, cfg),
+        xmlcount_reward(responses, cfg),
+    ]
+    return [sum(c[i] for c in components) for i in range(len(responses))]
+
+
+def math_reward_single(response: str, example) -> float:
+    """Single-example variant for `Env.reward_fn`. Hendrycks MATH / MATH-500 / AIME."""
+    return math_reward_batch([response], [example.answer])[0]
