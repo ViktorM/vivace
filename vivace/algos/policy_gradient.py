@@ -415,7 +415,7 @@ def compute_loss(
 
     Args:
         cfg: RLConfig — `loss_type`, `clip_low`, `clip_high`, `clip_ratio`,
-             `clip_cispo`, `dg_eta`, `max_new_tokens` are all read.
+             `clip_cispo_high`, `clip_cispo_low`, `dg_eta`, `max_new_tokens` are all read.
         policy_logp: [B*G, S-1] under current policy (with grad).
         old_logp: [B*G, S-1] under rollout policy (no grad).
         advantages: [B*G] (no grad).
@@ -447,7 +447,10 @@ def compute_loss(
 
     - "cispo"    : Importance-clipped policy-gradient. Detach the clamped
                    weight and multiply policy_logp directly. Numerator is
-                   ratio.clamp(max=clip_cispo).
+                   ratio.clamp(max=clip_cispo_high). Additionally applies a
+                   trust-region mask (MiniMax-M1 eq. 7): drop tokens whose
+                   ratio drifted outward in the same direction as the
+                   advantage (positive A & r>high, or negative A & r<low).
 
     - "dg"       : Delight-gated PG. Compute "delight" = eta * adv * surprisal
                    (surprisal = -policy_logp.detach()), pass through sigmoid
@@ -494,7 +497,15 @@ def compute_loss(
             per_seq = (obj * mask).sum(dim=1) / cfg.max_new_tokens
             loss = -per_seq.mean()
         elif cfg.loss_type == "cispo":
-            raise NotImplementedError("cispo loss not yet implemented")
+            # Detached IS weight, (MiniMax-M1 eq. 5) uses PPO style clip: 1-low, 1+high
+            is_weight = ratio.clamp(min=cfg.clip_cispo_low, max=cfg.clip_cispo_high).detach()
+            # Trust-region mask (MiniMax-M1 eq. 7): drop tokens whose ratio
+            # drifted outward in the same direction as the advantage.
+            keep_high = (ratio < cfg.clip_cispo_high) | (a <= 0.0)
+            keep_low = (ratio > cfg.clip_cispo_low) | (a >= 0.0)
+            is_mask = (keep_high & keep_low).to(ratio.dtype)
+            per_token = - is_weight * a * policy_logp * is_mask * mask
+            loss = per_token.sum() / mask.sum().clamp(min=1.0)
         elif cfg.loss_type == "dg":
             raise NotImplementedError("dg loss not yet implemented")
         elif cfg.loss_type == "dg_cispo":
@@ -613,6 +624,15 @@ def rl_step(
                         ratio = torch.exp((seq_lp - old_seq_lp).clamp(-5, 5))
                         tot_clip += ((ratio - 1.0).abs() > cfg.clip_high).float().sum()
                         tot_tok += float(len(ratio))
+                    elif cfg.loss_type == "cispo":
+                        # CISPO trust-region mask: same condition as the loss.
+                        ratio = torch.exp((policy_logp - mb["old_logp"]).clamp(-5, 5))
+                        a = mb["adv"].unsqueeze(1)
+                        drop_high = (ratio > cfg.clip_cispo_high) & (a > 0.0)
+                        drop_low  = (ratio < cfg.clip_cispo_low)  & (a < 0.0)
+                        clipped_mask = (drop_high | drop_low) & (mb["mask"] > 0)
+                        tot_clip += clipped_mask.sum().float()
+                        tot_tok += mb["mask"].sum()
                     elif cfg.uses_clipping:
                         ratio = torch.exp((policy_logp - mb["old_logp"]).clamp(-5, 5))
                         clipped_mask = (

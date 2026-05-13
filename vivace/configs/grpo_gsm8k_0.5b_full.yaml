@@ -38,7 +38,7 @@ rl:
   clip_low: 0.2
   clip_high: 0.2
   clip_ratio: 0.25
-  clip_cispo: 5.0
+  clip_cispo_high: 5.0
   kl_coef: 0.04
   adv_eps: 0.0001
   dg_eta: 1.0

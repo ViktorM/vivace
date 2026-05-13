@@ -471,7 +471,10 @@ class Trainer:
         # --- Optimizer + scheduler ---
         # Two modes: plain cosine, or cosine→linear-ramp-restart→cosine. The restart
         # uses `warmup_steps` for the ramp length, matching the initial warmup.
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=cfg.rl.lr)
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=cfg.rl.lr,
+            betas=(cfg.rl.adam_beta1, cfg.rl.adam_beta2), eps=cfg.rl.adam_eps,
+        )
         warmup_steps = cfg.rl.warmup_steps
         post_warmup = max(cfg.num_steps - warmup_steps, 1)
         eta_min = cfg.rl.lr * cfg.rl.eta_min_ratio
@@ -500,6 +503,11 @@ class Trainer:
                 self.optimizer, T_max=post_warmup, eta_min=eta_min))
         self.scheduler = torch.optim.lr_scheduler.SequentialLR(
             self.optimizer, schedulers=scheds, milestones=milestones)
+
+        # EMA of per-step KL(policy ∥ reference) — smooths the noisy batch-level
+        # `kl` so the cumulative-drift trend is visible. alpha=0.05 → ~20-step
+        # half-life. Logged as `kl_to_ref_ema`.
+        self.kl_to_ref_ema: float | None = None
 
         # --- Stats + logging ---
         # Label includes key config differences for comparison plots
@@ -1373,11 +1381,18 @@ class Trainer:
                         )
                         torch.cuda.reset_peak_memory_stats()
                     print("    " + " ".join(aux))
+                    # Track smoothed KL drift from reference.
+                    cur_kl = metrics["kl"]
+                    if self.kl_to_ref_ema is None:
+                        self.kl_to_ref_ema = cur_kl
+                    else:
+                        self.kl_to_ref_ema = 0.95 * self.kl_to_ref_ema + 0.05 * cur_kl
                     # Core metrics (flat — wandb top level)
                     log_metrics({
                         "loss": metrics["loss"],
                         "reward": metrics["reward"],
                         "kl": metrics["kl"],
+                        "kl_to_ref_ema": self.kl_to_ref_ema,
                         "clip_frac": metrics["clip_frac"],
                         "grad_norm": metrics["grad_norm"],
                         "entropy": metrics["entropy"],

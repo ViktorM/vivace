@@ -59,4 +59,22 @@ def make_env(name: str, **kwargs) -> Env:
     return ENV_REGISTRY[name](**kwargs)
 
 
-__all__ = ["Env", "Example", "ENV_REGISTRY", "make_env"]
+def register_env(name: str, cls: type[Env], *, overwrite: bool = False) -> None:
+    """Register a custom env class so it's reachable by `cfg.env_name=<name>`.
+
+    Call this once at import time from your own package before launching
+    a training run. The trainer's name → class lookup will find it.
+
+    >>> from vivace.envs import register_env
+    >>> from my_lib import MyEnv
+    >>> register_env("my_env", MyEnv)
+    """
+    if not overwrite and name in ENV_REGISTRY:
+        raise ValueError(
+            f"env {name!r} is already registered as {ENV_REGISTRY[name].__name__}; "
+            "pass overwrite=True to replace it"
+        )
+    ENV_REGISTRY[name] = cls
+
+
+__all__ = ["Env", "Example", "ENV_REGISTRY", "make_env", "register_env"]

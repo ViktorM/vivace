@@ -1,7 +1,7 @@
 # vivace
 
 A fast, hackable RL post-training lab for language models.
-Minimal by design, extensible by layout. Built for research, not production.
+Minimal by design, extensible by layout. Built for research and fast iteration.
 
 ## What this is
 
@@ -13,13 +13,17 @@ language models (and potentially vision-language models). The goals, in order:
 3. **Multi-GPU from day one.** Two execution modes: *disaggregated* (vLLM rollout workers
    on dedicated GPUs, trainer on others) and *colocated* (rollout and training share GPUs,
    useful for debugging).
-4. **Multiple benchmarks.** GSM8K, MATH, AIME, DeepMath-103K, Omni-MATH,
-   and agentic/tool-use environments — behind one `Env` interface.
+4. **Multiple benchmarks.** GSM8K, MATH (Hendrycks train), MATH-500, AIME 2024, AIME 2025 —
+   behind one `Env` interface. Train on one env, eval on many in the same step.
+   DeepMath-103K, Omni-MATH, and agentic/tool-use envs on the roadmap.
 5. **Not a framework.** No plugin system, no registry, no abstract factories. Just code.
 
 ## What this is not
 
-- A library. Don't `pip install vivace` into other projects. Fork it, hack it, run it.
+- A heavyweight framework. No plugin DSL, no abstract factory soup, no command bus.
+  You can `pip install -e .`, subclass `Env`, and `register_env("my_env", MyEnv)`
+  to plug a custom benchmark into a yaml-driven run — but the codebase itself stays
+  small enough to read end-to-end.
 - A replacement for verl, OpenRLHF, TRL, or slime. Those are excellent. This is for
   research and for experiments where those libraries get in the way.
 
@@ -99,7 +103,12 @@ vivace/                    # installable package
 │   └── sft.py             # Optional SFT warmup
 ├── envs/                  # Benchmark wrappers behind a common Env interface
 │   ├── base.py            # Env ABC + Example
-│   └── gsm8k.py
+│   ├── gsm8k.py           # GSM8K
+│   ├── math.py            # MATH (Hendrycks) — train env
+│   ├── math500.py         # MATH-500 — held-out 500-problem eval
+│   ├── aime.py            # AIME 2024 + AIME 2025
+│   ├── math_prompt.py     # shared math prompt + answer-extraction utilities
+│   └── __init__.py        # ENV_REGISTRY + make_env
 ├── rewards.py             # Rule-based reward functions
 ├── rollout/               # Rollout backends
 │   ├── hf_sampler.py      # HF generate (single-GPU dev)
@@ -172,9 +181,28 @@ writing anything new.
 
 ## Adding a new benchmark
 
+In-tree (most common — you're hacking on vivace):
+
 1. Create `vivace/envs/my_bench.py` subclassing `Env` from `vivace/envs/base.py`.
 2. Implement `load_split()`, `format_prompt()`, and link to a reward function.
-3. Point a config at it.
+3. Add a row to `ENV_REGISTRY` in `vivace/envs/__init__.py`.
+4. Point a config at it.
+
+Out-of-tree (you've `pip install -e .`'d vivace and want to add an env from
+your own package — e.g. wrapping OpenEnv or a private benchmark):
+
+```python
+from vivace.envs import register_env, Env
+
+class MyEnv(Env):
+    name = "my_env"
+    def load_split(self, split): ...
+    def format_prompt(self, example): ...
+    # ...
+
+register_env("my_env", MyEnv)
+# then launch training with env_name: my_env in your yaml
+```
 
 The reward function and the verifier are the contract. Everything else is up to you.
 
@@ -202,13 +230,16 @@ the design rationale and failure-mode diagnostics.
 
 ## Roadmap
 
-- [x] Composable PG zoo: GRPO / DAPO / GSPO / RLOO / Dr.GRPO / CISPO / DG
+- [x] Composable PG zoo: GRPO / DAPO / GSPO / RLOO / Dr.GRPO / CISPO (with MiniMax-M1 mask) / DG
 - [x] GSM8K env + reward functions
 - [x] Single-GPU training with HF sampler
 - [x] vLLM rollout backend with LoRA hot-swap (disk + NCCL + CUDA IPC paths)
 - [x] Disaggregated mode (separate rollout + trainer GPUs)
-- [ ] DDP / FSDP distributed training (in progress)
-- [ ] MATH-500 + AIME + Omni-MATH + DeepMath-103K envs
+- [x] DDP across multiple trainer GPUs (colocated and disaggregated)
+- [x] MATH (Hendrycks train) + MATH-500 + AIME 2024/2025 envs
+- [x] Multi-eval-env trainer (train on one env, eval on many per step)
+- [ ] FSDP for large models
+- [ ] DeepMath-103K + Omni-MATH envs
 - [ ] Optional SFT warmup path
 - [ ] Agentic tasks: tool-use rollout hooks (calculator, Python, search)
 - [ ] RL with self-distillation

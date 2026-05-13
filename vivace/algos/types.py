@@ -66,6 +66,11 @@ class RLConfig:
     eta_min_ratio: float = 0.2     # cosine floor as fraction of peak lr (peak * ratio = eta_min)
     lr_restart: bool = False       # True: cosine to mid, linear ramp eta_min→peak over `warmup_steps`, cosine again
 
+    # --- AdamW (PyTorch defaults; paper recipes sometimes override) ---
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999      # MiniMax-M1 / CISPO paper uses 0.95
+    adam_eps: float = 1e-8         # MiniMax-M1 / CISPO paper uses 1e-15
+
     # --- Adaptive LR (DAPO-style) ---
     use_adaptive_lr: bool = False
     kl_target: float = 0.05
@@ -85,7 +90,8 @@ class RLConfig:
     clip_low: float = 0.2          # epsilon_low
     clip_high: float = 0.2         # epsilon_high (set > clip_low for DAPO), but asymmetric can be used with other algorithms
     clip_ratio: float = 0.25       # PPO-style clip (referenced by some variants; currently unused by default loss)
-    clip_cispo: float = 5.0        # CISPO upper bound on importance weight
+    clip_cispo_high: float = 5.0   # CISPO upper r-threshold: drop tokens with A>0 and r > clip_cispo_high (also caps surviving IS weight)
+    clip_cispo_low: float = 0.0    # CISPO lower r-threshold: drop tokens with A<0 and r < clip_cispo_low (0.0 disables lower mask)
 
     # --- KL ---
     kl_coef: float = 0.02          # KL regularization coefficient (some implementations call this kl_beta)
@@ -170,7 +176,7 @@ def dg_config(**kw) -> RLConfig:
 def dg_cispo_config(**kw) -> RLConfig:
     return RLConfig(
         loss_type="dg_cispo", adv_type="rloo",
-        dg_eta=1.0, clip_cispo=5.0, kl_coef=0.04, **kw,
+        dg_eta=1.0, clip_cispo_high=5.0, kl_coef=0.04, **kw,
     )
 
 
