@@ -49,3 +49,8 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
+
+# flash-attn's setup.py imports torch at build time to detect CUDA version + GPU arches,
+# but doesn't declare torch as a build dep. Inject it so uv sync can build the wheel.
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]

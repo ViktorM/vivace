@@ -69,3 +69,8 @@ explicit = true
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 torchaudio = { index = "pytorch-cu128" }
+
+# flash-attn's setup.py imports torch at build time to detect CUDA version + GPU arches,
+# but doesn't declare torch as a build dep. Inject it so uv sync can build the wheel.
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
