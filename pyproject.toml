@@ -1,6 +1,6 @@
 [project]
 name = "vivace"
-version = "0.0.1"
+version = "0.0.2"
 description = "A fast, hackable RL post-training lab for language models."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,6 +14,7 @@ dependencies = [
     "accelerate>=1.13",
     "peft>=0.19",              # LoRA
     "vllm>=0.20",              # rollout inference (also brings torch==2.11)
+    "flash-attn>=2.8",         # trainer attn_implementation="flash_attention_2"; varlen kernels skip the O(S²) score tensor
     "wandb>=0.25",
     "pyyaml>=6.0",
     "numpy>=2.2",

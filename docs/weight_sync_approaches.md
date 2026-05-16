@@ -299,7 +299,7 @@ Step 1 passing proves the comparator works on identical weights. Step 2 passing 
 
 ```bash
 .venv/bin/python -m tests.test_weight_sync \
-    --config vivace/configs/dapo_gsm8k_1.5b_profiling.yaml \
+    --config vivace/configs/experiments/dapo_gsm8k_1.5b_profiling.yaml \
     --method disk
 ```
 
@@ -315,7 +315,7 @@ Only after (1) and (2) pass with disk, switch to NCCL:
 
 ```bash
 .venv/bin/python -m tests.test_weight_sync \
-    --config vivace/configs/dapo_gsm8k_1.5b_profiling.yaml \
+    --config vivace/configs/experiments/dapo_gsm8k_1.5b_profiling.yaml \
     --method nccl
 ```
 

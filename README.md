@@ -63,7 +63,7 @@ GSM8K with LoRA r=16, DAPO + RLOO loss.
 
 ```bash
 python -m vivace.scripts.train \
-    --config vivace/configs/dapo_gsm8k_qw25_0.5b_lora_colo.yaml \
+    --config vivace/configs/gsm8k/dapo_0.5b_colo.yaml \
     --num-steps 200 \
     --run-dir "runs/colo_$(date +%Y%m%d_%H%M%S)"
 ```
@@ -74,7 +74,7 @@ Uses `weight_sync_method: ipc` (CUDA IPC zero-copy on the same GPU).
 
 ```bash
 python -m vivace.scripts.train \
-    --config vivace/configs/dapo_gsm8k_1.5b_lowkl.yaml \
+    --config vivace/configs/gsm8k/dapo_2x4090.yaml \
     --num-steps 200 \
     --run-dir "runs/disagg_$(date +%Y%m%d_%H%M%S)"
 ```
@@ -84,7 +84,7 @@ Qwen2.5-1.5B + LoRA. Uses `weight_sync_method: nccl` (direct GPU→GPU broadcast
 
 ```bash
 python -m vivace.scripts.train \
-    --config vivace/configs/dapo_gsm8k_qw25_0.5b_lora_colo.yaml \
+    --config vivace/configs/gsm8k/dapo_0.5b_colo.yaml \
     --num-steps 5 \
     --run-dir "runs/smoke_$(date +%Y%m%d_%H%M%S)"
 ```

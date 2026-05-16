@@ -1,0 +1,58 @@
+model_name: Qwen/Qwen2.5-1.5B
+env_name: gsm8k
+algo_name: dapo
+mode: disaggregated
+trainer_gpus: [0]
+rollout_gpus: [1]
+use_vllm: true
+gpu_memory_utilization: 0.8
+enforce_eager: false
+compile_model: false      # torch.compile — flip to true to test ~10-30% speedup; can interact badly with peft/DDP/variable-T
+use_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+num_steps: 200
+eval_n: 500
+eval_batch_size: 32
+eval_use_vllm: true
+sft_warmup: false
+sft_warmup_steps: 0
+wandb_project: vivace
+log_interval: 1
+eval_interval: 50
+checkpoint_interval: 100
+run_dir: runs/dapo_lowkl
+weight_sync_method: nccl
+seed: 42
+rl:
+  loss_type: dapo
+  adv_type: rloo
+  batch_size: 1
+  group_size: 8
+  lr: 4.0e-05
+  warmup_steps: 10        # initial linear warmup; also used as the restart ramp length when lr_restart=true
+  grad_accum_steps: 4
+  optim_epochs: 2
+  eta_min_ratio: 0.2     # cosine floor as fraction of peak lr (peak * ratio = eta_min)
+  lr_restart: false      # True: cosine to step num_steps // 2, linear ramp eta_min→peak over warmup_steps, then cosine again
+  grad_clip: 1.0
+  max_new_tokens: 256
+  temperature: 0.9
+  top_p: 0.95
+  top_k: -1
+  clip_low: 0.2
+  clip_high: 0.28
+  clip_ratio: 0.25
+  clip_cispo_high: 5.0
+  kl_coef: 0.01
+  adv_eps: 0.0001
+  dg_eta: 1.0
+  adaptive_sampling: true
+  oversample_factor: 2.0
+  min_reward_spread: 0.5

@@ -377,6 +377,7 @@ class Trainer:
         self.model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name, dtype=model_dtype,
             low_cpu_mem_usage=True, trust_remote_code=True,
+            attn_implementation="flash_attention_2",
         ).to(self.device)
 
         self.model.config.use_cache = False

@@ -1,8 +1,19 @@
 """CLI entry point for `vivace-train`.
 
 Usage:
-    vivace-train --config vivace/configs/grpo_gsm8k_0.5b_lora.yaml
-    vivace-train --config <path> --num-steps 5    # quick smoke test
+    # Basic
+    vivace-train --config vivace/configs/gsm8k/grpo_0.5b_full.yaml
+    vivace-train --config <path> --num-steps 5                   # smoke test
+
+    # Common hyperparameter overrides (explicit flags)
+    vivace-train --config <path> --lr 3e-5 --batch-size 8 --group-size 8
+    vivace-train --config <path> --algo cispo --loss cispo --kl-coef 0.02
+    vivace-train --config <path> --lora-rank 32 --gpu-mem-util 0.45
+
+    # Anything else via the generic --set escape hatch (dotted path, yaml value):
+    vivace-train --config <path> --set rl.clip_cispo_high=10.0 \
+                                 --set adam_beta2=0.95 \
+                                 --set rl.lr_restart=true
 """
 
 from __future__ import annotations
@@ -87,45 +98,142 @@ def _maybe_enable_vllm_callable_rpc(cfg_dict: dict) -> None:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="vivace-train")
     p.add_argument("--config", required=True, help="path to YAML config")
+
+    # --- Run lifecycle ---
     p.add_argument("--num-steps", type=int, default=None, help="override TrainerConfig.num_steps")
     p.add_argument("--run-dir", type=str, default=None, help="override TrainerConfig.run_dir")
     p.add_argument("--seed", type=int, default=None, help="override TrainerConfig.seed")
+
+    # --- Algorithm / loss ---
+    p.add_argument("--algo", type=str, default=None,
+                   help="override algo_name (cispo / dapo / gspo / grpo)")
+    p.add_argument("--loss", type=str, default=None,
+                   help="override rl.loss_type")
+    p.add_argument("--adv", type=str, default=None,
+                   help="override rl.adv_type (rloo / grpo)")
+
+    # --- Most-tweaked RL hyperparameters ---
+    p.add_argument("--lr", type=float, default=None, help="override rl.lr")
+    p.add_argument("--batch-size", type=int, default=None, help="override rl.batch_size")
+    p.add_argument("--group-size", type=int, default=None, help="override rl.group_size")
+    p.add_argument("--grad-accum-steps", type=int, default=None,
+                   help="override rl.grad_accum_steps")
+    p.add_argument("--optim-epochs", type=int, default=None, help="override rl.optim_epochs")
+    p.add_argument("--kl-coef", type=float, default=None, help="override rl.kl_coef")
+    p.add_argument("--grad-clip", type=float, default=None,
+                   help="override rl.grad_clip (gradient norm cap)")
+    p.add_argument("--max-new-tokens", type=int, default=None, help="override rl.max_new_tokens")
+    p.add_argument("--max-prompt-tokens", type=int, default=None,
+                   help="override max_prompt_tokens (cap on input length)")
+
+    # --- Model / mode / scale ---
+    p.add_argument("--model", type=str, default=None, help="override model_name (HF repo id)")
+    p.add_argument("--env", type=str, default=None, help="override env_name")
+    p.add_argument("--mode", choices=["disaggregated", "colocated"], default=None,
+                   help="override mode")
+    p.add_argument("--lora-rank", type=int, default=None, help="override lora_rank")
+    p.add_argument("--gpu-mem-util", type=float, default=None,
+                   help="override gpu_memory_utilization (vLLM fraction)")
+    p.add_argument("--vllm-max-num-seqs", type=int, default=None,
+                   help="override vllm_max_num_seqs (rollout concurrency cap)")
+
+    # --- Weight sync ---
     p.add_argument("--weight-sync-method", choices=["disk", "nccl", "ipc"], default=None,
                    help="override TrainerConfig.weight_sync_method (disk | nccl | ipc)")
     p.add_argument("--weight-sync-disk-path", type=str, default=None,
                    help="override TrainerConfig.weight_sync_disk_path. Defaults to "
                         "/dev/shm/vivace_sync_<run_basename>; pass e.g. 'runs/<tag>/adapter' "
                         "to force NVMe.")
+
+    # --- wandb ---
     p.add_argument("--wandb-project", type=str, default=None,
                    help="override TrainerConfig.wandb_project")
     p.add_argument("--wandb-run-name", type=str, default=None,
                    help="override TrainerConfig.wandb_run_name (defaults to run_dir basename)")
     p.add_argument("--wandb-group", type=str, default=None,
                    help="override TrainerConfig.wandb_group (clusters runs in wandb UI)")
+
+    # --- Generic escape hatch for any other field ---
+    # Apply repeatedly: --set rl.clip_cispo_high=10.0 --set adam_beta2=0.95
+    # Values are yaml-parsed so types are inferred (int, float, bool, str, list).
+    p.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE",
+                   dest="overrides",
+                   help="dotted-path override of any config field, e.g. "
+                        "'--set rl.lora_dropout=0.05 --set adam_beta2=0.95'. Repeatable.")
+
     return p.parse_args(argv)
+
+
+def _apply_set_overrides(cfg_dict: dict, overrides: list[str]) -> None:
+    """Apply repeatable --set FIELD=VALUE overrides to a nested config dict.
+
+    FIELD is a dotted path (e.g. 'rl.lr' or 'lora_rank'). VALUE is yaml-parsed,
+    so '3e-5' → float, '8' → int, 'true' → bool, '[1,2]' → list. Missing nested
+    keys raise KeyError so typos fail loud rather than silently no-op.
+    """
+    for spec in overrides:
+        if "=" not in spec:
+            raise ValueError(f"--set expects FIELD=VALUE, got: {spec!r}")
+        key, raw = spec.split("=", 1)
+        value = yaml.safe_load(raw)
+        parts = key.split(".")
+        target = cfg_dict
+        for p in parts[:-1]:
+            if p not in target or not isinstance(target[p], dict):
+                raise KeyError(f"--set path {key!r}: '{p}' is not a dict in the config")
+            target = target[p]
+        target[parts[-1]] = value
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     cfg_dict = load_config(args.config)
 
-    # CLI overrides win over YAML
-    if args.num_steps is not None:
-        cfg_dict["num_steps"] = args.num_steps
-    if args.run_dir is not None:
-        cfg_dict["run_dir"] = args.run_dir
-    if args.seed is not None:
-        cfg_dict["seed"] = args.seed
-    if args.weight_sync_method is not None:
-        cfg_dict["weight_sync_method"] = args.weight_sync_method
-    if args.weight_sync_disk_path is not None:
-        cfg_dict["weight_sync_disk_path"] = args.weight_sync_disk_path
-    if args.wandb_project is not None:
-        cfg_dict["wandb_project"] = args.wandb_project
-    if args.wandb_run_name is not None:
-        cfg_dict["wandb_run_name"] = args.wandb_run_name
-    if args.wandb_group is not None:
-        cfg_dict["wandb_group"] = args.wandb_group
+    # CLI overrides win over YAML. Order: explicit shortcuts first, then the
+    # generic --set escape hatch (so --set wins if both target the same field).
+    # Top-level fields:
+    for arg_name, cfg_key in [
+        ("num_steps", "num_steps"),
+        ("run_dir", "run_dir"),
+        ("seed", "seed"),
+        ("algo", "algo_name"),
+        ("model", "model_name"),
+        ("env", "env_name"),
+        ("mode", "mode"),
+        ("lora_rank", "lora_rank"),
+        ("gpu_mem_util", "gpu_memory_utilization"),
+        ("vllm_max_num_seqs", "vllm_max_num_seqs"),
+        ("max_prompt_tokens", "max_prompt_tokens"),
+        ("weight_sync_method", "weight_sync_method"),
+        ("weight_sync_disk_path", "weight_sync_disk_path"),
+        ("wandb_project", "wandb_project"),
+        ("wandb_run_name", "wandb_run_name"),
+        ("wandb_group", "wandb_group"),
+    ]:
+        val = getattr(args, arg_name)
+        if val is not None:
+            cfg_dict[cfg_key] = val
+
+    # RL-block fields (apply under cfg_dict["rl"]):
+    rl_block = cfg_dict.setdefault("rl", {})
+    for arg_name, rl_key in [
+        ("loss", "loss_type"),
+        ("adv", "adv_type"),
+        ("lr", "lr"),
+        ("batch_size", "batch_size"),
+        ("group_size", "group_size"),
+        ("grad_accum_steps", "grad_accum_steps"),
+        ("optim_epochs", "optim_epochs"),
+        ("kl_coef", "kl_coef"),
+        ("grad_clip", "grad_clip"),
+        ("max_new_tokens", "max_new_tokens"),
+    ]:
+        val = getattr(args, arg_name)
+        if val is not None:
+            rl_block[rl_key] = val
+
+    # Generic --set FIELD=VALUE applies last (escape hatch wins ties).
+    _apply_set_overrides(cfg_dict, args.overrides)
 
     _maybe_enable_vllm_callable_rpc(cfg_dict)
 

@@ -8,7 +8,7 @@ stale folders.
 
 ```bash
 python -m vivace.scripts.train \
-    --config vivace/configs/dapo_gsm8k_qw25_0.5b_lora_colo.yaml \
+    --config vivace/configs/gsm8k/dapo_0.5b_colo.yaml \
     --num-steps 200 \
     --run-dir "runs/qw25_0.5b_ipc_$(date +%Y%m%d_%H%M%S)"
 ```
@@ -19,7 +19,7 @@ To save the trainer log:
 RUN_DIR="runs/qw25_0.5b_ipc_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_DIR"
 python -m vivace.scripts.train \
-    --config vivace/configs/dapo_gsm8k_qw25_0.5b_lora_colo.yaml \
+    --config vivace/configs/gsm8k/dapo_0.5b_colo.yaml \
     --num-steps 200 \
     --run-dir "$RUN_DIR" > "$RUN_DIR/train.log" 2>&1
 ```
