@@ -1,0 +1,71 @@
+[project]
+name = "vivace"
+version = "0.0.2"
+description = "A fast, hackable RL post-training lab for language models."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Viktor Makoviichuk" }]
+license = { text = "MIT" }
+
+dependencies = [
+    # Docker stack: torch 2.10 + vllm 0.19 + cu12.8 wheels. This combo runs on
+    # cloud A100/H100/H200 driver 545+. Local pyproject targets torch 2.11 /
+    # vllm 0.20 / cu13 — that needs driver 580+ (only on Blackwell hosts).
+    "torch>=2.10,<2.11",       # cu128 wheel; matches vllm 0.19's flash-attn build
+    "vllm>=0.19,<0.20",        # last cu12.8 series; 0.20+ is cu13-only
+    "nvidia-cudnn-cu12>=9.0",  # cuda-toolkit's extras don't include cudnn — pull explicitly
+    "flash-attn>=2.8",         # trainer attn_implementation="flash_attention_2"; compiles from source during uv sync (~10-15 min, see Dockerfile MAX_JOBS)
+    "transformers>=4.58",      # 4.58+ adds qwen3_5; vllm 0.20 will pull in 5.6.x in fresh installs
+    "datasets>=4.0",
+    "accelerate>=1.13",
+    "peft>=0.19",              # LoRA
+    "wandb>=0.25",
+    "pyyaml>=6.0",
+    "numpy>=2.2",
+    "tqdm>=4.67",
+    "matplotlib>=3.10",
+    "math-verify>=0.5",        # LaTeX-aware math answer verifier; backs MATHEnv / MATH500Env / AIME*Env rewards
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6", "ipython"]
+# Qwen 3.5 models use DeltaNet layers — these provide fast CUDA kernels.
+# Without them training works but is ~3-5x slower.
+qwen35 = ["causal-conv1d", "flash-linear-attention"]
+# OpenEnv and any other envs you want to keep optional
+envs = ["openenv"]
+
+[project.scripts]
+vivace-train = "vivace.scripts.train:main"
+vivace-sft = "vivace.scripts.sft:main"
+vivace-eval = "vivace.scripts.eval:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vivace"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+
+# Docker-only: pin torch + CUDA libs to the cu128 wheel variant. Most cloud
+# GPU hosts run NVIDIA driver 545-565, which supports cu128 but not cu13.
+# cu130 wheels would refuse to start on those hosts with
+# "nvidia-container-cli: requirement error: cuda>=13.1". cu128 still covers
+# H100 / H200 / B200 via forward-compatible drivers, so this is the
+# broadest-compatible target. Local pyproject.toml is unchanged (cu13).
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
