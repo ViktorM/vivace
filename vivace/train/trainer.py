@@ -330,11 +330,25 @@ class Trainer:
                     f"colocated mode requires trainer_gpus == rollout_gpus, got "
                     f"{cfg.trainer_gpus} vs {cfg.rollout_gpus}"
                 )
-        elif cfg.mode == "disaggregated" and world_size > 1:
-            # Single-rank disaggregated works (existing 2-GPU configs); only the
-            # multi-rank variant is unimplemented (would need a separate process
-            # group split for trainer ranks vs vLLM ranks).
-            raise NotImplementedError("disaggregated DDP (multi-rank) — Phase 2")
+        elif cfg.mode == "disaggregated":
+            # 1:1 trainer:rollout pairing — each trainer rank gets its own vLLM
+            # worker on a dedicated rollout GPU (gpu_ids=[rollout_gpus[local_rank]]
+            # in the VLLMRolloutWorker constructor below). The NCCL weight-sync
+            # path builds one comm per rank (each rank does its own
+            # StatelessProcessGroup rendezvous on a separate port), so DDP across
+            # multiple trainer ranks works without a global trainer↔vLLM group.
+            if len(cfg.rollout_gpus) != world_size:
+                raise ValueError(
+                    f"disaggregated mode requires len(rollout_gpus)={len(cfg.rollout_gpus)} "
+                    f"to equal WORLD_SIZE={world_size} (1:1 trainer:rollout pairing). "
+                    f"Got trainer_gpus={cfg.trainer_gpus}, rollout_gpus={cfg.rollout_gpus}."
+                )
+            if set(cfg.trainer_gpus) & set(cfg.rollout_gpus):
+                raise ValueError(
+                    f"disaggregated mode requires disjoint trainer/rollout GPU sets, got "
+                    f"trainer_gpus={cfg.trainer_gpus}, rollout_gpus={cfg.rollout_gpus}. "
+                    f"Use mode='colocated' for shared-GPU layouts."
+                )
 
         # --- Resolve devices ---
         # trainer_gpus / rollout_gpus are the full GPU pools (per cfg). For DDP,

@@ -145,12 +145,25 @@ class VLLMRolloutWorker:
         # vLLM spawns its own subprocess (EngineCore) that inherits
         # CUDA_VISIBLE_DEVICES. Set it before LLM() and restore after so the
         # trainer process still sees all GPUs.
+        #
+        # Composition with an outer CUDA_VISIBLE_DEVICES (set by torchrun launcher
+        # or the user when multiplexing several runs on one node): the child
+        # subprocess inherits whatever we put in os.environ and interprets it as
+        # **absolute** physical device indices — the outer mapping does NOT carry
+        # across the fork. So if outer = "4,5,6,7" and we naively set inner = "0",
+        # the child sees physical GPU 0, not physical 4. Translate gpu_ids
+        # (relative to the parent's visible set) into physical indices first.
         import os
         gpu_ids = gpu_ids or [0]
         tp_size = len(gpu_ids)
 
         old_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+        if old_visible:
+            outer_list = [int(x) for x in old_visible.split(",") if x.strip()]
+            physical_ids = [outer_list[g] for g in gpu_ids]
+        else:
+            physical_ids = list(gpu_ids)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(p) for p in physical_ids)
 
         # Under torchrun, env vars like MASTER_ADDR/MASTER_PORT/RANK/WORLD_SIZE/
         # LOCAL_RANK get set on the trainer process. The vLLM EngineCore
