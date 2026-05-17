@@ -28,7 +28,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv python3.12-dev python3-pip \
         git openssh-client curl ca-certificates \
-        build-essential \
+        build-essential tmux \
     && rm -rf /var/lib/apt/lists/*
 # python3.12-dev gives us Python.h, which triton needs to JIT-compile its
 # cuda_utils C shim at first vLLM model load.
