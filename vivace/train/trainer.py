@@ -188,11 +188,25 @@ def _set_seed(seed: int):
     torch.manual_seed(seed)
 
 
-def _find_free_port() -> int:
-    """Bind to port 0 to let the OS pick a free loopback port, then release it.
-    Small race window between releasing and another process grabbing it, but
-    sufficient for one-shot rendezvous at process startup.
+def _find_free_port(rank_hint: int = 0) -> int:
+    """Pick a free loopback port for one-shot rendezvous at startup.
+
+    For multi-rank disagg, each trainer rank calls this independently and a
+    naive port-0 grab can produce identical ports across ranks (the OS may
+    reuse a just-released port). We try a rank-spaced range first
+    (29600 + rank_hint*10 .. +9), falling back to OS allocation if that range
+    is fully busy. This eliminates the cross-rank race in practice while
+    keeping behavior identical for the single-rank case.
     """
+    base = 29600 + rank_hint * 10
+    for candidate in range(base, base + 10):
+        try:
+            s = socket.socket()
+            s.bind(("localhost", candidate))
+            s.close()
+            return candidate
+        except OSError:
+            continue
     s = socket.socket()
     s.bind(("localhost", 0))
     port = s.getsockname()[1]
@@ -446,7 +460,13 @@ class Trainer:
         self._inner_model = self.model
 
         if world_size > 1:
-            self.model = DDP(self.model, device_ids=[local_rank],
+            # device_ids must match the device the model actually lives on
+            # (self.device, set above from cfg.trainer_gpus[local_rank]).
+            # Using bare local_rank here breaks whenever trainer_gpus is not
+            # 0..N-1 in order — e.g., trainer_gpus=[2,3] with no outer
+            # CUDA_VISIBLE_DEVICES mask. NCCL then asserts with
+            # "Tensor on cuda:X but backend constrained to cuda:Y".
+            self.model = DDP(self.model, device_ids=[self.device.index],
                              find_unused_parameters=cfg.find_unused_parameters)
 
         # --- Compile (optional) ---
@@ -588,7 +608,7 @@ class Trainer:
             from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
             from vivace.utils.weight_sync import build_param_specs, allocate_fused_buffers
 
-            host, port = "localhost", _find_free_port()
+            host, port = "localhost", _find_free_port(rank_hint=local_rank)
             world_size = 2   # 1 trainer + 1 vLLM worker at TP=1; bump when scaling
 
             # Worker-side init runs inside the vLLM subprocess via collective_rpc.
