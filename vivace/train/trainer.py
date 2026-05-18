@@ -93,6 +93,11 @@ class TrainerConfig:
 
     # ----- model dtype + compilation -----
     dtype: str = "bfloat16"          # bfloat16 | float16 | float32
+    # HF attention implementation: "flash_attention_2" (default — sm_80+, requires
+    # flash-attn package), "sdpa" (torch built-in, falls back to math kernel with
+    # 4D masks), or "eager" (slowest, materializes full attention scores tensor).
+    # Override via --set attn_implementation=eager for FA2-off ablation runs.
+    attn_implementation: str = "flash_attention_2"
     compile_model: bool = False      # torch.compile — can break generate(), off by default
     # Gradient checkpointing: trades ~30% step-time for ~50% peak activation memory.
     # Required for 1.5B + LoRA on a single 4090 with long sequences (math). Calls
@@ -391,7 +396,7 @@ class Trainer:
         self.model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name, dtype=model_dtype,
             low_cpu_mem_usage=True, trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            attn_implementation=cfg.attn_implementation,
         ).to(self.device)
 
         self.model.config.use_cache = False
