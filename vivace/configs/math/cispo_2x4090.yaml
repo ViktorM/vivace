@@ -27,7 +27,7 @@ lora_target_modules:
 - k_proj
 - v_proj
 - o_proj
-num_steps: 500
+num_steps: 200
 sft_warmup: false
 sft_warmup_steps: 0
 wandb_project: vivace

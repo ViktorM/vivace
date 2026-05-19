@@ -6,7 +6,7 @@ trainer_gpus: [0, 1]
 rollout_gpus: [0, 1]
 use_lora: false
 compile_model: false      # torch.compile — flip to true to test ~10-30% speedup; can interact badly with peft/DDP/variable-T
-num_steps: 500
+num_steps: 200
 sft_warmup: false
 sft_warmup_steps: 0
 wandb_project: vivace
