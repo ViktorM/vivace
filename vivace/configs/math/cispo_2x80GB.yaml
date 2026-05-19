@@ -14,9 +14,14 @@
 # - Net: 8 × 8 × 1 = 64 trajectories per gradient step (2× the desktop's 32).
 #   This is also the first cluster-scale test of the "small batch is the cause"
 #   hypothesis for the step-200 collapse pattern.
-# - gradient_checkpointing OFF — 80GB has the memory to skip it (~30% faster
-#   per-step than with checkpointing). Peak ~65 GB at this batch.
-# - gpu_memory_utilization: 0.8 — vLLM gets 64 GB on an 80GB card.
+# - gradient_checkpointing ON — bs=8 × max_new=1024 hits ~78 GB peak on the
+#   trainer GPU without checkpointing, leaving no room for the SiLU forward
+#   spike. GC brings peak to ~52 GB. ~30% slower per step, but the only
+#   way bs=8 at max=1024 fits on 80GB.
+# - gpu_memory_utilization: 0.80 — disagg rollout GPU is dedicated to vLLM
+#   (no trainer sharing), so vLLM gets ~64 GB of KV cache. Distinct from
+#   the colocated config where 0.25 is right because the trainer needs the
+#   rest of the card.
 # - vllm_max_num_seqs: 128 — large enough to handle the rollout burst
 #   (8 prompts × 8 group × oversample 2.0 = ≤128 concurrent sequences).
 # - eval_batch_size: 128 — eval runs through vLLM; same headroom applies.
@@ -36,7 +41,7 @@ trainer_gpus:
 rollout_gpus:
 - 1
 use_vllm: true
-gpu_memory_utilization: 0.8
+gpu_memory_utilization: 0.80
 enforce_eager: false
 compile_model: false
 vllm_max_model_len: 1280
@@ -76,7 +81,7 @@ rl:
   eta_min_ratio: 0.2
   lr_restart: false
   grad_clip: 1.0
-  max_new_tokens: 768
+  max_new_tokens: 1024
   temperature: 0.7
   top_p: 0.95
   top_k: -1
@@ -100,4 +105,4 @@ rl:
   lr_factor: 1.5
   min_lr: 1.0e-07
   max_lr: 2.0e-05
-gradient_checkpointing: false
+gradient_checkpointing: true
