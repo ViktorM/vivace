@@ -1,16 +1,10 @@
-# vivace container image for cloud GPU pods (Runpod, Modal, etc.)
+# vivace container image for modern cloud GPU pods (Runpod, Modal, etc.)
 #
-# Stack chosen for compatibility with cloud GPU host drivers as of mid-2026:
-#   - Base: CUDA 12.8 (driver >= 545 — universal on cloud A100/H100/H200).
-#     cu13 needs driver >= 580 which only B200 hosts have; vivace's torch
-#     pin would refuse to start on A100/H100 nodes.
-#   - torch 2.10 + cu128 wheels — last torch series with a cu128 build that
-#     vllm's flash-attention links against. torch 2.11 ships cu13 wheels.
-#   - vllm 0.19.x — its compiled extension is cu12.8. vllm 0.20 ships cu13
-#     and triggers "CUDA driver version is insufficient" on A100/H100.
-# Local pyproject.toml stays on torch 2.11 / vllm 0.20 / cu13 (desktop has
-# a newer driver). docker/pyproject.cu128.toml is the docker-only manifest.
-FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
+# Stack: torch 2.11 + vllm 0.20 + cu13. Requires NVIDIA driver >= 580.
+# Targets recent H100 / H200 / B200 hosts. Older pods on driver 545-575
+# will fail with "CUDA driver version is insufficient" — that is intentional;
+# vivace v0.4.3+ only supports drivers shipping CUDA 13 runtime.
+FROM nvidia/cuda:13.0.1-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -39,26 +33,19 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
 
 WORKDIR /opt/vivace
 
-# Copy dependency manifests first so the heavy install layer survives source
-# edits. `--no-install-project` builds the dep tree (torch, vLLM, etc.) without
-# trying to install the local `vivace` package — that would require README.md
-# and the source tree, which we don't have yet.
-#
-# We use docker/pyproject.cu128.toml + docker/uv.cu128.lock (renamed in the
-# image to pyproject.toml + uv.lock) so the Docker build pins torch + CUDA
-# libs to cu128 wheels (runs on cloud driver 545+). The local project's
-# pyproject.toml stays on cu13 wheels for the desktop dev environment.
-COPY docker/pyproject.cu128.toml ./pyproject.toml
-COPY docker/uv.cu128.lock ./uv.lock
+# Copy the root pyproject + lock first so the heavy install layer caches
+# across source edits. --no-install-project skips the local vivace package
+# itself until the source is copied below.
+COPY pyproject.toml uv.lock ./
 
 RUN uv venv --python python3.12 && \
     uv sync --no-dev --frozen --no-install-project
 
 # Belt-and-braces: force-install cuDNN explicitly. uv sometimes prunes
-# nvidia-cudnn-cu12 when cuda-toolkit is in the dependency tree, even when
-# nvidia-cudnn-cu12 is locked as a direct dep — leaves torch unable to
-# dlopen libcudnn.so.9 at runtime. This RUN guarantees it's there.
-RUN uv pip install --python /opt/vivace/.venv/bin/python nvidia-cudnn-cu12==9.19.0.56
+# nvidia-cudnn-cu13 when cuda-toolkit is in the dependency tree, even when
+# it's locked as a direct dep — leaves torch unable to dlopen libcudnn.so.9
+# at runtime. This RUN guarantees it's there.
+RUN uv pip install --python /opt/vivace/.venv/bin/python nvidia-cudnn-cu13==9.19.0.56
 
 # Repo source (excludes via .dockerignore: runs/, .venv, wandb, etc.)
 COPY . .
@@ -67,15 +54,8 @@ COPY . .
 # Deps are already cached above, so this is a fast pip-install-style step.
 RUN uv sync --no-dev --frozen
 
-# torchvision pulled by transformers is built against cu13 even when torch
-# is cu12.8. Its CUDA-version sanity check refuses to load alongside our cu12.8
-# torch, breaking transformers' image_utils import (and therefore vllm config
-# load). vivace doesn't use vision — drop it. transformers gracefully skips
-# the torchvision.io import when the package isn't installed.
-RUN uv pip uninstall --python /opt/vivace/.venv/bin/python torchvision
-
 # Register the bundled NVIDIA libs (libcudnn / libcublas / libnccl / etc.)
-# with the dynamic loader. The cu12 torch wheels ship these under
+# with the dynamic loader. The cu13 torch wheels ship these under
 # .venv/lib/.../nvidia/<lib>/lib, which dlopen doesn't search by default,
 # so `import torch` fails with "libcudnn.so.9: cannot open shared object
 # file" without this step.

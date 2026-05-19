@@ -1,6 +1,6 @@
 [project]
 name = "vivace"
-version = "0.0.2"
+version = "0.0.3"
 description = "A fast, hackable RL post-training lab for language models."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,7 +13,7 @@ dependencies = [
     "datasets>=4.0",
     "accelerate>=1.13",
     "peft>=0.19",              # LoRA
-    "vllm>=0.20",              # rollout inference (also brings torch==2.11)
+    "vllm>=0.21",              # rollout inference (also brings torch==2.11)
     "flash-attn>=2.8",         # trainer attn_implementation="flash_attention_2"; varlen kernels skip the O(S²) score tensor
     "wandb>=0.25",
     "pyyaml>=6.0",
@@ -49,6 +49,20 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
+
+# Pin torch (and torchvision/torchaudio) to PyTorch's cu130 wheel channel.
+# Default pypi serves cu12.8 wheels even for torch 2.11; without this index
+# torch.version.cuda is "12.8", flash-attn's build refuses to compile against
+# a cu13 base image, and the docker build fails.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
 
 # flash-attn's setup.py imports torch at build time to detect CUDA version + GPU arches,
 # but doesn't declare torch as a build dep. Inject it so uv sync can build the wheel.

@@ -20,10 +20,3 @@ docs/superpowers
 signal-desktop-keyring.gpg
 signal-desktop.sources
 
-# The Docker build uses docker/pyproject.cu128.toml + docker/uv.cu128.lock
-# (copied into the image as pyproject.toml + uv.lock) to pin torch to cu128
-# wheels. The project-root pyproject.toml + uv.lock target cu13 for local
-# dev — keep them out of the build context so they can't shadow the cu128
-# versions during `COPY . .`.
-pyproject.toml
-uv.lock
