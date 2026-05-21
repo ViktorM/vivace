@@ -273,6 +273,10 @@ def compute_token_logprobs(
         no_prior_eos = (is_eos[:, start:].cumsum(dim=-1) - is_eos[:, start:].long()) == 0
         mask[:, start:] = no_prior_eos.float()
 
+    # Keep masks in fp32 so downstream reductions and denominators do not
+    # inherit bf16 precision from the model forward.
+    mask = mask.float()
+
     B, S_minus_one, _ = log_probs.shape
     entropy = None
     if return_entropy:
@@ -388,16 +392,20 @@ def compute_kl(
     ratio (policy/old, not ref/policy). For the KL ratio, -10/+10
     is looser and sufficient for stability without distorting typical values.
     """
+    policy_logp_f = policy_logp.float()
+    ref_logp_f = ref_logp.float()
+    mask_f = mask.float()
+
     if estimator == "k1":
-        per_token_kl = policy_logp - ref_logp
+        per_token_kl = policy_logp_f - ref_logp_f
     elif estimator == "k3":
-        log_r = (ref_logp - policy_logp).clamp(-10, 10)
+        log_r = (ref_logp_f - policy_logp_f).clamp(-10, 10)
         r = torch.exp(log_r)
         per_token_kl = r - log_r - 1.0
     else:
         raise ValueError(f"unknown KL estimator: {estimator!r}")
 
-    return (per_token_kl * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+    return (per_token_kl * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1.0)
 
 
 # =============================================================================
@@ -446,11 +454,10 @@ def compute_loss(
                    clip. One ratio per sequence, not per token.
 
     - "cispo"    : Importance-clipped policy-gradient. Detach the clamped
-                   weight and multiply policy_logp directly. Numerator is
-                   ratio.clamp(max=clip_cispo_high). Additionally applies a
-                   trust-region mask (MiniMax-M1 eq. 7): drop tokens whose
-                   ratio drifted outward in the same direction as the
-                   advantage (positive A & r>high, or negative A & r<low).
+                   weight and multiply policy_logp directly. Canonical CISPO
+                   preserves gradients for all tokens; the MiniMax-M1 eq. 7
+                   / PPO-style token mask is available as an explicit
+                   opt-in via cfg.cispo_use_token_mask.
 
     - "dg"       : Delight-gated PG. Compute "delight" = eta * adv * surprisal
                    (surprisal = -policy_logp.detach()), pass through sigmoid
@@ -468,44 +475,66 @@ def compute_loss(
     - Don't forget the negative sign on the final loss (we're maximizing).
 
     """
+    policy_logp_f = policy_logp.float()
+    old_logp_f = old_logp.float()
+    advantages_f = advantages.float()
+    mask_f = mask.float()
+    token_count_f = token_count.float().clamp(min=1.0)
+
     if cfg.loss_type == "rloo":
-        mean_logp = (policy_logp * mask).sum(dim=1) / token_count  # (B*G,)
-        loss = -(advantages * mean_logp).mean()
+        mean_logp = (policy_logp_f * mask_f).sum(dim=1) / token_count_f  # (B*G,)
+        loss = -(advantages_f * mean_logp).mean()
     # sequence-level ratio
     elif cfg.loss_type == "gspo":
-        seq_logp = (policy_logp * mask).sum(dim=1) / token_count  # (B*G,)
-        old_seq_logp = (old_logp * mask).sum(dim=1) / token_count
+        seq_logp = (policy_logp_f * mask_f).sum(dim=1) / token_count_f  # (B*G,)
+        old_seq_logp = (old_logp_f * mask_f).sum(dim=1) / token_count_f
         seq_log_ratio = (seq_logp - old_seq_logp).clamp(-5, 5)  # clamp for stability
         seq_ratio = torch.exp(seq_log_ratio)  # (B*G,)
         # we support asymmetric clipping for GSPO as well
         seq_clipped = torch.clamp(seq_ratio, 1.0 - cfg.clip_low, 1.0 + cfg.clip_high)
-        loss = -torch.min(advantages * seq_ratio, advantages * seq_clipped).mean()
+        loss = -torch.min(advantages_f * seq_ratio, advantages_f * seq_clipped).mean()
     # all token-level variants
     else:
-        log_ratio = (policy_logp - old_logp).clamp(-5, 5)  # clamp for stability
+        log_ratio = (policy_logp_f - old_logp_f).clamp(-5, 5)  # clamp for stability
         ratio = torch.exp(log_ratio)  # (B*G, S-1)
         clipped = torch.clamp(ratio, 1 - cfg.clip_low, 1 + cfg.clip_high)
-        a = advantages.unsqueeze(1)  # (B*G, 1)
+        a = advantages_f.unsqueeze(1)  # (B*G, 1)
         obj = torch.min(ratio * a, clipped * a)
         # token-level normalization
         if cfg.loss_type == "dapo":
-            loss = -(obj * mask).sum() / mask.sum().clamp(min=1.0)
+            loss = -(obj * mask_f).sum() / mask_f.sum().clamp(min=1.0)
         elif cfg.loss_type == "grpo":
-            per_seq = (obj * mask).sum(dim=1) / token_count
+            per_seq = (obj * mask_f).sum(dim=1) / token_count_f
             loss = -per_seq.mean()
         elif cfg.loss_type == "dr_grpo":
-            per_seq = (obj * mask).sum(dim=1) / cfg.max_new_tokens
+            per_seq = (obj * mask_f).sum(dim=1) / cfg.max_new_tokens
             loss = -per_seq.mean()
         elif cfg.loss_type == "cispo":
-            # Detached IS weight, (MiniMax-M1 eq. 5) uses PPO style clip: 1-low, 1+high
+            # Detached clipped IS weight (MiniMax-M1 eq. 5). Canonical CISPO
+            # clips the weight but keeps every response token in the gradient.
             is_weight = ratio.clamp(min=cfg.clip_cispo_low, max=cfg.clip_cispo_high).detach()
-            # Trust-region mask (MiniMax-M1 eq. 7): drop tokens whose ratio
-            # drifted outward in the same direction as the advantage.
-            keep_high = (ratio < cfg.clip_cispo_high) | (a <= 0.0)
-            keep_low = (ratio > cfg.clip_cispo_low) | (a >= 0.0)
-            is_mask = (keep_high & keep_low).to(ratio.dtype)
-            per_token = - is_weight * a * policy_logp * is_mask * mask
-            loss = per_token.sum() / mask.sum().clamp(min=1.0)
+            if cfg.cispo_use_token_mask:
+                # Optional trust-region mask (MiniMax-M1 eq. 7): drop tokens
+                # whose ratio drifted outward in the same direction as the
+                # advantage. This intentionally reintroduces PPO-like token
+                # dropping and is not the default CISPO objective.
+                keep_high = (ratio <= cfg.clip_cispo_high) | (a <= 0.0)
+                keep_low = (ratio >= cfg.clip_cispo_low) | (a >= 0.0)
+                is_mask = (keep_high & keep_low).to(ratio.dtype)
+            else:
+                is_mask = torch.ones_like(ratio)
+
+            per_token = -is_weight * a * policy_logp_f * is_mask * mask_f
+            token_loss = per_token.sum() / mask_f.sum().clamp(min=1.0)
+            sequence_loss = (per_token.sum(dim=1) / token_count_f).mean()
+            if cfg.cispo_normalization == "token":
+                loss = token_loss
+            elif cfg.cispo_normalization == "sequence":
+                loss = sequence_loss
+            elif cfg.cispo_normalization == "hybrid":
+                loss = 0.5 * (token_loss + sequence_loss)
+            else:
+                raise ValueError(f"unknown cispo_normalization: {cfg.cispo_normalization!r}")
         elif cfg.loss_type == "dg":
             raise NotImplementedError("dg loss not yet implemented")
         elif cfg.loss_type == "dg_cispo":
@@ -625,12 +654,17 @@ def rl_step(
                         tot_clip += ((ratio - 1.0).abs() > cfg.clip_high).float().sum()
                         tot_tok += float(len(ratio))
                     elif cfg.loss_type == "cispo":
-                        # CISPO trust-region mask: same condition as the loss.
-                        ratio = torch.exp((policy_logp - mb["old_logp"]).clamp(-5, 5))
-                        a = mb["adv"].unsqueeze(1)
-                        drop_high = (ratio > cfg.clip_cispo_high) & (a > 0.0)
-                        drop_low  = (ratio < cfg.clip_cispo_low)  & (a < 0.0)
-                        clipped_mask = (drop_high | drop_low) & (mb["mask"] > 0)
+                        # CISPO clip_frac reports clipped IS weights, not
+                        # token drops. Token dropping is optional and off by
+                        # default; clipped weights are always part of CISPO.
+                        log_ratio = (policy_logp.float() - mb["old_logp"].float()).clamp(-5, 5)
+                        ratio = torch.exp(log_ratio)
+                        clip_high = ratio > cfg.clip_cispo_high
+                        if cfg.clip_cispo_low > 0.0:
+                            clip_low = ratio < cfg.clip_cispo_low
+                        else:
+                            clip_low = torch.zeros_like(clip_high)
+                        clipped_mask = (clip_high | clip_low) & (mb["mask"] > 0)
                         tot_clip += clipped_mask.sum().float()
                         tot_tok += mb["mask"].sum()
                     elif cfg.uses_clipping:

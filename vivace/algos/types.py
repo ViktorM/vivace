@@ -90,8 +90,13 @@ class RLConfig:
     clip_low: float = 0.2          # epsilon_low
     clip_high: float = 0.2         # epsilon_high (set > clip_low for DAPO), but asymmetric can be used with other algorithms
     clip_ratio: float = 0.25       # PPO-style clip (referenced by some variants; currently unused by default loss)
-    clip_cispo_high: float = 5.0   # CISPO upper r-threshold: drop tokens with A>0 and r > clip_cispo_high (also caps surviving IS weight)
-    clip_cispo_low: float = 0.0    # CISPO lower r-threshold: drop tokens with A<0 and r < clip_cispo_low (0.0 disables lower mask)
+    clip_cispo_high: float = 5.0   # CISPO upper IS-weight cap. Paper tunes this side.
+    clip_cispo_low: float = 0.0    # CISPO lower IS-weight floor. 0.0 disables lower clipping.
+    # Canonical CISPO keeps all token gradients. Eq. 7 / PPO-style dropping is opt-in.
+    cispo_use_token_mask: bool = False
+    # token = previous DAPO-style token mean; sequence = equal weight per response;
+    # hybrid = average of both, which is more robust to long negative samples.
+    cispo_normalization: str = "hybrid"
 
     # --- KL ---
     kl_coef: float = 0.02          # KL regularization coefficient (some implementations call this kl_beta)
@@ -141,6 +146,26 @@ def validate_rl_config(cfg: RLConfig) -> None:
             "Nothing to filter. Setting adaptive_sampling=False."
         )
         cfg.adaptive_sampling = False
+
+    if cfg.clip_cispo_low < 0.0:
+        raise ValueError(f"clip_cispo_low must be >= 0.0, got {cfg.clip_cispo_low}")
+    if cfg.clip_cispo_low > 1.0:
+        raise ValueError(f"clip_cispo_low must be <= 1.0, got {cfg.clip_cispo_low}")
+    if cfg.clip_cispo_high <= 0.0:
+        raise ValueError(f"clip_cispo_high must be > 0.0, got {cfg.clip_cispo_high}")
+    if cfg.clip_cispo_high < 1.0:
+        raise ValueError(f"clip_cispo_high must be >= 1.0, got {cfg.clip_cispo_high}")
+    if cfg.clip_cispo_low > cfg.clip_cispo_high:
+        raise ValueError(
+            f"clip_cispo_low must be <= clip_cispo_high, got "
+            f"{cfg.clip_cispo_low} > {cfg.clip_cispo_high}"
+        )
+
+    if cfg.cispo_normalization not in {"token", "sequence", "hybrid"}:
+        raise ValueError(
+            f"cispo_normalization must be token | sequence | hybrid, "
+            f"got {cfg.cispo_normalization!r}"
+        )
 
 
 # --- Preset factories ---

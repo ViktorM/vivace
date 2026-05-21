@@ -2,7 +2,8 @@
 # Works unchanged across all three SKUs — use A100 80GB for cheap validation
 # ($1.49/hr × 2), then swap to H100 SXM for the real research runs.
 #
-# Same recipe as the canonical math winner (ep=4/mask/lr=2e-5/kl=0.01), but:
+# Same family as the 4090 math recipe (canonical clipped-IS CISPO, lr=2e-5,
+# kl=0.01), but:
 # - batch_size: 8 (was 1 on 4090) — 8 unique prompts per micro-batch.
 #   Direct scale-up of the 4090's gs=8/bs=1 baseline, just wider. Keeps
 #   the validated per-prompt advantage variance (gs=8) and trades more
@@ -90,6 +91,8 @@ rl:
   clip_ratio: 0.25
   clip_cispo_high: 5.0
   clip_cispo_low: 0.0
+  cispo_use_token_mask: false
+  cispo_normalization: hybrid
   kl_coef: 0.01
   adv_eps: 0.0001
   dg_eta: 1.0
