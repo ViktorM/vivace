@@ -108,3 +108,49 @@ reasoning gains are marginal at this model size on this env.
 - `max_new_tokens: 192 → 256` on the colocated DDP DAPO config. Baseline
   cap rate ~70%, drops to ~5% by step 100; final accuracy comparable
   (47–50% range, within noise). 256 is the new default for this config.
+
+## CISPO algorithmic improvements (2026-05)
+
+The step-200 collapse pattern documented in earlier runs is now traceable
+to two interacting issues, both fixed in the May 2026 commit.
+
+**1. Canonical CISPO is now the default (eq. 5 only).** The previous
+implementation unconditionally applied the MiniMax-M1 eq. 7 token-dropping
+mask — zeroing the gradient for tokens where `ratio > clip_cispo_high`
+AND `advantage > 0`. That created an asymmetric trust region: high-ratio
+positive-advantage tokens stopped contributing while negative-advantage
+tokens kept full gradient. The M1 paper presents eq. 7 as optional;
+vivace was running CISPO+mask and attributing instability to CISPO. The
+mask is now opt-in via `rl.cispo_use_token_mask: true`; default is the
+M1-canonical eq. 5 clipped-IS recipe.
+
+**2. `rl.cispo_normalization`** (token | sequence | hybrid, default
+`hybrid`). Token-level normalization (the previous fixed behavior)
+disproportionately weights long sequences with negative advantage —
+exactly the "pattern collapse" failure mode the M1 report calls out.
+Hybrid averages token- and sequence-mean losses for length-robustness.
+
+**3. fp32 reductions** in `compute_kl` and `compute_loss`. bf16 has only
+~3 decimal digits of mantissa precision; summing thousands of log-prob
+differences in bf16 accumulates real error. All reductions now cast to
+fp32 before the sum/divide.
+
+**4. `rl.kl_coef` default bumped 0.01 → 0.02.** Empirically validated as
+the lowest stable anchor across the May 2026 sweep. Pre-existing configs
+that set `kl_coef: 0.01` explicitly keep that value.
+
+**5. `clip_frac` metric** now reports tokens whose IS weight was clipped,
+not tokens dropped by the (now opt-in) mask. Comparable to PPO `clip_frac`.
+
+**2×2 ablation on ep=4 (1.5B, gs=16 bs=2, max=1024, lr=3e-5, kl=0.02):**
+
+| mask | norm  | gsm8k | math500 | KL₁₉₉ | entropy₁₉₉ |
+|------|-------|-------|---------|-------|-----------|
+| true  | token   | 74.75 | 39.00 | 0.084 | 0.33 |
+| true  | hybrid  | 74.22 | 37.80 | 0.053 | 0.27 |
+| false | hybrid  | **74.60** | **38.40** | **0.065** | **0.24** |
+| false | token   | 73.09 | 35.40 | **0.285** | **1.94** ✗ collapsed |
+
+Either stabilizer (mask OR hybrid norm) prevents the collapse seen with
+neither. Canonical+hybrid is the principled default — algorithmically
+matches the M1 paper claim AND has the lowest entropy at finish.

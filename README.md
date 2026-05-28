@@ -93,6 +93,35 @@ python -m vivace.scripts.train \
 [docs/running_experiments.md](docs/running_experiments.md) for the full launch
 pattern, sync-method overrides, and comparison commands.
 
+## Recommended recipe — CISPO (MiniMax-M1)
+
+vivace's validated production recipe is **CISPO + canonical IS clip + hybrid
+normalization**, modeled after MiniMax-M1
+([arxiv:2506.13585](https://arxiv.org/abs/2506.13585)).
+
+| key | value | rationale |
+|---|---|---|
+| `loss_type` | `cispo` | clipped IS weight × `policy_logp`, all token gradients preserved (M1 eq. 5) |
+| `cispo_use_token_mask` | `false` | the optional M1 eq. 7 PPO-style mask. Off by default; **either** the mask **or** hybrid normalization stabilizes ep≥2; both together adds no extra benefit |
+| `cispo_normalization` | `hybrid` | average of token-mean and sequence-mean reductions — defuses long-negative-sample length imbalance (M1 pattern-collapse section) |
+| `kl_coef` | `0.005` | math500 sweet spot; `kl=0` also viable per the M1 paper |
+| `adam_beta2` / `adam_eps` | `0.95` / `1e-15` | the M1 Adam tuning for fast-moving RL gradient statistics |
+| `optim_epochs` | `4` | per-rollout-batch reuse; `ep=2` works too, `ep≥8` collapses at fixed LR |
+
+Scaling result with this recipe on Qwen2.5 / math env (200 steps, 4×H200 colo,
+single seed):
+
+| model | gsm8k | math500 |
+|---|---|---|
+| 1.5B | 75.5 | 41.2 |
+| 3B   | 83.4 | 45.2 |
+| 7B   | 91.4 | 50.8 (500-step) |
+
+See [`docs/IMPLEMENTATION_NOTES.md`](docs/IMPLEMENTATION_NOTES.md) for the
+algorithmic story (the canonical-vs-mask 2×2 ablation, the fp32-reduction fix,
+the kl-coefficient sweep) and [`docs/ablation_studies.md`](docs/ablation_studies.md)
+for the full result table.
+
 ## Layout
 
 ```
