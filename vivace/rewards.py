@@ -164,22 +164,27 @@ def gsm8k_reward_batch(
     cfg: RewardConfig = DEFAULT_REWARD_CONFIG,
     response_token_counts: list[int] | None = None,
     max_new_tokens: int | None = None,
-) -> list[float]:
-    """Sum of all five reward components. Top-level GSM8K reward.
+    return_components: bool = False,
+) -> list[float] | tuple[list[float], dict[str, list[float]]]:
+    """Sum of all reward components. Top-level GSM8K reward.
 
     If `cfg.overlong_penalty > 0` AND token counts + max_new_tokens are provided,
-    the DAPO §3.4 soft length penalty is added as a 6th component.
+    the DAPO §3.4 soft length penalty is added as an extra component.
+
+    With `return_components=True`, also returns a {name: per_response_list} dict
+    for wandb logging.
     """
-    components = [
-        correctness_reward(responses, answers, cfg),
-        int_format_reward(responses, cfg),
-        strict_format_reward(responses, cfg),
-        soft_format_reward(responses, cfg),
-        xmlcount_reward(responses, cfg),
-    ]
+    components: dict[str, list[float]] = {
+        "correct":       correctness_reward(responses, answers, cfg),
+        "int":           int_format_reward(responses, cfg),
+        "format_strict": strict_format_reward(responses, cfg),
+        "format_soft":   soft_format_reward(responses, cfg),
+        "xmlcount":      xmlcount_reward(responses, cfg),
+    }
     if cfg.overlong_penalty > 0.0 and response_token_counts is not None and max_new_tokens is not None:
-        components.append(overlong_penalty_reward(response_token_counts, max_new_tokens, cfg))
-    return [sum(c[i] for c in components) for i in range(len(responses))]
+        components["overlong"] = overlong_penalty_reward(response_token_counts, max_new_tokens, cfg)
+    totals = [sum(c[i] for c in components.values()) for i in range(len(responses))]
+    return (totals, components) if return_components else totals
 
 
 def gsm8k_reward_single(
@@ -259,21 +264,26 @@ def math_reward_batch(
     cfg: RewardConfig = DEFAULT_REWARD_CONFIG,
     response_token_counts: list[int] | None = None,
     max_new_tokens: int | None = None,
-) -> list[float]:
+    return_components: bool = False,
+) -> list[float] | tuple[list[float], dict[str, list[float]]]:
     """Sum of correctness + format components. Skips int_format (GSM8K-specific).
 
     If `cfg.overlong_penalty > 0` AND token counts + max_new_tokens are provided,
-    the DAPO §3.4 soft length penalty is added as a 5th component.
+    the DAPO §3.4 soft length penalty is added as an extra component.
+
+    With `return_components=True`, also returns a {name: per_response_list} dict
+    for wandb logging.
     """
-    components = [
-        math_correctness_reward(responses, answers, cfg),
-        strict_format_reward(responses, cfg),
-        soft_format_reward(responses, cfg),
-        xmlcount_reward(responses, cfg),
-    ]
+    components: dict[str, list[float]] = {
+        "correct":       math_correctness_reward(responses, answers, cfg),
+        "format_strict": strict_format_reward(responses, cfg),
+        "format_soft":   soft_format_reward(responses, cfg),
+        "xmlcount":      xmlcount_reward(responses, cfg),
+    }
     if cfg.overlong_penalty > 0.0 and response_token_counts is not None and max_new_tokens is not None:
-        components.append(overlong_penalty_reward(response_token_counts, max_new_tokens, cfg))
-    return [sum(c[i] for c in components) for i in range(len(responses))]
+        components["overlong"] = overlong_penalty_reward(response_token_counts, max_new_tokens, cfg)
+    totals = [sum(c[i] for c in components.values()) for i in range(len(responses))]
+    return (totals, components) if return_components else totals
 
 
 def math_reward_single(

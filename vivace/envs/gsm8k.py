@@ -106,3 +106,11 @@ class GSM8KEnv(Env):
                 response_token_counts=tokens, max_new_tokens=max_new_tokens,
             )[0]
         return _scored
+
+    def reward_breakdown(self, responses, examples, response_token_counts=None, max_new_tokens=None):
+        return gsm8k_reward_batch(
+            responses, [ex.answer for ex in examples], self._reward_cfg,
+            response_token_counts=response_token_counts,
+            max_new_tokens=max_new_tokens,
+            return_components=True,
+        )

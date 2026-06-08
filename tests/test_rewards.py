@@ -3,6 +3,7 @@
 from vivace.rewards import (
     DEFAULT_REWARD_CONFIG,
     RewardConfig,
+    gsm8k_reward_batch,
     math_reward_batch,
     math_reward_single,
     overlong_penalty_reward,
@@ -76,3 +77,40 @@ def test_math_reward_single_threads_through_kwargs():
     # With default cfg, kwargs are inert (overlong_penalty=0).
     assert math_reward_single(r"\boxed{42}", _Ex()) == \
         math_reward_single(r"\boxed{42}", _Ex(), response_token_count=1024, max_new_tokens=1024)
+
+
+def test_gsm8k_reward_batch_components_sum_to_total():
+    """return_components=True must give a breakdown whose sum equals the total."""
+    cfg = RewardConfig(overlong_penalty=1.0, overlong_buffer_tokens=64)
+    responses = [
+        "<think>\nx\n</think>\n<answer>\n42\n</answer>\n",   # correct + format + int
+        "guess 99",                                          # wrong, no format
+    ]
+    totals, comps = gsm8k_reward_batch(
+        responses, ["42", "42"], cfg,
+        response_token_counts=[20, 200], max_new_tokens=192,
+        return_components=True,
+    )
+    assert set(comps) == {"correct", "int", "format_strict", "format_soft", "xmlcount", "overlong"}
+    for i in range(2):
+        assert abs(sum(comps[k][i] for k in comps) - totals[i]) < 1e-9
+
+
+def test_math_reward_batch_components_sum_to_total():
+    """Math variant has no `int` component; everything else mirrors gsm8k."""
+    cfg = RewardConfig(overlong_penalty=1.0, overlong_buffer_tokens=64)
+    responses = ["<think>\nx\n</think>\n<answer>\n42\n</answer>\n"]
+    totals, comps = math_reward_batch(
+        responses, ["42"], cfg,
+        response_token_counts=[20], max_new_tokens=192,
+        return_components=True,
+    )
+    assert "int" not in comps
+    assert set(comps) == {"correct", "format_strict", "format_soft", "xmlcount", "overlong"}
+    assert abs(sum(c[0] for c in comps.values()) - totals[0]) < 1e-9
+
+
+def test_gsm8k_reward_batch_backward_compatible():
+    """Default call (return_components=False) returns a flat list[float]."""
+    out = gsm8k_reward_batch(["x"], ["1"])
+    assert isinstance(out, list) and isinstance(out[0], float)

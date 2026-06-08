@@ -67,3 +67,22 @@ class Env(ABC):
         train = self.load_split("train")
         idx = rng.choice(len(train), size=n, replace=False)
         return [train[int(i)] for i in idx]
+
+    def reward_breakdown(
+        self,
+        responses: list[str],
+        examples: list[Example],
+        response_token_counts: list[int] | None = None,
+        max_new_tokens: int | None = None,
+    ) -> tuple[list[float], dict[str, list[float]]]:
+        """Compute total rewards + per-component breakdown for a batch.
+
+        Default impl: call `reward_fn` per response, return empty components dict.
+        Subclasses that wrap a `*_reward_batch` (gsm8k, math, ...) override this
+        to return the {component_name: per_response_list} dict for wandb logging.
+        """
+        tcs = response_token_counts if response_token_counts is not None else [None] * len(responses)
+        fn = self.reward_fn
+        totals = [fn(r, ex, response_token_count=tc, max_new_tokens=max_new_tokens)
+                  for r, ex, tc in zip(responses, examples, tcs)]
+        return totals, {}

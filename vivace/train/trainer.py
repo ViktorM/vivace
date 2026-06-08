@@ -878,6 +878,8 @@ class Trainer:
         to forward through base weights without a separate ref model.
         """
         micro_batches, alive_rates_step, spread_step = [], [], []
+        # Per-component reward accumulator across kept responses for wandb logging.
+        component_accum: dict[str, list[float]] = {}
         rl = self.cfg.rl
         B, G = rl.batch_size, rl.group_size
 
@@ -985,19 +987,17 @@ class Trainer:
                     )
                 torch.cuda.empty_cache()
 
-            # Compute rewards for ALL responses (needed for adaptive sampling spread)
-            # reward_fn takes (response, Example) plus optional response_token_count /
-            # max_new_tokens kwargs for DAPO §3.4 soft length penalty (skipped when
-            # reward_cfg.overlong_penalty == 0.0, which is the default).
+            # Compute rewards for ALL responses (needed for adaptive sampling spread).
+            # `reward_breakdown` also returns per-component values for wandb logging
+            # (envs that don't support it return an empty dict — backward compatible).
             with record_function("reward"):
                 tok_counts = response_lengths.tolist() if response_lengths is not None else [None] * len(responses)
-                rewards = torch.tensor(
-                    [self.env.reward_fn(resp, ex,
-                                        response_token_count=tc,
-                                        max_new_tokens=rl.max_new_tokens)
-                     for resp, ex, tc in zip(responses, examples, tok_counts)],
-                    device=self.device, dtype=torch.float32,
+                rewards_list, reward_components = self.env.reward_breakdown(
+                    responses, examples,
+                    response_token_counts=tok_counts,
+                    max_new_tokens=rl.max_new_tokens,
                 )
+                rewards = torch.tensor(rewards_list, device=self.device, dtype=torch.float32)
 
             if rl.adaptive_sampling:
                 rg = rewards.view(n_prompts_per_mb, G)
@@ -1014,6 +1014,11 @@ class Trainer:
                 responses = [responses[k] for k in keep]
                 if response_lengths is not None:
                     response_lengths = response_lengths[keep]
+                reward_components = {name: [vals[k] for k in keep]
+                                     for name, vals in reward_components.items()}
+
+            for name, vals in reward_components.items():
+                component_accum.setdefault(name, []).extend(vals)
 
             with record_function("advantages"):
                 adv = compute_advantages(rewards.view(B, G), self.rl_cfg)
@@ -1069,6 +1074,10 @@ class Trainer:
         # of length-gaming or policy regression (lagging eval-time cap_rate_pct).
         all_lens = torch.cat([mb["response_lengths"] for mb in micro_batches])
         self._last_cap_rate = (all_lens >= self.cfg.rl.max_new_tokens).float().mean().item()
+        # Per-component reward means (kept responses, this step). Empty for envs
+        # that don't override Env.reward_breakdown — wandb just won't log anything.
+        self._last_reward_components = {name: float(np.mean(vals))
+                                        for name, vals in component_accum.items() if vals}
 
         return micro_batches
 
@@ -1489,6 +1498,10 @@ class Trainer:
                         "reward_dist/min": metrics["reward_min"],
                         "reward_dist/advantage_std": metrics["advantage_std"],
                     }, step)
+                    # Per-component reward means (empty for envs without breakdown)
+                    if self._last_reward_components:
+                        log_metrics({f"reward_components/{name}": v
+                                     for name, v in self._last_reward_components.items()}, step)
                     # Adaptive sampling (logged even when disabled — 0 values)
                     if self.cfg.rl.adaptive_sampling:
                         log_metrics({
