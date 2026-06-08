@@ -32,6 +32,10 @@ class RewardConfig:
     strict_format_bonus: float = 0.5
     soft_format_bonus: float = 0.25
     xmlcount_max: float = 0.25
+    # DAPO §3.4 overlong soft penalty. Disabled by default (overlong_penalty=0.0);
+    # opt-in per recipe. buffer = the linear ramp zone before max_new_tokens.
+    overlong_penalty: float = 0.0
+    overlong_buffer_tokens: int = 256
 
 
 DEFAULT_REWARD_CONFIG = RewardConfig()
@@ -132,12 +136,40 @@ def xmlcount_reward(
     return [_score(r) for r in responses]
 
 
+def overlong_penalty_reward(
+    response_token_counts: list[int],
+    max_new_tokens: int,
+    cfg: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> list[float]:
+    """DAPO §3.4 soft length penalty. Linear ramp from 0 in the safe zone to
+    -cfg.overlong_penalty at max_new_tokens. Returns one penalty per response."""
+    if cfg.overlong_penalty <= 0.0:
+        return [0.0] * len(response_token_counts)
+    safe_zone = max_new_tokens - cfg.overlong_buffer_tokens
+    out = []
+    for n in response_token_counts:
+        if n <= safe_zone:
+            r = 0.0
+        elif n >= max_new_tokens:
+            r = -1.0
+        else:
+            r = -(n - safe_zone) / cfg.overlong_buffer_tokens
+        out.append(cfg.overlong_penalty * r)
+    return out
+
+
 def gsm8k_reward_batch(
     responses: list[str],
     answers: list[str],
     cfg: RewardConfig = DEFAULT_REWARD_CONFIG,
+    response_token_counts: list[int] | None = None,
+    max_new_tokens: int | None = None,
 ) -> list[float]:
-    """Sum of all five reward components. Top-level GSM8K reward."""
+    """Sum of all five reward components. Top-level GSM8K reward.
+
+    If `cfg.overlong_penalty > 0` AND token counts + max_new_tokens are provided,
+    the DAPO §3.4 soft length penalty is added as a 6th component.
+    """
     components = [
         correctness_reward(responses, answers, cfg),
         int_format_reward(responses, cfg),
@@ -145,10 +177,17 @@ def gsm8k_reward_batch(
         soft_format_reward(responses, cfg),
         xmlcount_reward(responses, cfg),
     ]
+    if cfg.overlong_penalty > 0.0 and response_token_counts is not None and max_new_tokens is not None:
+        components.append(overlong_penalty_reward(response_token_counts, max_new_tokens, cfg))
     return [sum(c[i] for c in components) for i in range(len(responses))]
 
 
-def gsm8k_reward_single(response: str, example) -> float:
+def gsm8k_reward_single(
+    response: str,
+    example,
+    response_token_count: int | None = None,
+    max_new_tokens: int | None = None,
+) -> float:
     """Single-example variant. Useful from `Env.reward_fn`.
 
     Takes the full Example so the reward function has access to the problem
@@ -159,7 +198,11 @@ def gsm8k_reward_single(response: str, example) -> float:
       - penalty for answers that ignore stated constraints
       - difficulty-weighted scoring via example.difficulty
     """
-    return gsm8k_reward_batch([response], [example.answer])[0]
+    tokens = [response_token_count] if response_token_count is not None else None
+    return gsm8k_reward_batch(
+        [response], [example.answer], DEFAULT_REWARD_CONFIG,
+        response_token_counts=tokens, max_new_tokens=max_new_tokens,
+    )[0]
 
 
 # =============================================================================
@@ -214,17 +257,34 @@ def math_reward_batch(
     responses: list[str],
     answers: list[str],
     cfg: RewardConfig = DEFAULT_REWARD_CONFIG,
+    response_token_counts: list[int] | None = None,
+    max_new_tokens: int | None = None,
 ) -> list[float]:
-    """Sum of correctness + format components. Skips int_format (GSM8K-specific)."""
+    """Sum of correctness + format components. Skips int_format (GSM8K-specific).
+
+    If `cfg.overlong_penalty > 0` AND token counts + max_new_tokens are provided,
+    the DAPO §3.4 soft length penalty is added as a 5th component.
+    """
     components = [
         math_correctness_reward(responses, answers, cfg),
         strict_format_reward(responses, cfg),
         soft_format_reward(responses, cfg),
         xmlcount_reward(responses, cfg),
     ]
+    if cfg.overlong_penalty > 0.0 and response_token_counts is not None and max_new_tokens is not None:
+        components.append(overlong_penalty_reward(response_token_counts, max_new_tokens, cfg))
     return [sum(c[i] for c in components) for i in range(len(responses))]
 
 
-def math_reward_single(response: str, example) -> float:
+def math_reward_single(
+    response: str,
+    example,
+    response_token_count: int | None = None,
+    max_new_tokens: int | None = None,
+) -> float:
     """Single-example variant for `Env.reward_fn`. Hendrycks MATH / MATH-500 / AIME."""
-    return math_reward_batch([response], [example.answer])[0]
+    tokens = [response_token_count] if response_token_count is not None else None
+    return math_reward_batch(
+        [response], [example.answer], DEFAULT_REWARD_CONFIG,
+        response_token_counts=tokens, max_new_tokens=max_new_tokens,
+    )[0]

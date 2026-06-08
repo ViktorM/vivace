@@ -73,10 +73,9 @@ def _level_to_float(level: str | None) -> float | None:
 class MATHEnv(Env):
     """Competition-math training corpus. Defaults to Hendrycks MATH train.
 
-    `reward_overrides` lets a config override individual RewardConfig fields
+    `reward_overrides` lets a yaml override individual RewardConfig fields
     (e.g. `{"correct_bonus": 5.0, "strict_format_bonus": 0.05}`) without
-    needing a new env class. Useful for experiments that need to rebalance
-    correctness vs format weighting — see the `math_strict` registry entry.
+    needing a new env class. Configure via `env_kwargs` in the trainer yaml.
     """
 
     name = "math"
@@ -150,6 +149,14 @@ class MATHEnv(Env):
         cfg = self._reward_cfg
         if cfg is DEFAULT_REWARD_CONFIG:
             return math_reward_single   # fast path — no closure when no override
-        def _scored(response: str, example) -> float:
-            return math_reward_batch([response], [example.answer], cfg)[0]
+        def _scored(
+            response: str, example,
+            response_token_count: int | None = None,
+            max_new_tokens: int | None = None,
+        ) -> float:
+            tokens = [response_token_count] if response_token_count is not None else None
+            return math_reward_batch(
+                [response], [example.answer], cfg,
+                response_token_counts=tokens, max_new_tokens=max_new_tokens,
+            )[0]
         return _scored

@@ -21,6 +21,7 @@ dependencies = [
     "tqdm>=4.67",
     "matplotlib>=3.10",
     "math-verify>=0.5",        # LaTeX-aware math answer verifier; backs MATHEnv / MATH500Env / AIME*Env rewards
+    "fastokens>=0.2",          # Rust BPE tokenizer; enabled via VLLM_USE_FASTOKENS=1
 ]
 
 [project.optional-dependencies]

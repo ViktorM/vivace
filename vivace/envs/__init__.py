@@ -21,41 +21,15 @@ ENV_REGISTRY: dict[str, type[Env]] = {
     "aime25":  AIME2025Env,
 }
 
-# Per-env preset kwargs. Lets a yaml reference a variant by name without
-# wiring a full kwargs dict through the trainer config. Keep this small —
-# new variants belong here only when they're worth a stable name.
-ENV_PRESETS: dict[str, dict] = {
-    # 1.5B-Instruct hits format=99% in <50 steps, then accuracy plateaus / regresses
-    # because the format reward dominates the gradient. This preset rebalances:
-    # correctness 5x default, format weights crushed, so the gradient targets
-    # answer-correctness specifically.
-    "math_strict": dict(
-        corpus="hendrycks",
-        reward_overrides={
-            "correct_bonus": 5.0,
-            "strict_format_bonus": 0.05,
-            "soft_format_bonus": 0.05,
-            "xmlcount_max": 0.05,
-        },
-    ),
-}
-
 
 def make_env(name: str, **kwargs) -> Env:
     """Instantiate an env by registry name.
 
-    Resolves `name` first against `ENV_PRESETS` (a config-only alias mapping to
-    a class + preset kwargs), then falls back to `ENV_REGISTRY` (raw class).
-    Caller-supplied **kwargs override the preset.
+    Per-env kwargs (corpus, reward_overrides, n_eval, ...) come from the yaml
+    config via `env_kwargs` / `eval_env_kwargs`. See `TrainerConfig`.
     """
-    if name in ENV_PRESETS:
-        preset = ENV_PRESETS[name]
-        # All current presets target MATHEnv; if that changes, store cls per preset.
-        return MATHEnv(**{**preset, **kwargs})
     if name not in ENV_REGISTRY:
-        raise ValueError(
-            f"unknown env {name!r}; known: {sorted(set(ENV_REGISTRY) | set(ENV_PRESETS))}"
-        )
+        raise ValueError(f"unknown env {name!r}; known: {sorted(ENV_REGISTRY)}")
     return ENV_REGISTRY[name](**kwargs)
 
 

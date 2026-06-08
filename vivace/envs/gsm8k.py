@@ -14,7 +14,12 @@ from __future__ import annotations
 from typing import Callable
 
 from vivace.envs.base import Env, Example
-from vivace.rewards import gsm8k_reward_single
+from vivace.rewards import (
+    DEFAULT_REWARD_CONFIG,
+    RewardConfig,
+    gsm8k_reward_batch,
+    gsm8k_reward_single,
+)
 
 SYSTEM_PROMPT = """\
 Respond in the following format:
@@ -55,9 +60,14 @@ class GSM8KEnv(Env):
 
     name = "gsm8k"
 
-    def __init__(self, n_eval: int | None = None):
+    def __init__(self, n_eval: int | None = None, reward_overrides: dict | None = None):
         self.n_eval = n_eval
         self._splits: dict[str, list[Example]] = {}
+        if reward_overrides:
+            base = DEFAULT_REWARD_CONFIG.__dict__
+            self._reward_cfg: RewardConfig = RewardConfig(**{**base, **reward_overrides})
+        else:
+            self._reward_cfg = DEFAULT_REWARD_CONFIG
 
     def _load(self) -> None:
         if self._splits:
@@ -82,4 +92,17 @@ class GSM8KEnv(Env):
 
     @property
     def reward_fn(self) -> Callable:
-        return gsm8k_reward_single
+        cfg = self._reward_cfg
+        if cfg is DEFAULT_REWARD_CONFIG:
+            return gsm8k_reward_single   # fast path — no closure when no override
+        def _scored(
+            response: str, example,
+            response_token_count: int | None = None,
+            max_new_tokens: int | None = None,
+        ) -> float:
+            tokens = [response_token_count] if response_token_count is not None else None
+            return gsm8k_reward_batch(
+                [response], [example.answer], cfg,
+                response_token_counts=tokens, max_new_tokens=max_new_tokens,
+            )[0]
+        return _scored

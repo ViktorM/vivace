@@ -76,11 +76,20 @@ class TrainerConfig:
     # train splits concatenated, uniform sampling). All training envs must
     # share format_prompt + reward_fn (true within the math family).
     env_name: str | list[str] = "gsm8k"
+    # Constructor kwargs forwarded to the train env(s). Lets yaml specify
+    # reward_overrides etc. directly without baking a named preset in code:
+    #   env_kwargs: {reward_overrides: {overlong_penalty: 1.0}}
+    # When env_name is a list, env_kwargs must be a list[dict] of matching length.
+    env_kwargs: dict | list[dict] | None = None
     # Eval env(s). One or many; each runs every eval cycle, logged under
     # `eval/{env_name}/...` in wandb. None → defaults to [env_name] when
     # env_name is a single string (backward-compat); must be set explicitly
     # when env_name is a list.
     eval_envs: list[str] | None = None
+    # Per-eval-env constructor kwargs (parallel list to eval_envs). None →
+    # no overrides. Most evals use vanilla envs, so this stays None for most
+    # configs; set only when an eval env needs custom reward params.
+    eval_env_kwargs: list[dict] | None = None
     algo_name: str = "grpo"
 
     # ----- execution mode -----
@@ -716,7 +725,20 @@ class Trainer:
         train_names = [cfg.env_name] if isinstance(cfg.env_name, str) else list(cfg.env_name)
         if not train_names:
             raise ValueError("env_name must be a non-empty string or list[str]")
-        train_envs = [make_env(n) for n in train_names]
+
+        # Per-train-env kwargs. dict → broadcast to all; list[dict] → must match length.
+        if cfg.env_kwargs is None:
+            train_kwargs: list[dict] = [{} for _ in train_names]
+        elif isinstance(cfg.env_kwargs, dict):
+            train_kwargs = [cfg.env_kwargs for _ in train_names]
+        else:
+            if len(cfg.env_kwargs) != len(train_names):
+                raise ValueError(
+                    f"env_kwargs list length ({len(cfg.env_kwargs)}) must match "
+                    f"env_name list length ({len(train_names)})"
+                )
+            train_kwargs = list(cfg.env_kwargs)
+        train_envs = [make_env(n, **kw) for n, kw in zip(train_names, train_kwargs)]
 
         if cfg.eval_envs is not None:
             eval_names = list(cfg.eval_envs)
@@ -727,7 +749,16 @@ class Trainer:
                 "eval_envs must be set explicitly when env_name is a list "
                 "(no canonical default for multi-train mixes)"
             )
-        eval_envs = [(n, make_env(n)) for n in eval_names]
+        if cfg.eval_env_kwargs is None:
+            eval_kwargs: list[dict] = [{} for _ in eval_names]
+        else:
+            if len(cfg.eval_env_kwargs) != len(eval_names):
+                raise ValueError(
+                    f"eval_env_kwargs list length ({len(cfg.eval_env_kwargs)}) must "
+                    f"match eval_envs length ({len(eval_names)})"
+                )
+            eval_kwargs = list(cfg.eval_env_kwargs)
+        eval_envs = [(n, make_env(n, **kw)) for n, kw in zip(eval_names, eval_kwargs)]
         return train_envs, eval_envs
 
     def _eval_data_for(self, env_name: str, env: Env) -> list:
@@ -955,11 +986,16 @@ class Trainer:
                 torch.cuda.empty_cache()
 
             # Compute rewards for ALL responses (needed for adaptive sampling spread)
-            # reward_fn takes (response, Example) — full example available for
-            # problem-aware rewards (e.g. bonus for using numbers from the problem)
+            # reward_fn takes (response, Example) plus optional response_token_count /
+            # max_new_tokens kwargs for DAPO §3.4 soft length penalty (skipped when
+            # reward_cfg.overlong_penalty == 0.0, which is the default).
             with record_function("reward"):
+                tok_counts = response_lengths.tolist() if response_lengths is not None else [None] * len(responses)
                 rewards = torch.tensor(
-                    [self.env.reward_fn(resp, ex) for resp, ex in zip(responses, examples)],
+                    [self.env.reward_fn(resp, ex,
+                                        response_token_count=tc,
+                                        max_new_tokens=rl.max_new_tokens)
+                     for resp, ex, tc in zip(responses, examples, tok_counts)],
                     device=self.device, dtype=torch.float32,
                 )
 
