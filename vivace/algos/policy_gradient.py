@@ -614,6 +614,8 @@ def rl_step(
     # Stats accumulators — only populated on the last epoch
     tot_kl = tot_pg = tot_kl_loss = tot_ent = 0.0
     tot_clip = tot_tok = 0.0
+    # GSPO seq_ratio samples for p50/p99 logging (diagnoses inert trust region).
+    seq_ratio_chunks: list[torch.Tensor] = []
 
     for epoch in range(n_epochs):
         optimizer.zero_grad(set_to_none=True)
@@ -646,13 +648,20 @@ def rl_step(
                     if entropy is not None:
                         tot_ent += (entropy * mb["mask"]).sum() / mb["mask"].sum().clamp(min=1.0)
 
-                    # Clip fraction — differs between sequence-level and token-level
+                    # Clip fraction — differs between sequence-level (GSPO) and
+                    # token-level (PPO-style). For GSPO the denominator counts
+                    # sequences, so clip_frac is NOT cross-comparable to PPO's
+                    # token-level rate; treat it as "fraction of sequences
+                    # whose ratio left the trust region this step."
                     if cfg.loss_type == "gspo":
                         seq_lp = (policy_logp * mb["mask"]).sum(dim=1) / mb["token_count"]
                         old_seq_lp = (mb["old_logp"] * mb["mask"]).sum(dim=1) / mb["token_count"]
                         ratio = torch.exp((seq_lp - old_seq_lp).clamp(-5, 5))
-                        tot_clip += ((ratio - 1.0).abs() > cfg.clip_high).float().sum()
+                        # Asymmetric: count clips in both directions, not |ratio-1| > clip_high.
+                        clipped = (ratio < 1 - cfg.clip_low) | (ratio > 1 + cfg.clip_high)
+                        tot_clip += clipped.float().sum()
                         tot_tok += float(len(ratio))
+                        seq_ratio_chunks.append(ratio.detach())
                     elif cfg.loss_type == "cispo":
                         # CISPO clip_frac reports clipped IS weights, not
                         # token drops. Token dropping is optional and off by
@@ -732,6 +741,12 @@ def rl_step(
             "_clip_count": tot_clip.item() if torch.is_tensor(tot_clip) else float(tot_clip),
             "_clip_tokens": tot_tok.item() if torch.is_tensor(tot_tok) else float(tot_tok),
         }
+        # GSPO sequence-ratio percentiles — diagnoses inert clip (paper's eps≈3e-4
+        # vs vivace default 0.2: if p99 stays within 1±0.2, the clip never bites).
+        if seq_ratio_chunks:
+            seq_ratios = torch.cat(seq_ratio_chunks)
+            metrics["seq_ratio_p50"] = seq_ratios.median().item()
+            metrics["seq_ratio_p99"] = seq_ratios.quantile(0.99).item()
 
     if cfg.use_adaptive_lr:
         pass  # skipped for now — add later

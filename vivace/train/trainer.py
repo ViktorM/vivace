@@ -1483,6 +1483,12 @@ class Trainer:
                         "entropy": metrics["entropy"],
                         "format_rate": metrics["format_rate"],
                     }, step)
+                    # GSPO sequence-ratio percentiles (only present for loss_type=gspo)
+                    if "seq_ratio_p50" in metrics:
+                        log_metrics({
+                            "gspo/seq_ratio_p50": metrics["seq_ratio_p50"],
+                            "gspo/seq_ratio_p99": metrics["seq_ratio_p99"],
+                        }, step)
                     # Length distribution (grouped in wandb)
                     log_metrics({
                         "length/mean": metrics["length_mean"],

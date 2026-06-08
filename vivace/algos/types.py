@@ -106,7 +106,10 @@ class RLConfig:
     dg_eta: float = 1.0
 
     # --- Adaptive sampling (DAPO-style) ---
-    adaptive_sampling: bool = False
+    # Default ON since the 0.5B/gsm8k pilots showed it's strictly helpful for
+    # every RLOO-family algorithm (and required for GRPO to learn at all).
+    # See docs/pilot_findings.md for the cross-algo evidence.
+    adaptive_sampling: bool = True
     oversample_factor: float = 2.0
     reward_threshold: float = 1.8  # responses above this count as "correct"
     min_reward_spread: float = 0.5

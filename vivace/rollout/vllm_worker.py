@@ -183,6 +183,9 @@ class VLLMRolloutWorker:
         # In colocated mode these fire every step and drown out training logs.
         # `setdefault` lets the user override with VLLM_LOGGING_LEVEL=INFO when debugging.
         os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+        # Rust BPE tokenizer (~9x faster encode at gsm8k length, ~30x at MATH/AIME
+        # context). Opt out with VLLM_USE_FASTOKENS=0 if a model isn't supported.
+        os.environ.setdefault("VLLM_USE_FASTOKENS", "1")
 
         # logprobs_mode="processed_logprobs": return log_softmax(logits/T) AFTER
         # temperature + top_p/top_k. vLLM v1's default is "raw_logprobs" which
