@@ -60,16 +60,19 @@ Pin the group in the YAML for an experiment family, then vary `--seed` and
 
 ```bash
 GROUP="loss-comparison-qw25-0.5b-200steps-3seed"
-for ALGO in dapo gspo; do
+for ALGO in cispo gspo; do            # 2-GPU DDP-colo configs ([0,1] GPU lists)
   for SEED in 42 43 44; do
     torchrun --nproc_per_node=2 -m vivace.scripts.train \
-        --config "vivace/configs/${ALGO}_gsm8k_qw25_0.5b_lora_colo_ddp.yaml" \
+        --config "vivace/configs/gsm8k/${ALGO}_0.5b_colo.yaml" \
         --num-steps 200 --seed $SEED \
         --run-dir "runs/${ALGO}_seed${SEED}_$(date +%Y%m%d_%H%M%S)" \
         --wandb-group "$GROUP"
   done
 done
 ```
+
+(`gsm8k/dapo_0.5b_colo.yaml` is single-GPU-shaped for the README quickstart —
+launch it with plain `python`, or set its GPU lists to `[0, 1]` for torchrun.)
 
 All 6 runs land in the same group; in the wandb UI, click the group → the
 chart panel groups by `name` so DAPO seeds and GSPO seeds each render as

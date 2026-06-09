@@ -1,8 +1,8 @@
 """CLI entry point for `vivace-train`.
 
 Usage:
-    # Basic
-    vivace-train --config vivace/configs/gsm8k/grpo_0.5b_full.yaml
+    # Basic (single GPU)
+    vivace-train --config vivace/configs/gsm8k/dapo_0.5b_colo.yaml
     vivace-train --config <path> --num-steps 5                   # smoke test
 
     # Common hyperparameter overrides (explicit flags)

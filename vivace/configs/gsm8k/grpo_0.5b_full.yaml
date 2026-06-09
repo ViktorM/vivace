@@ -1,9 +1,12 @@
+# Full FT on 2 GPUs: trainer on GPU 0, vLLM on GPU 1, NCCL weight broadcast.
+# (NCCL can't connect two ranks on one device, so full FT pairs with disaggregated.)
 model_name: Qwen/Qwen2.5-0.5B
 env_name: gsm8k
 algo_name: grpo
-mode: colocated
-trainer_gpus: [0, 1]
-rollout_gpus: [0, 1]
+mode: disaggregated
+trainer_gpus: [0]
+rollout_gpus: [1]
+gpu_memory_utilization: 0.8
 use_lora: false
 compile_model: false      # torch.compile — flip to true to test ~10-30% speedup; can interact badly with peft/DDP/variable-T
 num_steps: 200

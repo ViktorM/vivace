@@ -39,8 +39,8 @@ uv pip install -e ".[dev]"
 uv pip install -e ".[qwen35]"
 ```
 
-vLLM 0.20 hard-pins `torch==2.11.0`. If the default resolve breaks, force the
-matching torch CUDA build, e.g.:
+vLLM ≥0.22 (the version floor in pyproject) pins a matching `torch==2.11.x`.
+If the default resolve breaks, force the matching torch CUDA build, e.g.:
 `uv pip install -e ".[dev]" --extra-index-url https://download.pytorch.org/whl/cu130`.
 
 ### Upgrading an existing venv
@@ -51,13 +51,14 @@ uv pip install -e ".[dev]" --upgrade
 
 Or upgrade load-bearing packages explicitly:
 ```bash
-uv pip install --upgrade "vllm>=0.20" "transformers>=4.58" "torch>=2.11" "peft>=0.19"
+uv pip install --upgrade "vllm>=0.22" "transformers>=4.58" "torch>=2.11" "peft>=0.19"
 ```
 
 ## Quickstart
 
-Two end-to-end recipes to verify your setup. Both train Qwen2.5-0.5B-Instruct on
-GSM8K with LoRA r=16, DAPO + RLOO loss.
+Two end-to-end recipes to verify your setup. Both train on GSM8K with LoRA
+r=16 and the DAPO loss + RLOO advantages: colocated runs Qwen2.5-0.5B-Instruct
+on one GPU, disaggregated runs Qwen2.5-1.5B across two.
 
 ### Colocated — single GPU (trainer + vLLM share one device)
 
@@ -67,8 +68,10 @@ python -m vivace.scripts.train \
     --num-steps 200 \
     --run-dir "runs/colo_$(date +%Y%m%d_%H%M%S)"
 ```
-~440s wall-clock on a 4090, baseline 0% → 43% accuracy in 200 steps.
-Uses `weight_sync_method: ipc` (CUDA IPC zero-copy on the same GPU).
+Baseline 0% → ~43% accuracy in 200 steps (measured on the 2×4090 DDP variant
+of this config; the single-GPU run sees half the batch per step).
+Uses `weight_sync_method: ipc` (CUDA IPC zero-copy on the same GPU); vLLM
+sleeps during each train phase, so rollouts get most of the GPU.
 
 ### Disaggregated — two GPUs (trainer on GPU 0, vLLM on GPU 1)
 
@@ -128,7 +131,7 @@ for the full result table.
 vivace/                    # installable package
 ├── algos/                 # Training methods (the math)
 │   ├── types.py           # RolloutBatch, RLConfig, SFTConfig, preset factories
-│   ├── policy_gradient.py # Composable PG zoo (GRPO, DAPO, GSPO, RLOO, CISPO, DG, ...)
+│   ├── policy_gradient.py # Composable PG zoo (GRPO, DAPO, GSPO, RLOO, CISPO, ...)
 │   └── sft.py             # Optional SFT warmup
 ├── envs/                  # Benchmark wrappers behind a common Env interface
 │   ├── base.py            # Env ABC + Example
@@ -153,7 +156,7 @@ vivace/                    # installable package
 │   ├── checkpointing.py   # save/load (LoRA-aware)
 │   └── distributed.py     # init, ranks, barriers, weight-sync subgroup
 ├── configs/               # YAML configs (one per experiment)
-└── scripts/               # CLI entry points (vivace-train, vivace-sft, vivace-eval)
+└── scripts/               # CLI entry points (vivace-train; sft/eval are stubs)
 tests/                     # Unit tests, weight-sync verification, vLLM↔HF probes, run comparison plotting
 docs/                      # running_experiments, weight_sync_approaches, training_theory, profiling
 ```
@@ -169,8 +172,9 @@ Fewer GPUs needed; uses CUDA IPC for zero-copy weight sync on the same device.
 GPU 0: [ trainer ] <-> [ vllm worker ]   (single-GPU)
 ```
 
-Weight sync: `ipc` (default for colocated). NCCL doesn't work for two ranks on
-the same GPU, so disk is the only fallback.
+Weight sync: set `ipc` in colocated configs (all shipped ones do). The code
+default `nccl` is rejected at init for shared-GPU layouts — NCCL can't connect
+two ranks on one device; `disk` works as a slower fallback.
 
 ### Disaggregated
 
@@ -187,12 +191,14 @@ Weight sync: `nccl` (default). `disk` works as a fallback in either topology.
 
 ### Picking a config
 
+All paths relative to `vivace/configs/`.
+
 | where you are | use |
 |---|---|
-| 1 GPU, debugging | `dapo_gsm8k_qw25_0.5b_lora_colo.yaml` (IPC, 0.5B) |
-| 1 GPU, more capacity | `dapo_gsm8k_qw35_0.8b_lora_colo.yaml` (IPC, 0.8B Qwen3.5) |
-| 2 GPUs, faster | `dapo_gsm8k_1.5b_lowkl.yaml` (NCCL, 1.5B) |
-| 2 GPUs, full FT | `grpo_gsm8k_0.5b_full_nccl.yaml` (NCCL, 0.5B no-LoRA) |
+| 1 GPU, debugging | `gsm8k/dapo_0.5b_colo.yaml` (colocated, IPC, 0.5B) |
+| 2 GPUs, faster | `gsm8k/dapo_2x4090.yaml` (disaggregated, NCCL, 1.5B) |
+| 2 GPUs, full FT | `gsm8k/grpo_0.5b_full.yaml` (disaggregated, NCCL, 0.5B no-LoRA) |
+| MATH instead of GSM8K | `math/cispo_2x4090.yaml` (disaggregated, NCCL, 1.5B) |
 
 ## Adding a new loss variant
 
@@ -259,7 +265,7 @@ the design rationale and failure-mode diagnostics.
 
 ## Roadmap
 
-- [x] Composable PG zoo: GRPO / DAPO / GSPO / RLOO / Dr.GRPO / CISPO (with MiniMax-M1 mask) / DG
+- [x] Composable PG zoo: GRPO / DAPO / GSPO / RLOO / Dr.GRPO / CISPO (with MiniMax-M1 mask)
 - [x] GSM8K env + reward functions
 - [x] Single-GPU training with HF sampler
 - [x] vLLM rollout backend with LoRA hot-swap (disk + NCCL + CUDA IPC paths)
