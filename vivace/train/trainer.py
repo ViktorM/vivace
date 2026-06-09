@@ -90,6 +90,12 @@ class TrainerConfig:
     # no overrides. Most evals use vanilla envs, so this stays None for most
     # configs; set only when an eval env needs custom reward params.
     eval_env_kwargs: list[dict] | None = None
+    # Per-eval-env generation budget (parallel list to eval_envs). None → every
+    # eval env uses rl.max_new_tokens. Set this when an eval env needs a longer
+    # budget than training: e.g. train gsm8k at max_new=256 but eval AIME at
+    # 4096, since AIME chain-of-thought is much longer and would otherwise be
+    # truncated to an artificial 0%.
+    eval_max_new_tokens: list[int] | None = None
     algo_name: str = "grpo"
 
     # ----- execution mode -----
@@ -392,7 +398,12 @@ class Trainer:
             self.rollout_devices = [torch.device("cpu")]
             self.device = self.trainer_devices[0]
 
-        self.seed = cfg.seed + rank
+        # Per-rank RNG offset by 1000*rank (not +rank) so distinct cfg.seed values
+        # never produce overlapping per-rank streams across runs. With +rank,
+        # consecutive seeds collide (run(41).rank1 == run(42).rank0); the 1000x
+        # spacing keeps seeds independent for up to 1000 ranks. Preserves
+        # per-rank diversity within a run (each rank still samples differently).
+        self.seed = cfg.seed + 1000 * rank
         _set_seed(self.seed)
 
         # --- Tokenizer ---
@@ -758,6 +769,11 @@ class Trainer:
                     f"match eval_envs length ({len(eval_names)})"
                 )
             eval_kwargs = list(cfg.eval_env_kwargs)
+        if cfg.eval_max_new_tokens is not None and len(cfg.eval_max_new_tokens) != len(eval_names):
+            raise ValueError(
+                f"eval_max_new_tokens list length ({len(cfg.eval_max_new_tokens)}) must "
+                f"match eval_envs length ({len(eval_names)})"
+            )
         eval_envs = [(n, make_env(n, **kw)) for n, kw in zip(eval_names, eval_kwargs)]
         return train_envs, eval_envs
 
@@ -767,13 +783,18 @@ class Trainer:
             self._eval_data_cache[env_name] = env.load_split("eval")
         return self._eval_data_cache[env_name]
 
-    def _run_eval(self, env: Env, eval_data: list, label: str = "") -> tuple[dict, list, list]:
+    def _run_eval(self, env: Env, eval_data: list, label: str = "",
+                  max_new_tokens: int | None = None) -> tuple[dict, list, list]:
         """Run evaluation using the best available backend.
 
         `label` ("baseline" / "step_NNNN" / "final" / etc.) is attached to the
         returned metrics dict and used by `_save_eval_samples` for the JSON
         filename, so multiple eval moments can be persisted side by side.
+
+        `max_new_tokens` overrides the generation budget for this env (e.g. AIME
+        needs more than the gsm8k training budget). None → rl.max_new_tokens.
         """
+        eval_max_new = max_new_tokens if max_new_tokens is not None else self.cfg.rl.max_new_tokens
         n = len(eval_data) if self.cfg.eval_n <= 0 else self.cfg.eval_n
         # Cached deterministic shuffle (cfg.seed, identical across ranks): keeps
         # contiguous slices length/difficulty-balanced on sorted datasets.
@@ -789,7 +810,7 @@ class Trainer:
             self.model, self.tokenizer, local, env,
             n=-1, # already sliced
             batch_size=self.cfg.eval_batch_size,
-            max_new_tokens=self.cfg.rl.max_new_tokens,
+            max_new_tokens=eval_max_new,
             device=str(self.device),
             vllm_worker=self.eval_worker,
         )
@@ -843,10 +864,14 @@ class Trainer:
         the first env is the "primary" (the one that drives stats updates and
         the baseline-vs-final comparison print). All ranks must call this so
         every `_run_eval` collective fires on every rank."""
+        # Per-env generation budget (parallel to eval_envs); None → rl.max_new_tokens.
+        budgets = self.cfg.eval_max_new_tokens
         out: dict[str, tuple[dict, list, list]] = {}
-        for env_name, env in self.eval_envs:
+        for i, (env_name, env) in enumerate(self.eval_envs):
             data = self._eval_data_for(env_name, env)
-            out[env_name] = self._run_eval(env, data, label=f"{label}_{env_name}")
+            mnt = budgets[i] if budgets is not None else None
+            out[env_name] = self._run_eval(env, data, label=f"{label}_{env_name}",
+                                           max_new_tokens=mnt)
         return out
 
     def _save_eval_samples(self, label: str, correct: list, incorrect: list) -> None:

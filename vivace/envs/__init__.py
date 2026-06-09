@@ -7,7 +7,7 @@ by string name without import gymnastics.
 
 from __future__ import annotations
 
-from vivace.envs.aime import AIME2024Env, AIME2025Env
+from vivace.envs.aime import AIME2024Env, AIME2025Env, AIME2026Env
 from vivace.envs.base import Env, Example
 from vivace.envs.gsm8k import GSM8KEnv
 from vivace.envs.math import MATHEnv
@@ -19,6 +19,7 @@ ENV_REGISTRY: dict[str, type[Env]] = {
     "math500": MATH500Env,
     "aime24":  AIME2024Env,
     "aime25":  AIME2025Env,
+    "aime26":  AIME2026Env,
 }
 
 

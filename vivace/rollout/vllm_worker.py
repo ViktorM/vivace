@@ -183,8 +183,11 @@ class VLLMRolloutWorker:
         # In colocated mode these fire every step and drown out training logs.
         # `setdefault` lets the user override with VLLM_LOGGING_LEVEL=INFO when debugging.
         os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
-        # Rust BPE tokenizer (~9x faster encode at gsm8k length, ~30x at MATH/AIME
-        # context). Opt out with VLLM_USE_FASTOKENS=0 if a model isn't supported.
+        # fastokens: swap the Rust BPE backend under HF fast tokenizers (~4-9x
+        # encode at gsm8k length, ~30x at MATH/AIME context). It's a cross-cutting
+        # backend override (composes with any tokenizer_mode), so vLLM exposes it
+        # as a process-global flag rather than a per-LLM param. Opt out with
+        # VLLM_USE_FASTOKENS=0. (vLLM 0.22+ interface; needs the fastokens pkg.)
         os.environ.setdefault("VLLM_USE_FASTOKENS", "1")
 
         # logprobs_mode="processed_logprobs": return log_softmax(logits/T) AFTER

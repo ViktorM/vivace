@@ -1,4 +1,4 @@
-"""AIME 2024 / 2025 evaluation environments.
+"""AIME 2024 / 2025 / 2026 evaluation environments.
 
 The American Invitational Mathematics Examination — 30 integer-answer
 problems per year (0-999). Pair with MATHEnv or NuminaMathEnv for training;
@@ -6,6 +6,7 @@ training on AIME itself leaks the eval set.
 
   AIME2024Env  → Maxwell-Jia/AIME_2024              (30 problems, single split)
   AIME2025Env  → opencompass/AIME2025-I + -II       (15 + 15 = 30 problems)
+  AIME2026Env  → MathArena/aime_2026                (30 problems, single split)
 
 The integer-answer shape means `math_reward_single`'s numeric fast-path always
 fires here — no sympy roundtrip per eval sample.
@@ -89,3 +90,21 @@ class AIME2025Env(_AIMEBase):
                     metadata={"section": cfg},
                 ))
         return rows
+
+
+class AIME2026Env(_AIMEBase):
+    """AIME 2026 — 30 problems, single split. Source: MathArena/aime_2026."""
+
+    name = "aime26"
+
+    def _load_rows(self) -> list[Example]:
+        from datasets import load_dataset
+        ds = load_dataset("MathArena/aime_2026", split="train")
+        return [
+            Example(
+                problem=r["problem"],
+                answer=str(r["answer"]).strip(),
+                metadata={"problem_idx": r.get("problem_idx")},
+            )
+            for r in ds
+        ]

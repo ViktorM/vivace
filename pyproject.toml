@@ -13,7 +13,7 @@ dependencies = [
     "datasets>=4.0",
     "accelerate>=1.13",
     "peft>=0.19",              # LoRA
-    "vllm>=0.21",              # rollout inference (also brings torch==2.11)
+    "vllm>=0.22",              # rollout inference; 0.21+ has tokenizer_mode="fastokens" (Rust BPE)
     "flash-attn>=2.8",         # trainer attn_implementation="flash_attention_2"; varlen kernels skip the O(S²) score tensor
     "wandb>=0.25",
     "pyyaml>=6.0",
