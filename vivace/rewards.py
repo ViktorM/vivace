@@ -42,6 +42,8 @@ DEFAULT_REWARD_CONFIG = RewardConfig()
 
 
 _NUM_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+# Validly-grouped thousands numeral: 1,200 / +12,345.67 — NOT 1,2 or 12,34.
+_THOUSANDS_RE = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
 
 
 def extract_answer(text: str) -> str:
@@ -52,8 +54,18 @@ def extract_answer(text: str) -> str:
 
 
 def to_float(x) -> Optional[float]:
-    """Best-effort float coercion. Returns None on NaN/inf/garbage."""
+    """Best-effort float coercion. Returns None on NaN/inf/garbage.
+
+    Strips commas from validly-grouped thousands numerals ("1,200" → 1200.0):
+    models write large GSM8K answers that way (int_format_reward even rewards
+    the format). Invalid groupings ("1,2") stay unparseable rather than
+    silently collapsing to 12.
+    """
     try:
+        if isinstance(x, str):
+            x = x.strip()
+            if _THOUSANDS_RE.match(x):
+                x = x.replace(",", "")
         val = float(x)
         return val if math.isfinite(val) else None
     except (TypeError, ValueError):
@@ -61,13 +73,15 @@ def to_float(x) -> Optional[float]:
 
 
 def answer_match(gt, pred, tol: float = 1e-3) -> bool:
-    """Numeric equality with tolerance. Falsy on either-side parse failure."""
-    if gt is None or pred is None:
+    """Numeric equality with tolerance. False on either-side parse failure.
+
+    Coerces through `to_float` so comma-grouped numerals compare equal —
+    keeps the reward path, Env.is_correct, and maj@k voting consistent.
+    """
+    gt_f, pred_f = to_float(gt), to_float(pred)
+    if gt_f is None or pred_f is None:
         return False
-    try:
-        return abs(float(gt) - float(pred)) < tol
-    except (ValueError, TypeError):
-        return False
+    return abs(gt_f - pred_f) < tol
 
 
 def correctness_reward(

@@ -78,3 +78,18 @@ def test_maj_at_k_winner_verified_with_env_verifier():
 def test_maj_at_k_no_parseable_answers_scores_zero():
     env = GSM8KEnv()
     assert maj_at_k([["junk", "junk"]], [_ex("72")], env, k=2) == 0.0
+
+
+def test_gsm8k_is_correct_comma_formatted():
+    env = GSM8KEnv()
+    assert env.is_correct(_resp("18,000"), _ex("18000"))
+    assert not env.is_correct(_resp("1,2"), _ex("12"))   # invalid grouping stays wrong
+
+
+def test_maj_at_k_pools_comma_variant_votes():
+    env = GSM8KEnv()
+    # '1,200' and '1200' must share a vote bucket and outvote the wrong '13's.
+    samples = [_resp("1,200"), _resp("1200"), _resp("13"), _resp("13")]
+    # tie 2-2 broken first-seen -> correct bucket; make it strict with a 3rd variant
+    samples.append(_resp("1200.0"))
+    assert maj_at_k([samples], [_ex("1200")], env, k=5) == 1.0

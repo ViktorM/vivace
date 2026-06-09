@@ -114,3 +114,38 @@ def test_gsm8k_reward_batch_backward_compatible():
     """Default call (return_components=False) returns a flat list[float]."""
     out = gsm8k_reward_batch(["x"], ["1"])
     assert isinstance(out, list) and isinstance(out[0], float)
+
+
+def test_to_float_strips_valid_thousands_grouping():
+    from vivace.rewards import to_float
+    assert to_float("1,200") == 1200.0
+    assert to_float("+12,345.67") == 12345.67
+    assert to_float("-1,000,000") == -1000000.0
+    assert to_float(" 1,200 ") == 1200.0
+    # Invalid groupings must NOT silently collapse ("1,2" is not 12).
+    assert to_float("1,2") is None
+    assert to_float("12,34") is None
+    assert to_float("2, 3") is None
+    # Non-string and plain paths unchanged.
+    assert to_float(72) == 72.0
+    assert to_float("72.5") == 72.5
+    assert to_float("inf") is None
+    assert to_float(None) is None
+
+
+def test_answer_match_accepts_comma_formatted_prediction():
+    from vivace.rewards import answer_match
+    assert answer_match("1200", "1,200")
+    assert answer_match("18000", "18,000.00")
+    assert not answer_match("12", "1,2")
+
+
+def test_gsm8k_correctness_rewards_comma_formatted_answer():
+    """int_format_reward grants the int bonus for comma-grouped answers;
+    the correctness component must agree they're correct."""
+    _, comps = gsm8k_reward_batch(
+        ["<think>\nx\n</think>\n<answer>\n1,200\n</answer>\n"], ["1200"],
+        return_components=True,
+    )
+    assert comps["correct"][0] == DEFAULT_REWARD_CONFIG.correct_bonus
+    assert comps["int"][0] == DEFAULT_REWARD_CONFIG.int_bonus
