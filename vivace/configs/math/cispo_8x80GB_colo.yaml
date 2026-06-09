@@ -37,7 +37,7 @@ rollout_gpus:
 - 6
 - 7
 use_vllm: true
-gpu_memory_utilization: 0.35
+gpu_memory_utilization: 0.7   # vLLM sleeps during the train phase (enable_sleep_mode), so rollout can take most of the GPU
 enforce_eager: false
 compile_model: false
 vllm_max_model_len: 1280

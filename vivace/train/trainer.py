@@ -945,6 +945,20 @@ class Trainer:
                     max_tokens=rl.max_new_tokens, n=G,
                 )
 
+            # Colocated: sleep vLLM IMMEDIATELY after generation — everything
+            # below (rewards, advantages, old/ref logprob recompute) is
+            # trainer-side, and the recompute's full-vocab [B*G, S-1, V]
+            # logits need the memory vLLM would otherwise hold (at util 0.7
+            # the 1.5B math configs OOM if vLLM stays awake here). The drain
+            # gives vLLM's `freed_bytes >= 0` sleep invariant a stable baseline.
+            if self.rollout_worker.colocated:
+                gc.collect()
+                torch.cuda.empty_cache()
+                with record_function("vllm_sleep"):
+                    self.rollout_worker.sleep()
+                gc.collect()
+                torch.cuda.empty_cache()
+
         # {full_ids, plen, adv, old_logp, ref_logp, mask, token_count, responses, rewards}
         for i in range(rl.grad_accum_steps):
 
@@ -1339,41 +1353,40 @@ class Trainer:
         for step in range(self.cfg.num_steps):
             self.step = step
 
+            # Colocated step order: generate (vLLM awake) → sleep (inside
+            # rollout_phase, right after the generate call) → logprob
+            # recompute + train → wake → sync. Sync MUST happen while vLLM
+            # is awake — level-1 sleep unmaps the weight pages, so a sync
+            # into a sleeping engine hits unmapped memory and crashes the
+            # worker (CUDA illegal memory access). vLLM stays awake from the
+            # post-train wake through any eval below and the next step's
+            # generate; it starts awake from construction at step 0.
             with record_function(f"step_{step}"), Timer() as step_t:
                 with record_function("rollout"), Timer() as rollout_t:
-                    # In colocated mode: wake vLLM before rollout, sleep after.
-                    # Skip wake_up on step 0 — vLLM starts awake after construction.
-                    if self.rollout_worker and self.rollout_worker.colocated and step > 0:
-                        with record_function("vllm_wake_up"):
-                            self.rollout_worker.wake_up()
                     micro_batches = self.rollout_phase()
-                    if self.rollout_worker and self.rollout_worker.colocated:
-                        # Drain trainer cache before sleep so vLLM's `freed_bytes >= 0`
-                        # invariant sees a stable baseline. See colocated allocator note below.
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        with record_function("vllm_sleep"):
-                            self.rollout_worker.sleep()
-                        # Also after sleep — clears any blocks freed by sleep itself,
-                        # so the next wake_up starts on a clean trainer pool.
-                        gc.collect()
-                        torch.cuda.empty_cache()
                 with record_function("train_phase"), Timer() as train_t:
                     metrics = self.train_phase(micro_batches)
+                if self.rollout_worker and self.rollout_worker.colocated:
+                    # Release the trainer's cached training-phase blocks BEFORE
+                    # wake_up so vLLM can remap its weights + KV cache, then wake
+                    # so sync writes into mapped memory.
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    with record_function("vllm_wake_up"):
+                        self.rollout_worker.wake_up()
                 with record_function("weight_sync"):
                     self.sync_weights()
-                # Release the trainer's cached-but-unused CUDA blocks each step.
-                # Variable T (per-step prompt + response length) creates blocks
-                # of many shapes the allocator can't reuse — pool drifts upward
-                # across steps. In colocated mode this squeezes vLLM and trips
-                # its sleep-time `freed_bytes >= 0` assertion; in disaggregated
-                # mode it OOMs the trainer outright (~step 150-200 on 1.5B + MATH).
+                # Disaggregated: release the trainer's cached-but-unused CUDA
+                # blocks each step. Variable T (per-step prompt + response
+                # length) creates blocks of many shapes the allocator can't
+                # reuse — the pool drifts upward across steps and OOMs the
+                # trainer outright (~step 150-200 on 1.5B + MATH).
                 # gc.collect() before empty_cache() is necessary — Python ref
                 # cycles in rl_step's closures / stats accumulators keep tensors
                 # alive past their scope; empty_cache alone only frees cached
                 # blocks, not blocks still referenced through dead cycles.
-                # No-op cost when there's nothing to release.
-                if self.rollout_worker is not None:
+                # (Colocated drains before sleep and before wake above instead.)
+                if self.rollout_worker is not None and not self.rollout_worker.colocated:
                     gc.collect()
                     torch.cuda.empty_cache()
 
@@ -1551,15 +1564,10 @@ class Trainer:
                     }, step)
 
             # --- Periodic eval (out of is_main_process: all ranks must enter
-            # _run_eval to participate in its all_reduce) ---
+            # _run_eval to participate in its all_reduce). vLLM is awake here
+            # (post-train wake) and holds the freshly synced weights. ---
             if step > 0 and step % self.cfg.eval_interval == 0:
-                if self.rollout_worker and self.rollout_worker.colocated:
-                    self.rollout_worker.wake_up()
                 eval_results = self._run_eval_all(f"step_{step:04d}")
-                if self.rollout_worker and self.rollout_worker.colocated:
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    self.rollout_worker.sleep()
                 if is_main_process():
                     primary_metrics = eval_results[self.eval_envs[0][0]][0]
                     for env_name, (m, _, _) in eval_results.items():
@@ -1592,16 +1600,11 @@ class Trainer:
             export_and_summarize(prof, self.profiling_cfg, self.cfg.run_dir)
             prof = None
 
-        # --- Final eval (all ranks participate in _run_eval's all_reduce) ---
+        # --- Final eval (all ranks participate in _run_eval's all_reduce).
+        # vLLM is awake from the last step's post-train wake. ---
         if is_main_process():
             print("\nFinal evaluation...")
-        if self.rollout_worker and self.rollout_worker.colocated:
-            self.rollout_worker.wake_up()
         final_results = self._run_eval_all("final")
-        if self.rollout_worker and self.rollout_worker.colocated:
-            gc.collect()
-            torch.cuda.empty_cache()
-            self.rollout_worker.sleep()
         primary_name = self.eval_envs[0][0]
         final_metrics = final_results[primary_name][0]
         if is_main_process():

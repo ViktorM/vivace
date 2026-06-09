@@ -198,11 +198,18 @@ class VLLMRolloutWorker:
         # max_model_len=None lets vLLM use the model's max_position_embeddings,
         # which on Qwen3.5 / long-context models is huge and balloons KV cache size.
         # Set it explicitly (prompt + max_new_tokens) to size KV cache appropriately.
+        # enable_sleep_mode routes vLLM's weight + KV allocations through
+        # CuMemAllocator so sleep()/wake_up() can actually unmap them. Without
+        # it (the default), sleep() walks an empty allocator and frees ZERO
+        # bytes — vLLM holds its full gpu_memory_utilization through the whole
+        # training phase. Colocated-only: it requires the default CUDA allocator
+        # (incompatible with expandable_segments, which disagg mode sets).
         llm_kwargs = dict(
             model=model_name, tensor_parallel_size=tp_size,
             gpu_memory_utilization=gpu_memory_utilization, dtype=dtype,
             enable_lora=enable_lora, max_lora_rank=max_lora_rank,
             enforce_eager=enforce_eager,
+            enable_sleep_mode=colocated,
             logprobs_mode="processed_logprobs",
             disable_log_stats=True,
         )
@@ -224,6 +231,7 @@ class VLLMRolloutWorker:
 
         self.colocated = colocated
         self.gpu_ids = gpu_ids
+        self._asleep = False
         self._lora_counter = 0
         self._current_lora = None
         # Populated by init_weight_sync(). None until then.
@@ -340,10 +348,27 @@ class VLLMRolloutWorker:
         )
 
     def sleep(self) -> None:
-        """Release vLLM's KV cache (colocated mode). Pair with wake_up()."""
-        self.llm.sleep()
+        """Release vLLM's GPU memory between rollouts (colocated mode).
+
+        Level-1 sleep: weights offload to CPU, KV cache is discarded. The
+        CuMemAllocator keeps virtual addresses mapped-stable, so CUDA graphs
+        and the IPC/NCCL weight-sync specs survive the sleep/wake cycle.
+        Idempotent — repeated calls are no-ops.
+        """
+        if self._asleep:
+            return
+        self.llm.sleep(level=1)
+        self._asleep = True
         torch.cuda.empty_cache()
 
     def wake_up(self) -> None:
-        """Rebuild vLLM's KV cache. Inverse of sleep()."""
+        """Remap vLLM's memory and restore weights. Inverse of sleep().
+
+        Weight sync must run AFTER wake_up: a sync into a sleeping engine
+        writes to unmapped pages and crashes the worker (CUDA illegal
+        memory access). Idempotent — repeated calls are no-ops.
+        """
+        if not self._asleep:
+            return
         self.llm.wake_up()
+        self._asleep = False

@@ -6,7 +6,7 @@ mode: colocated
 trainer_gpus: [0, 1]
 rollout_gpus: [0, 1]
 use_vllm: true
-gpu_memory_utilization: 0.3
+gpu_memory_utilization: 0.7   # vLLM sleeps during the train phase (enable_sleep_mode), so rollout can take most of the GPU
 enforce_eager: false
 compile_model: false      # torch.compile; can interact badly with peft/DDP/variable-T
 gradient_checkpointing: true  # required to fit max_new=512 in colo with vLLM sharing GPU
