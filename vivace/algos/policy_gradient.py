@@ -35,11 +35,13 @@ WHAT THIS FILE DOES NOT OWN:
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.profiler import record_function
 
 from vivace.algos.types import RLConfig
+from vivace.utils.distributed import get_world_size
 
 
 # =============================================================================
@@ -418,6 +420,7 @@ def compute_loss(
     advantages: torch.Tensor,
     mask: torch.Tensor,
     token_count: torch.Tensor,
+    token_norm: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Policy gradient loss for the configured variant.
 
@@ -429,6 +432,12 @@ def compute_loss(
         advantages: [B*G] (no grad).
         mask: [B*G, S-1] response token mask.
         token_count: [B*G] number of unmasked tokens per sequence.
+        token_norm: denominator for the token-mean losses (dapo; cispo
+             token/hybrid). Under grad accumulation this must be the GLOBAL
+             mean token count per micro-batch (all micro-batches, all DDP
+             ranks — `rl_step` computes it), so the papers' sum(obj)/total_tokens
+             objective survives the per-micro-batch `/ n` averaging. None
+             (single whole batch, tests) falls back to this batch's own count.
 
     Returns:
         Scalar loss tensor (with grad). Does NOT include KL — that's added
@@ -502,7 +511,8 @@ def compute_loss(
         obj = torch.min(ratio * a, clipped * a)
         # token-level normalization
         if cfg.loss_type == "dapo":
-            loss = -(obj * mask_f).sum() / mask_f.sum().clamp(min=1.0)
+            denom = token_norm if token_norm is not None else mask_f.sum().clamp(min=1.0)
+            loss = -(obj * mask_f).sum() / denom
         elif cfg.loss_type == "grpo":
             per_seq = (obj * mask_f).sum(dim=1) / token_count_f
             loss = -per_seq.mean()
@@ -525,7 +535,8 @@ def compute_loss(
                 is_mask = torch.ones_like(ratio)
 
             per_token = -is_weight * a * policy_logp_f * is_mask * mask_f
-            token_loss = per_token.sum() / mask_f.sum().clamp(min=1.0)
+            denom = token_norm if token_norm is not None else mask_f.sum().clamp(min=1.0)
+            token_loss = per_token.sum() / denom
             sequence_loss = (per_token.sum(dim=1) / token_count_f).mean()
             if cfg.cispo_normalization == "token":
                 loss = token_loss
@@ -611,6 +622,21 @@ def rl_step(
     n = len(micro_batches)
     n_epochs = cfg.optim_epochs  # RLOO must have optim_epochs=1 — enforced by validate_rl_config
 
+    # Token-mean losses (dapo; cispo token/hybrid) must divide by the GLOBAL
+    # token count, not each micro-batch's own — per-micro-batch denominators
+    # upweight short-response micro-batches under grad accumulation, and
+    # low-token ranks under DDP. Dividing the global count by (n * world_size)
+    # keeps the uniform `loss / n` scaling below exact: summed over micro-batches
+    # and averaged over ranks by DDP, the gradient is sum(obj) / total_tokens.
+    token_norm = None
+    needs_token_norm = cfg.loss_type == "dapo" or (
+        cfg.loss_type == "cispo" and cfg.cispo_normalization != "sequence")
+    if needs_token_norm:
+        total_tokens = torch.stack([mb["token_count"].sum() for mb in micro_batches]).sum()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+        token_norm = total_tokens / (n * get_world_size())
+
     # Stats accumulators — only populated on the last epoch
     tot_kl = tot_pg = tot_kl_loss = tot_ent = 0.0
     tot_clip = tot_tok = 0.0
@@ -635,6 +661,7 @@ def rl_step(
             pg_loss = compute_loss(
                 cfg, policy_logp, mb["old_logp"],
                 mb["adv"], mb["mask"], mb["token_count"],
+                token_norm=token_norm,
             )
             kl_loss = cfg.kl_coef * kl.mean()
             loss = (pg_loss + kl_loss) / n

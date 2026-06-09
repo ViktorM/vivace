@@ -80,3 +80,75 @@ def test_cispo_config_validation_rejects_inverted_clip_range():
 
     with pytest.raises(ValueError, match="clip_cispo_low"):
         validate_rl_config(cfg)
+
+
+def _random_microbatches(seed: int, token_counts=(6, 2), S: int = 6):
+    """Two same-width micro-batches with unequal response-token counts."""
+    g = torch.Generator().manual_seed(seed)
+    mbs = []
+    for n_tok in token_counts:
+        policy = torch.randn(2, S, generator=g, requires_grad=True)
+        old = policy.detach() + 0.1 * torch.randn(2, S, generator=g)
+        mask = torch.zeros(2, S)
+        mask[:, :n_tok] = 1.0
+        adv = torch.randn(2, generator=g)
+        mbs.append((policy, old, adv, mask))
+    return mbs
+
+
+@pytest.mark.parametrize("cfg", [
+    RLConfig(loss_type="dapo"),
+    RLConfig(loss_type="cispo", cispo_normalization="token"),
+    RLConfig(loss_type="cispo", cispo_normalization="hybrid"),
+])
+def test_token_norm_grad_accum_matches_single_batch(cfg):
+    """sum(loss_mb / n) with token_norm == loss of the concatenated batch.
+
+    Without token_norm, per-micro-batch token-mean upweights short-response
+    micro-batches — the bug class this pins (mean-of-means != global mean).
+    """
+    mbs = _random_microbatches(seed=0)
+    total_tokens = sum(m[3].sum() for m in mbs)
+    n = len(mbs)
+    token_norm = total_tokens / n
+
+    accum = sum(
+        compute_loss(cfg, p, o, a, m, m.sum(dim=1).clamp(min=1.0), token_norm=token_norm)
+        for p, o, a, m in mbs
+    ) / n
+
+    cat = [torch.cat([mbs[0][i], mbs[1][i]]) for i in range(4)]
+    single = compute_loss(cfg, cat[0], cat[1], cat[2], cat[3],
+                          cat[3].sum(dim=1).clamp(min=1.0))
+
+    assert accum.item() == pytest.approx(single.item(), rel=1e-6)
+
+    # Gradients must match too, not just the scalar.
+    accum.backward()
+    grads_accum = [m[0].grad.clone() for m in mbs]
+    single_inputs = _random_microbatches(seed=0)
+    cat_p = torch.cat([single_inputs[0][0], single_inputs[1][0]])
+    # rebuild graph on concatenated leaf tensors
+    cat_loss = compute_loss(
+        cfg,
+        cat_p,
+        torch.cat([single_inputs[0][1], single_inputs[1][1]]),
+        torch.cat([single_inputs[0][2], single_inputs[1][2]]),
+        torch.cat([single_inputs[0][3], single_inputs[1][3]]),
+        torch.cat([single_inputs[0][3], single_inputs[1][3]]).sum(dim=1).clamp(min=1.0),
+    )
+    cat_loss.backward()
+    grad_cat = torch.cat(grads_accum)
+    assert torch.allclose(grad_cat[:2], single_inputs[0][0].grad, atol=1e-7)
+    assert torch.allclose(grad_cat[2:], single_inputs[1][0].grad, atol=1e-7)
+
+
+def test_token_norm_default_none_keeps_local_normalization():
+    """token_norm=None (whole batch in one piece) is the paper objective."""
+    cfg = RLConfig(loss_type="dapo")
+    mbs = _random_microbatches(seed=1, token_counts=(4,))
+    p, o, a, m = mbs[0]
+    with_none = compute_loss(cfg, p, o, a, m, m.sum(dim=1).clamp(min=1.0))
+    explicit = compute_loss(cfg, p, o, a, m, m.sum(dim=1).clamp(min=1.0),
+                            token_norm=m.sum())
+    assert with_none.item() == pytest.approx(explicit.item(), rel=1e-7)
