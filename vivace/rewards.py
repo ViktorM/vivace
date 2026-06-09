@@ -239,7 +239,17 @@ def _math_correct(gt: str, pred: str, tol: float = 1e-6) -> bool:
             pass
     try:
         from math_verify import parse, verify
-        return bool(verify(parse(gt_s), parse(pred_s)))
+
+        def _parse(s: str):
+            # math_verify's extraction expects delimited math ($...$, \boxed{}),
+            # but our inputs (dataset ground truths, <answer> contents) are BARE
+            # LaTeX, where extraction misfires: \sqrt{2} -> [] and 2\sqrt{3} ->
+            # [2] (leading-number grab). Wrap in $...$ first; fall back to a
+            # bare parse for input that already carries its own delimiters.
+            parsed = parse(f"${s}$")
+            return parsed if parsed else parse(s)
+
+        return bool(verify(_parse(gt_s), _parse(pred_s)))
     except Exception:
         # math_verify throws on adversarial LaTeX or hangs sympy on rare
         # inputs; treat any exception as "not equivalent" rather than

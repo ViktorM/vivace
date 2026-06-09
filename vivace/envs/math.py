@@ -25,10 +25,11 @@ from vivace.envs.math_prompt import make_prompt
 from vivace.rewards import (
     DEFAULT_REWARD_CONFIG,
     RewardConfig,
+    _math_correct,
+    extract_answer,
     math_reward_batch,
     math_reward_single,
 )
-
 
 _HENDRYCKS_SUBJECTS = (
     "algebra",
@@ -160,6 +161,10 @@ class MATHEnv(Env):
                 response_token_counts=tokens, max_new_tokens=max_new_tokens,
             )[0]
         return _scored
+
+    def is_correct(self, response: str, example: Example) -> bool:
+        # LaTeX ground truths — sympy-backed equivalence, same as the reward path.
+        return _math_correct(example.answer, extract_answer(response))
 
     def reward_breakdown(self, responses, examples, response_token_counts=None, max_new_tokens=None):
         return math_reward_batch(

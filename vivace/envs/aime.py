@@ -18,7 +18,7 @@ from typing import Callable
 
 from vivace.envs.base import Env, Example
 from vivace.envs.math_prompt import make_prompt
-from vivace.rewards import math_reward_single
+from vivace.rewards import _math_correct, extract_answer, math_reward_single
 
 
 class _AIMEBase(Env):
@@ -53,6 +53,11 @@ class _AIMEBase(Env):
     @property
     def reward_fn(self) -> Callable:
         return math_reward_single
+
+    def is_correct(self, response: str, example: Example) -> bool:
+        # Integer answers hit _math_correct's numeric fast path; same verifier
+        # as the reward so eval accuracy and training reward can't diverge.
+        return _math_correct(example.answer, extract_answer(response))
 
 
 class AIME2024Env(_AIMEBase):

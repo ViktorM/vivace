@@ -16,7 +16,7 @@ from collections import Counter
 import numpy as np
 import torch
 
-from vivace.rewards import answer_match, extract_answer, to_float
+from vivace.rewards import extract_answer, to_float
 
 
 @torch.no_grad()
@@ -69,13 +69,15 @@ def evaluate_model(
         model.train()
 
     # --- Score responses ---
+    # Correctness is env-owned: `env.is_correct` runs the same verifier as the
+    # reward path (numeric for gsm8k, sympy/math_verify for the LaTeX math
+    # family). Float-only matching here scored 35% of MATH-500 ground truths
+    # as unconditionally wrong.
     n_capped = 0
     for ex, (resp, n_tok) in zip(subset, all_responses):
         ans = extract_answer(resp)
         if ans:
             format_ok += 1
-        gt = to_float(ex.answer)
-        pred = to_float(ans) if ans else None
         r = env.reward_fn(resp, ex)
         reward_sum += r
         char_lengths.append(len(resp))
@@ -85,14 +87,14 @@ def evaluate_model(
             n_capped += 1
         detail = {
             "question": ex.problem,
-            "ground_truth": gt,
-            "predicted": pred,
+            "ground_truth": ex.answer,
+            "predicted": ans,
             "reward": r,
             "response": resp,
             "length_tokens": n_tok,
             "capped": capped,
         }
-        if answer_match(gt, pred):
+        if env.is_correct(resp, ex):
             correct += 1
             correct_list.append(detail)
         else:
@@ -216,12 +218,11 @@ def sample_evaluate(
     else:
         raise ValueError("Either model or vllm_worker must be provided")
 
-    answers = [ex.answer for ex in subset]
     elapsed = time.time() - t0
 
     return {
-        "pass_at_k": pass_at_k(responses_per_prompt, answers, k),
-        "maj_at_k": maj_at_k(responses_per_prompt, answers, k),
+        "pass_at_k": pass_at_k(responses_per_prompt, subset, env, k),
+        "maj_at_k": maj_at_k(responses_per_prompt, subset, env, k),
         "k": k,
         "n": len(subset),
         "eval_time_s": elapsed,
@@ -347,37 +348,50 @@ def preview_progress(
     model.train()
 
 
+def _vote_key(ans: str) -> str:
+    """Canonical voting key: numeric answers collapse ('72' == '72.0' == '72.00');
+    everything else votes on the stripped string. LaTeX equivalence classes are
+    NOT merged (would need a sympy parse per sample — too slow at eval scale)."""
+    f = to_float(ans)
+    return repr(f) if f is not None else ans.strip()
+
+
 def pass_at_k(
-    responses_per_prompt: list[list[str]], answers: list[str], k: int
+    responses_per_prompt: list[list[str]], examples: list, env, k: int
 ) -> float:
-    """Fraction of prompts with at least one correct answer in top-k samples."""
-    assert len(responses_per_prompt) == len(answers)
-    hits = 0
-    for samples, gt in zip(responses_per_prompt, answers):
-        any_correct = any(
-            answer_match(to_float(gt), to_float(extract_answer(r)))
-            for r in samples[:k]
-        )
-        if any_correct:
-            hits += 1
-    return hits / max(len(answers), 1)
+    """Fraction of prompts with at least one correct answer in top-k samples.
+    Correctness is `env.is_correct` — same verifier as the reward path."""
+    assert len(responses_per_prompt) == len(examples)
+    hits = sum(
+        1 for samples, ex in zip(responses_per_prompt, examples)
+        if any(env.is_correct(r, ex) for r in samples[:k])
+    )
+    return hits / max(len(examples), 1)
 
 
 def maj_at_k(
-    responses_per_prompt: list[list[str]], answers: list[str], k: int
+    responses_per_prompt: list[list[str]], examples: list, env, k: int
 ) -> float:
-    """Majority-vote accuracy at sample size k. Ties broken by first-seen."""
-    assert len(responses_per_prompt) == len(answers)
+    """Majority-vote accuracy at sample size k. Ties broken by first-seen.
+
+    Votes are bucketed by `_vote_key` so numeric formatting variants pool their
+    votes; the winning bucket's first response is then checked with
+    `env.is_correct` (the full verifier, LaTeX-aware for math envs).
+    """
+    assert len(responses_per_prompt) == len(examples)
     hits = 0
-    for samples, gt in zip(responses_per_prompt, answers):
+    for samples, ex in zip(responses_per_prompt, examples):
         votes: Counter = Counter()
+        representative: dict[str, str] = {}   # vote key -> first full response
         for r in samples[:k]:
             ans = extract_answer(r)
             if ans:
-                votes[ans] += 1
+                key = _vote_key(ans)
+                votes[key] += 1
+                representative.setdefault(key, r)
         if not votes:
             continue
         winner, _ = votes.most_common(1)[0]
-        if answer_match(to_float(gt), to_float(winner)):
+        if env.is_correct(representative[winner], ex):
             hits += 1
-    return hits / max(len(answers), 1)
+    return hits / max(len(examples), 1)

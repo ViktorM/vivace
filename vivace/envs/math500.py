@@ -14,7 +14,7 @@ from typing import Callable
 
 from vivace.envs.base import Env, Example
 from vivace.envs.math_prompt import SYSTEM_PROMPT, make_prompt
-from vivace.rewards import math_reward_single
+from vivace.rewards import _math_correct, extract_answer, math_reward_single
 
 
 class MATH500Env(Env):
@@ -59,3 +59,7 @@ class MATH500Env(Env):
     @property
     def reward_fn(self) -> Callable:
         return math_reward_single
+
+    def is_correct(self, response: str, example: Example) -> bool:
+        # LaTeX ground truths — sympy-backed equivalence, same as the reward path.
+        return _math_correct(example.answer, extract_answer(response))

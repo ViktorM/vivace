@@ -22,6 +22,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable
 
+from vivace.rewards import answer_match, extract_answer, to_float
+
 
 @dataclass
 class Example:
@@ -61,6 +63,17 @@ class Env(ABC):
         For code: run tests. For anything needing a model: not allowed here.
         """
         ...
+
+    def is_correct(self, response: str, example: Example) -> bool:
+        """Binary verifier for eval metrics (accuracy_pct, pass@k, maj@k).
+
+        Default: numeric match on the extracted <answer> block. Envs whose
+        ground truths are not plain numbers (LaTeX math) MUST override —
+        float comparison scores every non-numeric answer as wrong.
+        Must agree with the correctness component of `reward_fn`.
+        """
+        ans = extract_answer(response)
+        return bool(ans) and answer_match(to_float(example.answer), to_float(ans))
 
     def sample_batch(self, n: int, rng) -> list[Example]:
         """Default: uniform sampling from the training split. Override for curriculum."""
