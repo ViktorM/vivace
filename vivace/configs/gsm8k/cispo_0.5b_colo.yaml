@@ -9,7 +9,7 @@ gpu_memory_utilization: 0.7   # vLLM sleeps during the train phase (enable_sleep
 enforce_eager: false
 compile_model: false
 vllm_max_model_len: 1024
-vllm_max_num_seqs: 32
+vllm_max_num_seqs: 256   # Qwen2.5 KV is small; the old cap of 32 (a Qwen3.5 Mamba-cache limit) serialized generation — 3x slower evals, 1.3x slower rollouts
 use_lora: true
 lora_rank: 16
 lora_alpha: 32

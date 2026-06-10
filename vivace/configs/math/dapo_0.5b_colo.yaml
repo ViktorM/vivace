@@ -11,7 +11,7 @@ enforce_eager: false
 compile_model: false      # torch.compile; can interact badly with peft/DDP/variable-T
 gradient_checkpointing: true  # required to fit max_new=512 in colo with vLLM sharing GPU
 vllm_max_model_len: 1536  # MATH responses are longer than GSM8K's; prompt + 512 response fits in 1536
-vllm_max_num_seqs: 32
+vllm_max_num_seqs: 256   # Qwen2.5 KV is small; the old cap of 32 (a Qwen3.5 Mamba-cache limit) serialized generation — 3x slower evals, 1.3x slower rollouts
 use_lora: true
 lora_rank: 16
 lora_alpha: 32

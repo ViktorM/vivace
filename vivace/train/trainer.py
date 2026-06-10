@@ -1658,6 +1658,17 @@ class Trainer:
             export_and_summarize(prof, self.profiling_cfg, self.cfg.run_dir)
             prof = None
 
+        # --- Save the trained policy (before final eval, so an eval crash
+        # can't lose the run's model). LoRA: adapter + tokenizer, a few MB —
+        # reload via PeftModel.from_pretrained on the base model. Full FT:
+        # full HF checkpoint. ---
+        if is_main_process():
+            final_dir = os.path.join(self.cfg.run_dir, "final_model")
+            self._inner_model.save_pretrained(final_dir)
+            self.tokenizer.save_pretrained(final_dir)
+            print(f"Final {'adapter' if self.cfg.use_lora else 'model'} saved to {final_dir}")
+        barrier()
+
         # --- Final eval (all ranks participate in _run_eval's all_reduce).
         # vLLM is awake from the last step's post-train wake. ---
         if is_main_process():

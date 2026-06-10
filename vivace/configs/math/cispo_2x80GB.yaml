@@ -23,8 +23,8 @@
 #   (no trainer sharing), so vLLM gets ~64 GB of KV cache. Distinct from
 #   the colocated config where 0.25 is right because the trainer needs the
 #   rest of the card.
-# - vllm_max_num_seqs: 128 — large enough to handle the rollout burst
-#   (8 prompts × 8 group × oversample 2.0 = ≤128 concurrent sequences).
+# - vllm_max_num_seqs: 256 — wide enough that rollout bursts and full-set
+#   eval generation never serialize (rollout burst: 8×8×2.0 = 128 concurrent).
 # - eval_batch_size: 128 — eval runs through vLLM; same headroom applies.
 #
 # Verify GPU memory utilization (see runpod_quickstart.md "Verify GPU
@@ -46,7 +46,7 @@ gpu_memory_utilization: 0.80
 enforce_eager: false
 compile_model: false
 vllm_max_model_len: 1280
-vllm_max_num_seqs: 128
+vllm_max_num_seqs: 256   # Qwen2.5 KV is small; 128 (Qwen3.5-era cap) throttled eval + rollout concurrency
 use_lora: true
 lora_rank: 16
 lora_alpha: 32

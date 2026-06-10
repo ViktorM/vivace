@@ -30,7 +30,7 @@ gpu_memory_utilization: 0.7   # vLLM sleeps during the train phase (enable_sleep
 enforce_eager: false
 compile_model: false
 vllm_max_model_len: 1280
-vllm_max_num_seqs: 128
+vllm_max_num_seqs: 256   # Qwen2.5 KV is small; 128 (Qwen3.5-era cap) throttled eval + rollout concurrency
 use_lora: true
 lora_rank: 16
 lora_alpha: 32
