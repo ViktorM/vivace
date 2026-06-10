@@ -34,14 +34,36 @@ WHAT THIS FILE DOES NOT OWN:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.nn.utils import clip_grad_norm_
 from torch.profiler import record_function
 
 from vivace.algos.types import RLConfig
 from vivace.utils.distributed import get_world_size
+
+
+def build_response_mask(
+    prompt_len: int,
+    seq_len: int,
+    response_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Loss mask over target positions, built purely from response lengths.
+
+    Returns fp32 [B, seq_len - 1]. Targets are shifted by one: target index t
+    corresponds to full_ids[t + 1], so the response occupies target positions
+    [prompt_len - 1, prompt_len - 1 + resp_len). No forward pass needed —
+    this is what lets the trainer skip the old_logp recompute entirely.
+    """
+    device = response_lengths.device
+    start = max(prompt_len - 1, 0)
+    resp_lens = response_lengths.long().unsqueeze(1)              # (B, 1)
+    pos = torch.arange(seq_len - 1, device=device).unsqueeze(0)   # (1, S-1)
+    return ((pos >= start) & (pos < start + resp_lens)).float()
 
 
 # =============================================================================
@@ -261,10 +283,7 @@ def compute_token_logprobs(
     start = max(prompt_len - 1, 0)
     mask = torch.zeros_like(token_log_prob)
     if response_lengths is not None:
-        resp_lens = response_lengths.to(device).long().unsqueeze(1)            # (B, 1)
-        pos = torch.arange(S - 1, device=device).unsqueeze(0)                   # (1, S-1)
-        in_response = (pos >= start) & (pos < start + resp_lens)
-        mask = in_response
+        mask = build_response_mask(prompt_len, S, response_lengths.to(device))
     else:
         # Fallback: stop-token heuristic. Correct when EOS genuinely terminates the
         # sequence; off-by-one (includes first right-pad) for max_tokens-truncated
@@ -643,29 +662,54 @@ def rl_step(
     # GSPO seq_ratio samples for p50/p99 logging (diagnoses inert trust region).
     seq_ratio_chunks: list[torch.Tensor] = []
 
+    # DDP: gradients are only consumed at optimizer.step(), so the all-reduce
+    # is needed solely on the LAST micro-batch of each epoch; no_sync() skips
+    # it on the others (grad_accum_steps x fewer collectives per epoch).
+    inner = getattr(model, "_orig_mod", model)  # unwrap torch.compile
+    ddp = inner if isinstance(inner, DistributedDataParallel) else None
+
     for epoch in range(n_epochs):
         optimizer.zero_grad(set_to_none=True)
         last = (epoch == n_epochs - 1)
 
-        for mb in micro_batches:
-            policy_logp, _, entropy = compute_token_logprobs(
-                model, mb["full_ids"], mb["plen"], cfg.temperature,
-                return_entropy=last,
-                entropy_chunk_size=cfg.entropy_chunk_size,
-                entropy_grad=cfg.entropy_grad,
-                pad_token_id=mb.get("pad_token_id"),
-                stop_token_id=mb.get("stop_token_id"),
-                response_lengths=mb.get("response_lengths"),
-            )
-            kl = compute_kl(policy_logp, mb["ref_logp"], mb["mask"])
-            pg_loss = compute_loss(
-                cfg, policy_logp, mb["old_logp"],
-                mb["adv"], mb["mask"], mb["token_count"],
-                token_norm=token_norm,
-            )
-            kl_loss = cfg.kl_coef * kl.mean()
-            loss = (pg_loss + kl_loss) / n
-            loss.backward()
+        for mb_idx, mb in enumerate(micro_batches):
+            sync_ctx = ddp.no_sync() if (ddp is not None and mb_idx < n - 1) else nullcontext()
+            with sync_ctx:
+                policy_logp, _, entropy = compute_token_logprobs(
+                    model, mb["full_ids"], mb["plen"], cfg.temperature,
+                    return_entropy=last,
+                    entropy_chunk_size=cfg.entropy_chunk_size,
+                    entropy_grad=cfg.entropy_grad,
+                    pad_token_id=mb.get("pad_token_id"),
+                    stop_token_id=mb.get("stop_token_id"),
+                    response_lengths=mb.get("response_lengths"),
+                )
+                # old_logp = the epoch-1 forward, detached. The rollout weights
+                # ARE the epoch-1 weights, and the recompute the trainer used to
+                # do here is bit-identical to this forward (measured: eval/no-grad
+                # vs train/grad logits agree exactly; requires dropout == 0,
+                # enforced at trainer init). Saves one full no-grad forward per
+                # micro-batch per step.
+                if mb["old_logp"] is None:
+                    mb["old_logp"] = policy_logp.detach()
+                if mb["ref_logp"] is not None:
+                    kl = compute_kl(policy_logp, mb["ref_logp"], mb["mask"])
+                elif cfg.kl_coef != 0.0:
+                    raise ValueError(
+                        "ref_logp is None but kl_coef != 0 — the trainer only "
+                        "skips the reference forward when the KL term is off"
+                    )
+                else:
+                    # kl_coef == 0: ref forward skipped in rollout_phase; KL ≡ 0.
+                    kl = policy_logp.new_zeros(policy_logp.shape[0])
+                pg_loss = compute_loss(
+                    cfg, policy_logp, mb["old_logp"],
+                    mb["adv"], mb["mask"], mb["token_count"],
+                    token_norm=token_norm,
+                )
+                kl_loss = cfg.kl_coef * kl.mean()
+                loss = (pg_loss + kl_loss) / n
+                loss.backward()
 
             if last:
                 with torch.no_grad():
@@ -680,6 +724,10 @@ def rl_step(
                     # sequences, so clip_frac is NOT cross-comparable to PPO's
                     # token-level rate; treat it as "fraction of sequences
                     # whose ratio left the trust region this step."
+                    # NOTE: at optim_epochs=1 these stats are degenerate by
+                    # construction — old_logp IS this epoch's forward, so the
+                    # ratio is exactly 1 and clip_frac is exactly 0. Expected,
+                    # not a bug. Real clip activity needs epochs >= 2.
                     if cfg.loss_type == "gspo":
                         seq_lp = (policy_logp * mb["mask"]).sum(dim=1) / mb["token_count"]
                         old_seq_lp = (mb["old_logp"] * mb["mask"]).sum(dim=1) / mb["token_count"]

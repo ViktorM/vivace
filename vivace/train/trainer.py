@@ -27,7 +27,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from vivace.algos.types import RLConfig, SFTConfig, validate_rl_config
 from vivace.algos.policy_gradient import (
-    compute_advantages, compute_token_logprobs, compute_kl, compute_loss, rl_step,
+    build_response_mask, compute_advantages, compute_token_logprobs,
+    compute_kl, compute_loss, rl_step,
 )
 from vivace.envs.base import Env, Example
 from vivace.envs import Env, make_env
@@ -344,6 +345,12 @@ class Trainer:
 
         self.rollout_worker = None
 
+        # Fork the math_verify worker pool NOW, while this process is still
+        # (nearly) single-threaded — vLLM, NCCL rendezvous, and wandb all spawn
+        # threads later, and fork() from a threaded process risks child deadlock.
+        from vivace.rewards import warm_verify_pool
+        warm_verify_pool()
+
         _print_system_info()
         torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -474,6 +481,20 @@ class Trainer:
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
 
+        # rl_step reuses the epoch-1 policy forward as old_logp, which requires
+        # a deterministic train-mode forward. Any live dropout (lora_dropout OR
+        # the base model's own attention/residual dropout) makes the rollout
+        # policy and the loss forward disagree — the importance ratio would be
+        # silently wrong. Module-level check so it covers full FT too.
+        live_dropout = sorted({m.p for m in self.model.modules()
+                               if isinstance(m, nn.Dropout) and m.p > 0})
+        if live_dropout:
+            raise ValueError(
+                f"model has active dropout (p={live_dropout}). old_logp reuse needs a "
+                "deterministic forward: set lora_dropout=0.0 and use a model whose "
+                "config disables attention/residual dropout."
+            )
+
         # Keep a handle to the peft (or bare HF) model so we can call peft methods
         # like merge_adapter / unmerge_adapter / disable_adapter / save_pretrained
         # without hitting DDP's __getattr__ wall after wrapping.
@@ -531,9 +552,14 @@ class Trainer:
         # --- Optimizer + scheduler ---
         # Two modes: plain cosine, or cosine→linear-ramp-restart→cosine. The restart
         # uses `warmup_steps` for the ramp length, matching the initial warmup.
+        # fused=True: single multi-tensor CUDA kernel (torch defaults to the
+        # slower foreach path when unset). Trainable-only param list — frozen
+        # base params under LoRA never get state, no reason to hand them over.
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=cfg.rl.lr,
+            [p for p in self.model.parameters() if p.requires_grad],
+            lr=cfg.rl.lr,
             betas=(cfg.rl.adam_beta1, cfg.rl.adam_beta2), eps=cfg.rl.adam_eps,
+            fused=torch.cuda.is_available(),
         )
         warmup_steps = cfg.rl.warmup_steps
         post_warmup = max(cfg.num_steps - warmup_steps, 1)
@@ -606,6 +632,20 @@ class Trainer:
         # --- Profiling ---
         self.profiling_cfg = ProfilingConfig(**(cfg.profiling or {}))
 
+        # ----- Weight-sync param filter -----
+        # After merge_adapter(), LoRA changes ONLY the target-module weights —
+        # embeddings, norms, untargeted MLPs, and all biases are bit-identical
+        # to what vLLM loaded from disk at init. Sync only what moves (~6x less
+        # NCCL traffic / IPC copying at r=16 on qkvo). Full FT: no filter.
+        self._sync_filter = None
+        if cfg.use_lora:
+            _targets = tuple(cfg.lora_target_modules)
+
+            def _sync_filter(name, _p, _targets=_targets):
+                return any(name.endswith(f".{t}.weight") for t in _targets)
+
+            self._sync_filter = _sync_filter
+
         # ----- NCCL weight sync setup (one-time, Pattern A) -----
         # Pattern A = StatelessProcessGroup (TCP rendezvous) + PyNcclCommunicator.
         # See docs/training_theory.md and docs/weight_sync_approaches.md.
@@ -626,7 +666,9 @@ class Trainer:
                     )
             from vllm.distributed.utils import StatelessProcessGroup
             from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-            from vivace.utils.weight_sync import build_param_specs, allocate_fused_buffers
+            from vivace.utils.weight_sync import (
+                allocate_fused_buffers, build_param_specs, validate_filter_coverage,
+            )
 
             host, port = "localhost", _find_free_port(rank_hint=local_rank)
             world_size = 2   # 1 trainer + 1 vLLM worker at TP=1; bump when scaling
@@ -675,7 +717,9 @@ class Trainer:
             # broadcast and `unmerge_adapter` undoes it after, so vLLM (enable_lora=False
             # on this path) receives the full merged weights via these specs. Full FT
             # path ignores merge/unmerge and broadcasts the live trainable params.
-            specs, fusion_map = build_param_specs(self.model, fuse=True)
+            specs, fusion_map = build_param_specs(self.model, filter_fn=self._sync_filter, fuse=True)
+            if self._sync_filter is not None:
+                validate_filter_coverage(specs, fusion_map, cfg.lora_target_modules)
             fused_buffers = allocate_fused_buffers(self.model, specs, self.device)
             self._nccl_sync_state = {
                 "specs": specs,
@@ -705,10 +749,14 @@ class Trainer:
                     "weight_sync_method='ipc' is only meaningful in colocated mode. "
                     "For disaggregated, use 'nccl' (faster) or 'disk'."
                 )
-            from vivace.utils.weight_sync import build_param_specs, allocate_fused_buffers
+            from vivace.utils.weight_sync import (
+                allocate_fused_buffers, build_param_specs, validate_filter_coverage,
+            )
             from vivace.utils.ipc_sync import pack_ipc_handles
 
-            specs, fusion_map = build_param_specs(self.model, fuse=True)
+            specs, fusion_map = build_param_specs(self.model, filter_fn=self._sync_filter, fuse=True)
+            if self._sync_filter is not None:
+                validate_filter_coverage(specs, fusion_map, cfg.lora_target_modules)
             fused_buffers = allocate_fused_buffers(self.model, specs, self.device)
             # Build IPC handles ONCE: storages are stable across the run because
             # peft merge/unmerge mutate base.weight.data in place and fused buffers
@@ -952,11 +1000,14 @@ class Trainer:
             # the 1.5B math configs OOM if vLLM stays awake here). The drain
             # gives vLLM's `freed_bytes >= 0` sleep invariant a stable baseline.
             if self.rollout_worker.colocated:
+                # The one gc.collect() per step: breaks ref cycles holding CUDA
+                # blocks so the pre-sleep drain gives vLLM's `freed_bytes >= 0`
+                # invariant a stable baseline. (gc.freeze() at train() start
+                # exempts the long-lived model/optimizer graph from the scan.)
                 gc.collect()
                 torch.cuda.empty_cache()
                 with record_function("vllm_sleep"):
                     self.rollout_worker.sleep()
-                gc.collect()
                 torch.cuda.empty_cache()
 
         # {full_ids, plen, adv, old_logp, ref_logp, mask, token_count, responses, rewards}
@@ -1062,25 +1113,21 @@ class Trainer:
             with record_function("advantages"):
                 adv = compute_advantages(rewards.view(B, G), self.rl_cfg)
 
-            # old_logp via recompute (peft separate-matmul forward). For LoRA, this
-            # matches policy_logp's forward path → ratio is well-behaved. We tried
-            # using vLLM's old_logp directly (skips the recompute, ~700ms/step win)
-            # but the peft-vs-vLLM-merged bf16 numerical gap biases importance ratios
-            # by an irreducible amount that grows with ‖B@A‖, degrading sample
-            # efficiency. Until weight sync supports vLLM enable_lora=True (whose
-            # Punica fused-LoRA forward matches peft's separate-matmul numerics),
-            # recompute is the principled choice for LoRA.
-            with record_function("logprob_recompute"), torch.no_grad():
-                with record_function("logprob_policy"):
-                    self.compiled_model.eval()
-                    old_logp, mask, _ = compute_token_logprobs(
-                        self.compiled_model, full_ids, plen, rl.temperature,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        response_lengths=response_lengths,
-                    )
-                    self.compiled_model.train()
+            # Loss mask comes straight from response_lengths — no forward needed.
+            # old_logp is NOT recomputed here anymore: the rollout weights are the
+            # epoch-1 weights, and rl_step's epoch-1 forward is bit-identical to
+            # the eval-mode recompute this block used to do (measured; requires
+            # dropout == 0, enforced at init). rl_step fills mb["old_logp"] from
+            # epoch 1's policy_logp.detach(). (We had also tried vLLM's own
+            # logprobs as old_logp — the peft-vs-vLLM-merged bf16 gap biases the
+            # ratios; recompute-by-reuse keeps the HF-vs-HF exactness for free.)
+            mask = build_response_mask(plen, full_ids.shape[1], response_lengths)
 
-                with record_function("logprob_ref"):
+            # Reference forward only exists to anchor the KL term — skip the
+            # whole no-grad forward when the config trains without a KL anchor.
+            ref_logp = None
+            if rl.kl_coef != 0.0:
+                with record_function("logprob_ref"), torch.no_grad():
                     if self.compiled_ref is not None:
                         ref_logp, _, _ = compute_token_logprobs(
                             self.compiled_ref, full_ids, plen, rl.temperature,
@@ -1099,7 +1146,7 @@ class Trainer:
 
             micro_batches.append({
                 "full_ids": full_ids, "plen": plen, "adv": adv,
-                "old_logp": old_logp, "ref_logp": ref_logp, "mask": mask,
+                "old_logp": None, "ref_logp": ref_logp, "mask": mask,
                 "token_count": mask.sum(dim=1).clamp(min=1.0),
                 "responses": responses, "rewards": rewards,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -1349,6 +1396,12 @@ class Trainer:
                 print(f"Profiler armed: will profile steps {self.profiling_cfg.start_step}-{self.profiling_cfg.end_step}")
 
         # --- Training loop ---
+        # Everything alive here (model, optimizer, vLLM handles, train data) is
+        # permanent — exempt it from gc scans so the per-step gc.collect() cost
+        # stays flat instead of growing with the live-object count. Collect
+        # first so init-time cyclic garbage isn't immortalized by the freeze.
+        gc.collect()
+        gc.freeze()
         self.kl_ema = self.cfg.rl.kl_target
         for step in range(self.cfg.num_steps):
             self.step = step
@@ -1369,8 +1422,9 @@ class Trainer:
                 if self.rollout_worker and self.rollout_worker.colocated:
                     # Release the trainer's cached training-phase blocks BEFORE
                     # wake_up so vLLM can remap its weights + KV cache, then wake
-                    # so sync writes into mapped memory.
-                    gc.collect()
+                    # so sync writes into mapped memory. (Training-phase tensors
+                    # are scope-dead here; empty_cache alone reclaims them — the
+                    # per-step cycle-breaking gc.collect lives pre-sleep.)
                     torch.cuda.empty_cache()
                     with record_function("vllm_wake_up"):
                         self.rollout_worker.wake_up()
@@ -1504,23 +1558,27 @@ class Trainer:
                         )
                         torch.cuda.reset_peak_memory_stats()
                     print("    " + " ".join(aux))
-                    # Track smoothed KL drift from reference.
-                    cur_kl = metrics["kl"]
-                    if self.kl_to_ref_ema is None:
-                        self.kl_to_ref_ema = cur_kl
-                    else:
-                        self.kl_to_ref_ema = 0.95 * self.kl_to_ref_ema + 0.05 * cur_kl
                     # Core metrics (flat — wandb top level)
-                    log_metrics({
+                    core_metrics = {
                         "loss": metrics["loss"],
                         "reward": metrics["reward"],
-                        "kl": metrics["kl"],
-                        "kl_to_ref_ema": self.kl_to_ref_ema,
                         "clip_frac": metrics["clip_frac"],
                         "grad_norm": metrics["grad_norm"],
                         "entropy": metrics["entropy"],
                         "format_rate": metrics["format_rate"],
-                    }, step)
+                    }
+                    # KL is only MEASURED when a ref forward runs (kl_coef != 0).
+                    # Omit it otherwise — a flat 0 on a dashboard reads as "no
+                    # drift" when it means "not measured".
+                    if self.cfg.rl.kl_coef != 0.0:
+                        cur_kl = metrics["kl"]
+                        if self.kl_to_ref_ema is None:
+                            self.kl_to_ref_ema = cur_kl
+                        else:
+                            self.kl_to_ref_ema = 0.95 * self.kl_to_ref_ema + 0.05 * cur_kl
+                        core_metrics["kl"] = cur_kl
+                        core_metrics["kl_to_ref_ema"] = self.kl_to_ref_ema
+                    log_metrics(core_metrics, step)
                     # GSPO sequence-ratio percentiles (only present for loss_type=gspo)
                     if "seq_ratio_p50" in metrics:
                         log_metrics({

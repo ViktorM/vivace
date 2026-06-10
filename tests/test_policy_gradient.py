@@ -152,3 +152,136 @@ def test_token_norm_default_none_keeps_local_normalization():
     explicit = compute_loss(cfg, p, o, a, m, m.sum(dim=1).clamp(min=1.0),
                             token_norm=m.sum())
     assert with_none.item() == pytest.approx(explicit.item(), rel=1e-7)
+
+
+def test_build_response_mask_matches_compute_token_logprobs():
+    """The trainer now builds the loss mask without a forward — it must equal
+    the mask compute_token_logprobs derives from the same response_lengths."""
+    from vivace.algos.policy_gradient import build_response_mask, compute_token_logprobs
+
+    class _StubModel(torch.nn.Module):
+        def __init__(self, vocab=23):
+            super().__init__()
+            self.emb = torch.nn.Embedding(vocab, vocab)
+
+        def forward(self, ids, attention_mask=None, position_ids=None):
+            class _Out: ...
+            out = _Out()
+            out.logits = self.emb(ids)
+            return out
+
+    torch.manual_seed(0)
+    B, S, plen = 3, 10, 4
+    full_ids = torch.randint(1, 23, (B, S))
+    resp_lens = torch.tensor([6, 2, 4])  # last row right-padded
+
+    _, mask_ref, _ = compute_token_logprobs(
+        _StubModel(), full_ids, plen, pad_token_id=0, response_lengths=resp_lens)
+    mask = build_response_mask(plen, S, resp_lens)
+    assert torch.equal(mask, mask_ref)
+    assert mask.sum(dim=1).tolist() == [6.0, 2.0, 4.0]
+
+
+def test_rl_step_fills_old_logp_and_ratio_is_one_on_first_epoch():
+    """old_logp is no longer precomputed: epoch 1 must set it from the policy
+    forward (detached), making the epoch-1 ratio exactly 1 (clip_frac == 0)."""
+    from vivace.algos.policy_gradient import rl_step
+
+    class _StubModel(torch.nn.Module):
+        def __init__(self, vocab=23):
+            super().__init__()
+            self.emb = torch.nn.Embedding(vocab, vocab)
+
+        def forward(self, ids, attention_mask=None, position_ids=None):
+            class _Out: ...
+            out = _Out()
+            out.logits = self.emb(ids)
+            return out
+
+    torch.manual_seed(1)
+    model = _StubModel()
+    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+    cfg = RLConfig(loss_type="grpo", adv_type="grpo", group_size=2,
+                   optim_epochs=2, kl_coef=0.0, adaptive_sampling=False)
+    B, S, plen = 2, 8, 3
+    mbs = []
+    for _ in range(2):
+        full_ids = torch.randint(1, 23, (B, S))
+        resp_lens = torch.tensor([5, 3])
+        from vivace.algos.policy_gradient import build_response_mask
+        mask = build_response_mask(plen, S, resp_lens)
+        mbs.append({
+            "full_ids": full_ids, "plen": plen,
+            "adv": torch.tensor([0.5, -0.5]),
+            "old_logp": None, "ref_logp": None,   # filled by rl_step / kl skipped
+            "mask": mask, "token_count": mask.sum(dim=1).clamp(min=1.0),
+            "responses": ["<answer>1</answer>", "x"], "rewards": torch.tensor([1.0, 0.0]),
+            "pad_token_id": 0, "response_lengths": resp_lens,
+        })
+
+    metrics, _ = rl_step(cfg, mbs, model, None, opt, None, step=0, kl_ema=0.0)
+
+    assert all(mb["old_logp"] is not None for mb in mbs)
+    assert not mbs[0]["old_logp"].requires_grad
+    assert metrics["kl"] == 0.0          # ref skipped at kl_coef=0
+    # epoch-1 ratio ≡ 1; only epoch 2 (after one SGD step) can clip — with
+    # lr=1e-3 on this stub the ratio stays inside 1±0.2, so clip_frac == 0.
+    assert metrics["clip_frac"] == 0.0
+
+
+def test_build_param_specs_lora_filter_keeps_only_target_weights():
+    """LoRA sync filter: fused qkv weight + o_proj weight survive; biases,
+    embeddings, and the (untargeted) MLP group are dropped on both paths."""
+    import torch.nn as nn
+    from vivace.utils.weight_sync import build_param_specs
+
+    class _Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(8, 8, bias=True)
+            self.k_proj = nn.Linear(8, 4, bias=True)
+            self.v_proj = nn.Linear(8, 4, bias=True)
+            self.o_proj = nn.Linear(8, 8, bias=False)
+
+    class _Mlp(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(8, 16, bias=False)
+            self.up_proj = nn.Linear(8, 16, bias=False)
+            self.down_proj = nn.Linear(16, 8, bias=False)
+
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _Attn()
+            self.mlp = _Mlp()
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(11, 8)
+            self.layers = nn.ModuleList([_Layer()])
+
+    model = _Model()
+    targets = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+    def lora_filter(name, _p):
+        return any(name.endswith(f".{t}.weight") for t in targets)
+
+    specs, fusion_map = build_param_specs(model, filter_fn=lora_filter, fuse=True)
+    names = sorted(s.name for s in specs)
+    assert names == ["layers.0.self_attn.o_proj.weight",
+                     "layers.0.self_attn.qkv_proj.weight"]
+    assert "layers.0.self_attn.qkv_proj.weight" in fusion_map
+    # unfiltered still ships everything (full-FT path unchanged)
+    specs_all, _ = build_param_specs(model, fuse=True)
+    assert len(specs_all) > 2
+
+
+def test_math_correct_batch_matches_singles_and_preserves_order():
+    from vivace.rewards import _math_correct, math_correct_batch
+    gts = ["72", "\\frac{1}{2}", "", "\\sqrt{12}", "5"]
+    preds = ["72.0", "0.5", "1", "2\\sqrt{3}", "6"]
+    batch = math_correct_batch(gts, preds)
+    singles = [_math_correct(g, p) for g, p in zip(gts, preds)]
+    assert batch == singles == [True, True, False, True, False]

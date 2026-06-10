@@ -129,9 +129,10 @@ def build_param_specs(model: nn.Module, filter_fn=None, fuse=True) -> list[Param
     specs = []
     fusion_map = {}
     if fuse:
-        # Fusion is applied to trainable tensors unconditionally — filter_fn
-        # is deliberately NOT consulted here to keep groups all-or-nothing.
-        # (If you later want filtered fusion, build a filter-aware version.)
+        # Fused groups are all-or-nothing: a group is kept iff ANY member
+        # passes filter_fn (a fused tensor must ship whole if any slice
+        # changed). Members of dropped groups also fail filter_fn
+        # individually, so they can't leak through the leftover loop below.
         consumed = set()
         for comps, fused in FUSION_GROUPS:
             # Iterate both suffixes so qkv_proj.bias gets fused when present
@@ -147,6 +148,12 @@ def build_param_specs(model: nn.Module, filter_fn=None, fuse=True) -> list[Param
 
                     if not all(n in named for n in member_names):
                         continue  # partial group (e.g. no bias) — skip cleanly
+
+                    if filter_fn is not None and not any(
+                        filter_fn(n, named[n]) for n in member_names
+                    ):
+                        consumed.update(member_names)  # dropped, not leftovers
+                        continue
 
                     fused_name = f"{prefix}.{fused}.{suffix}"
                     shapes = [named[n].shape for n in member_names]
@@ -188,6 +195,28 @@ def allocate_fused_buffers(model, specs, device):
 def is_lora_param(name: str, _p: nn.Parameter) -> bool:
     """Filter for build_param_specs: LoRA adapter params only."""
     return "lora_" in name
+
+
+def validate_filter_coverage(specs, fusion_map, target_modules) -> None:
+    """Raise if any LoRA target produced no sync spec (directly or as a fused
+    member). A silently-missed target would leave that module's weights frozen
+    at vLLM's disk values forever while the trainer keeps updating them."""
+    def _covered(target: str) -> bool:
+        suffix = f".{target}.weight"
+        for spec in specs:
+            if spec.name.endswith(suffix):
+                return True
+            if any(m.endswith(suffix) for m in fusion_map.get(spec.name, ())):
+                return True
+        return False
+
+    missing = [t for t in target_modules if not _covered(t)]
+    if missing:
+        raise ValueError(
+            f"weight-sync filter produced no spec for LoRA target(s) {missing}; "
+            f"their merged weights would never reach vLLM. Spec names: "
+            f"{sorted(s.name for s in specs)[:8]}..."
+        )
 
 
 def sender_broadcast_loop(
