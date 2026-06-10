@@ -75,6 +75,11 @@ class Env(ABC):
         ans = extract_answer(response)
         return bool(ans) and answer_match(to_float(example.answer), to_float(ans))
 
+    def is_correct_batch(self, responses: list[str], examples: list[Example]) -> list[bool]:
+        """Vectorized `is_correct`. Override when batch scoring can fan out
+        (the math family routes LaTeX pairs to the math_verify process pool)."""
+        return [self.is_correct(r, ex) for r, ex in zip(responses, examples)]
+
     def sample_batch(self, n: int, rng) -> list[Example]:
         """Default: uniform sampling from the training split. Override for curriculum."""
         train = self.load_split("train")

@@ -17,6 +17,7 @@ reward components for a batch of responses.
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -271,15 +272,91 @@ def _math_correct(gt: str, pred: str, tol: float = 1e-6) -> bool:
         return False
 
 
+# --- Parallel LaTeX verification ---------------------------------------------
+# math_verify is sympy-backed (~50-500 ms per LaTeX comparison); its own
+# parse/verify carry built-in 5 s signal timeouts, so a rare sympy hang is
+# already bounded per call. Batch paths fan the LaTeX comparisons out to a
+# small persistent process pool purely for parallelism; numeric pairs never
+# leave the calling process.
+
+_VERIFY_POOL = None
+
+
+def _warm_worker():
+    # Pre-import the sympy stack so a worker's first task doesn't pay for it.
+    import math_verify  # noqa: F401
+
+
+def _make_pool():
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+
+    # fork: cheap workers that inherit the loaded modules. They run pure
+    # sympy and never touch CUDA, so forking a CUDA-initialized parent is
+    # fine (DataLoader-worker contract) — but fork from a process with many
+    # live threads risks child deadlocks, hence warm_verify_pool() below.
+    return ProcessPoolExecutor(
+        max_workers=min(8, os.cpu_count() or 1),
+        mp_context=mp.get_context("fork"),
+        initializer=_warm_worker,
+    )
+
+
+def warm_verify_pool() -> None:
+    """Create the verify pool eagerly. The trainer calls this at init, BEFORE
+    vLLM / NCCL / wandb spawn their threads — forking from a (nearly)
+    single-threaded process is the safe window."""
+    global _VERIFY_POOL
+    if _VERIFY_POOL is None:
+        _VERIFY_POOL = _make_pool()
+
+
+def math_correct_batch(gts: list[str], preds: list[str]) -> list[bool]:
+    """Vectorized `_math_correct`: numeric pairs short-circuit inline, LaTeX
+    pairs verify in parallel on the process pool (math_verify's built-in 5 s
+    timeouts bound each comparison inside the worker)."""
+    global _VERIFY_POOL
+    out: list[bool] = [False] * len(gts)
+    pool_idx: list[int] = []
+    pool_pairs: list[tuple[str, str]] = []
+    for i, (gt, pred) in enumerate(zip(gts, preds)):
+        g, p = (gt or "").strip(), (pred or "").strip()
+        if not g or not p:
+            continue
+        if _PURE_NUM_RE.match(g) and _PURE_NUM_RE.match(p):
+            out[i] = _math_correct(g, p)
+        else:
+            pool_idx.append(i)
+            pool_pairs.append((g, p))
+    if pool_pairs:
+        from concurrent.futures.process import BrokenProcessPool
+
+        warm_verify_pool()
+        pool_gts, pool_preds = zip(*pool_pairs)
+        try:
+            results = list(_VERIFY_POOL.map(_math_correct, pool_gts, pool_preds))
+        except BrokenProcessPool:
+            # A killed worker poisons the executor permanently. Rebuild once;
+            # if that also breaks, degrade to inline serial — never let the
+            # reward path take down a training step.
+            _VERIFY_POOL = _make_pool()
+            try:
+                results = list(_VERIFY_POOL.map(_math_correct, pool_gts, pool_preds))
+            except BrokenProcessPool:
+                results = [_math_correct(g, p) for g, p in pool_pairs]
+        for i, ok in zip(pool_idx, results):
+            out[i] = bool(ok)
+    return out
+
+
 def math_correctness_reward(
     responses: list[str], answers: list[str], cfg: RewardConfig = DEFAULT_REWARD_CONFIG
 ) -> list[float]:
-    """correct_bonus on math_verify equivalence; wrong_penalty otherwise."""
+    """correct_bonus on math_verify equivalence; wrong_penalty otherwise.
+    Batched through the verify pool — LaTeX comparisons run in parallel."""
     extracted = [extract_answer(r) for r in responses]
-    return [
-        cfg.correct_bonus if _math_correct(a, e) else cfg.wrong_penalty
-        for a, e in zip(answers, extracted)
-    ]
+    flags = math_correct_batch(answers, extracted)
+    return [cfg.correct_bonus if ok else cfg.wrong_penalty for ok in flags]
 
 
 def math_reward_batch(

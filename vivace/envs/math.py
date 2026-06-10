@@ -27,6 +27,7 @@ from vivace.rewards import (
     RewardConfig,
     _math_correct,
     extract_answer,
+    math_correct_batch,
     math_reward_batch,
     math_reward_single,
 )
@@ -165,6 +166,10 @@ class MATHEnv(Env):
     def is_correct(self, response: str, example: Example) -> bool:
         # LaTeX ground truths — sympy-backed equivalence, same as the reward path.
         return _math_correct(example.answer, extract_answer(response))
+
+    def is_correct_batch(self, responses: list[str], examples: list[Example]) -> list[bool]:
+        return math_correct_batch([ex.answer for ex in examples],
+                                  [extract_answer(r) for r in responses])
 
     def reward_breakdown(self, responses, examples, response_token_counts=None, max_new_tokens=None):
         return math_reward_batch(

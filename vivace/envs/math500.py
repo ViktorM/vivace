@@ -14,7 +14,13 @@ from typing import Callable
 
 from vivace.envs.base import Env, Example
 from vivace.envs.math_prompt import SYSTEM_PROMPT, make_prompt
-from vivace.rewards import _math_correct, extract_answer, math_reward_single
+from vivace.rewards import (
+    _math_correct,
+    extract_answer,
+    math_correct_batch,
+    math_reward_batch,
+    math_reward_single,
+)
 
 
 class MATH500Env(Env):
@@ -63,3 +69,17 @@ class MATH500Env(Env):
     def is_correct(self, response: str, example: Example) -> bool:
         # LaTeX ground truths — sympy-backed equivalence, same as the reward path.
         return _math_correct(example.answer, extract_answer(response))
+
+    def is_correct_batch(self, responses: list[str], examples: list[Example]) -> list[bool]:
+        return math_correct_batch([ex.answer for ex in examples],
+                                  [extract_answer(r) for r in responses])
+
+    def reward_breakdown(self, responses, examples, response_token_counts=None, max_new_tokens=None):
+        # Batched so eval rewards hit the verify pool (the base default calls
+        # reward_fn per item — serial sympy).
+        return math_reward_batch(
+            responses, [ex.answer for ex in examples],
+            response_token_counts=response_token_counts,
+            max_new_tokens=max_new_tokens,
+            return_components=True,
+        )

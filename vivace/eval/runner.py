@@ -69,16 +69,19 @@ def evaluate_model(
         model.train()
 
     # --- Score responses ---
-    # Correctness is env-owned: `env.is_correct` runs the same verifier as the
-    # reward path (numeric for gsm8k, sympy/math_verify for the LaTeX math
-    # family). Float-only matching here scored 35% of MATH-500 ground truths
-    # as unconditionally wrong.
+    # Correctness is env-owned: the same verifier as the reward path (numeric
+    # for gsm8k, sympy/math_verify for the LaTeX math family). Both rewards and
+    # correctness are computed BATCHED so the math family can fan LaTeX
+    # comparisons out to the verify process pool instead of serial sympy.
+    texts = [resp for resp, _ in all_responses]
+    rewards, _ = env.reward_breakdown(texts, subset)
+    correct_flags = env.is_correct_batch(texts, subset)
+
     n_capped = 0
-    for ex, (resp, n_tok) in zip(subset, all_responses):
+    for ex, (resp, n_tok), r, ok in zip(subset, all_responses, rewards, correct_flags):
         ans = extract_answer(resp)
         if ans:
             format_ok += 1
-        r = env.reward_fn(resp, ex)
         reward_sum += r
         char_lengths.append(len(resp))
         token_lengths.append(n_tok)
@@ -94,7 +97,7 @@ def evaluate_model(
             "length_tokens": n_tok,
             "capped": capped,
         }
-        if env.is_correct(resp, ex):
+        if ok:
             correct += 1
             correct_list.append(detail)
         else:
@@ -159,24 +162,22 @@ def _eval_generate_vllm(
     vllm_worker, tokenizer, examples, env,
     batch_size: int, max_new_tokens: int,
 ) -> list[tuple[str, int]]:
-    """Greedy vLLM generation. Returns (text, generated_token_count) per example."""
+    """Greedy vLLM generation. Returns (text, generated_token_count) per example.
+
+    All prompts go in ONE generate call — vLLM's continuous batching schedules
+    them better than any outer chunking, which left the engine draining to
+    near-empty between chunks. `batch_size` only bounds the HF path's memory.
+    """
     from vllm import SamplingParams
 
-    all_out = []
-    for i in range(0, len(examples), batch_size):
-        batch = examples[i : i + batch_size]
-        prompts = [env.format_prompt(ex) for ex in batch]
-
-        sp = SamplingParams(temperature=0.0, max_tokens=max_new_tokens, n=1)
-        outputs = vllm_worker.llm.generate(
-            prompts, sp,
-            lora_request=vllm_worker._current_lora,
-            use_tqdm=False,
-        )
-        for req_output in outputs:
-            comp = req_output.outputs[0]
-            all_out.append((comp.text, len(comp.token_ids)))
-    return all_out
+    prompts = [env.format_prompt(ex) for ex in examples]
+    sp = SamplingParams(temperature=0.0, max_tokens=max_new_tokens, n=1)
+    outputs = vllm_worker.llm.generate(
+        prompts, sp,
+        lora_request=vllm_worker._current_lora,
+        use_tqdm=False,
+    )
+    return [(req.outputs[0].text, len(req.outputs[0].token_ids)) for req in outputs]
 
 
 def sample_evaluate(

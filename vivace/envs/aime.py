@@ -18,7 +18,13 @@ from typing import Callable
 
 from vivace.envs.base import Env, Example
 from vivace.envs.math_prompt import make_prompt
-from vivace.rewards import _math_correct, extract_answer, math_reward_single
+from vivace.rewards import (
+    _math_correct,
+    extract_answer,
+    math_correct_batch,
+    math_reward_batch,
+    math_reward_single,
+)
 
 
 class _AIMEBase(Env):
@@ -58,6 +64,20 @@ class _AIMEBase(Env):
         # Integer answers hit _math_correct's numeric fast path; same verifier
         # as the reward so eval accuracy and training reward can't diverge.
         return _math_correct(example.answer, extract_answer(response))
+
+    def is_correct_batch(self, responses: list[str], examples: list[Example]) -> list[bool]:
+        return math_correct_batch([ex.answer for ex in examples],
+                                  [extract_answer(r) for r in responses])
+
+    def reward_breakdown(self, responses, examples, response_token_counts=None, max_new_tokens=None):
+        # Batched so eval rewards hit the verify pool (the base default calls
+        # reward_fn per item — serial sympy).
+        return math_reward_batch(
+            responses, [ex.answer for ex in examples],
+            response_token_counts=response_token_counts,
+            max_new_tokens=max_new_tokens,
+            return_components=True,
+        )
 
 
 class AIME2024Env(_AIMEBase):
