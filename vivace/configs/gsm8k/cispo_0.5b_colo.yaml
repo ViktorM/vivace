@@ -42,7 +42,7 @@ rl:
   grad_accum_steps: 4
   optim_epochs: 2
   eta_min_ratio: 0.2
-  lr_restart: true
+  lr_restart: false
   grad_clip: 1.0
   max_new_tokens: 256
   temperature: 0.7

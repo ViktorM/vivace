@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 2x4090 3-seed gsm8k benchmark: 5 algos x 3 seeds = 15 runs at 1.5B (overnight-scale).
 #
-# Seeds are the OUTER loop (41 -> 42 -> 43) so after ~1/3 of the night we have a
+# Seeds are the OUTER loop (7 -> 13 -> 42) so after ~1/3 of the night we have a
 # full 5-algo ranking at 1 seed, firming up to mean+-std by morning. If anything
 # breaks mid-run, the completed seeds still give a usable comparison.
 #
