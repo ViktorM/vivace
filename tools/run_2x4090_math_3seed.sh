@@ -15,7 +15,7 @@ set -u
 REPO=/home/viktor/Projects/Research/vivace
 DATE_TAG=$(date +%Y%m%d_%H%M)
 STATUS_LOG=/tmp/vivace_math_3seed_status.log
-CFG_DIR=${REPO}/vivace/configs/experiments/overnight
+CFG_DIR=${REPO}/vivace/configs/experiments/v1_1.5b
 
 ALGOS=(gspo dapo cispo dr_grpo)
 SEEDS=(7 13 42)

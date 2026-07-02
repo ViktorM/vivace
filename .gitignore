@@ -35,3 +35,14 @@ adapter_sync/
 
 # Claude session artifacts
 docs/superpowers/
+
+# internal working material — not for release
+reviews/
+docs/pilot_findings.md
+docs/grpo_collapse_diagnostic.md
+docs/gspo_diagnostic.md
+docs/ablation_studies.md
+docs/vllm_v1_migration.md
+docs/tmux_quickstart.md
+docs/v1_benchmark_plan.md
+.codex

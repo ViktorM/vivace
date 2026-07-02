@@ -263,6 +263,35 @@ python -m tests.compare_sync_perf  --runs runs/<a> runs/<b> runs/<c> \
 See [`docs/weight_sync_approaches.md`](docs/weight_sync_approaches.md) for
 the design rationale and failure-mode diagnostics.
 
+## Benchmark results
+
+Five-algorithm comparison: Qwen2.5-1.5B base, LoRA r=16, 200 steps, 3 seeds
+{7, 13, 42}, 2×4090. Accuracy is greedy (T=0) on the full eval split,
+mean ± std across seeds. gsm8k column trained on gsm8k; math500 column
+trained on Hendrycks MATH.
+
+| algo | gsm8k | math500 |
+|---|---|---|
+| GSPO | 72.20 ± 0.39 | 54.73 ± 0.76 |
+| CISPO | 72.02 ± 1.25 | 54.87 ± 0.76 |
+| GRPO | 71.85 ± 0.46 | 40.87 ± 2.54 |
+| DAPO (ep=2) | 70.68 ± 1.14 | 52.20 ± 1.44 |
+| Dr.GRPO | 70.33 ± 0.83 | 54.07 ± 1.90 |
+
+![gsm8k, 5 algorithms × 3 seeds](docs/figures/v2_1.5b_gsm8k_5algo.png)
+![math500, 5 algorithms × 3 seeds](docs/figures/math_1.5b_math500_5algo.png)
+
+- The RLOO-family algorithms (Dr.GRPO / GSPO / DAPO / CISPO) land within
+  ~2-3pp of each other on both tasks — at this scale and budget the spread
+  is recipe fit (LR, update count), not algorithm.
+- GRPO matches the others on gsm8k but drops ~13pp training on MATH:
+  std-normalized advantages degrade when most rollout groups carry uniform
+  reward on a hard distribution.
+- Math training transfers: +17pp on math500 over gsm8k-training, at a ~4pp
+  gsm8k cost — worth the ~2.7× longer rollouts if you can afford them.
+- Full tables, per-seed numbers, A/Bs, and wall-clock breakdowns in
+  [docs/v1_results.md](docs/v1_results.md).
+
 ## Roadmap
 
 - [x] Composable PG zoo: GRPO / DAPO / GSPO / RLOO / Dr.GRPO / CISPO (with MiniMax-M1 mask)

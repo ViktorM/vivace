@@ -1,0 +1,63 @@
+# v1 benchmark, 1.5B / gsm8k — CISPO (full 5-algo comparison).
+# max_new=192 (gsm8k responses never approach the cap); eval on gsm8k + math500.
+model_name: Qwen/Qwen2.5-1.5B
+env_name: gsm8k
+algo_name: cispo
+mode: colocated
+trainer_gpus: [0, 1]
+rollout_gpus: [0, 1]
+use_vllm: true
+gpu_memory_utilization: 0.65   # vLLM sleeps during training; 0.65 (not 0.7) leaves ~1GB margin for a desktop session on one GPU — 1.5B DDP-colo at 0.7 OOMs in merge_adapter when the display eats 2.4GB
+enforce_eager: false
+compile_model: false
+vllm_max_model_len: 1536
+vllm_max_num_seqs: 256   # Qwen2.5 KV is small; the old 32 cap serialized eval + rollout generation
+use_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+num_steps: 200
+sft_warmup: false
+sft_warmup_steps: 0
+wandb_project: vivace
+log_interval: 1
+eval_interval: 50
+eval_n: -1
+eval_batch_size: 32
+eval_use_vllm: true
+checkpoint_interval: 200
+run_dir: runs/v1_1.5b/cispo_1.5b_gsm8k
+weight_sync_method: ipc
+seed: 42
+eval_envs: [gsm8k, math500]
+eval_max_new_tokens: [256, 1024]
+rl:
+  loss_type: cispo
+  adv_type: rloo
+  batch_size: 1
+  group_size: 8
+  lr: 6.0e-05
+  warmup_steps: 10
+  grad_accum_steps: 4
+  optim_epochs: 2
+  eta_min_ratio: 0.2
+  lr_restart: false
+  grad_clip: 1.0
+  max_new_tokens: 192
+  temperature: 0.7
+  top_p: 0.95
+  top_k: -1
+  kl_coef: 0.01
+  adv_eps: 0.0001
+  entropy_chunk_size: 64
+  entropy_grad: false
+  adaptive_sampling: true
+  oversample_factor: 2.0
+  min_reward_spread: 0.5
+  adam_beta2: 0.95
+  adam_eps: 1.0e-15
+  cispo_normalization: hybrid
+  clip_cispo_high: 5.0
+  clip_cispo_low: 0.0
+gradient_checkpointing: true
