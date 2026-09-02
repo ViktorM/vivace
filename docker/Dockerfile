@@ -1,6 +1,6 @@
 # vivace container image for modern cloud GPU pods (Runpod, Modal, etc.)
 #
-# Stack: torch 2.11 + vllm 0.20 + cu13. Requires NVIDIA driver >= 580.
+# Stack: torch 2.13.0+cu130 + vllm 0.28.0 + flash-attn 2.8.3 (from uv.lock). Requires NVIDIA driver >= 580.
 # Targets recent H100 / H200 / B200 hosts. Older pods on driver 545-575
 # will fail with "CUDA driver version is insufficient" — that is intentional;
 # vivace v0.4.3+ only supports drivers shipping CUDA 13 runtime.
@@ -21,7 +21,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # a wheel needs to compile.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv python3.12-dev python3-pip \
-        git openssh-client curl ca-certificates \
+        git openssh-client openssh-server curl ca-certificates \
         build-essential tmux \
     && rm -rf /var/lib/apt/lists/*
 # python3.12-dev gives us Python.h, which triton needs to JIT-compile its
@@ -45,7 +45,7 @@ RUN uv venv --python python3.12 && \
 # nvidia-cudnn-cu13 when cuda-toolkit is in the dependency tree, even when
 # it's locked as a direct dep — leaves torch unable to dlopen libcudnn.so.9
 # at runtime. This RUN guarantees it's there.
-RUN uv pip install --python /opt/vivace/.venv/bin/python nvidia-cudnn-cu13==9.19.0.56
+RUN uv pip install --python /opt/vivace/.venv/bin/python nvidia-cudnn-cu13==9.20.0.48   # torch 2.13.0 pins this cuDNN
 
 # Repo source (excludes via .dockerignore: runs/, .venv, wandb, etc.)
 COPY . .
@@ -79,4 +79,6 @@ WORKDIR /opt/vivace
 ENV PATH="/opt/vivace/.venv/bin:${PATH}" \
     LD_LIBRARY_PATH="/opt/vivace/.venv/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}"
 
+COPY docker/entrypoint.sh /usr/local/bin/vivace-entrypoint
+ENTRYPOINT ["/usr/local/bin/vivace-entrypoint"]
 CMD ["sleep", "infinity"]

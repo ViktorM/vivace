@@ -8,12 +8,12 @@ authors = [{ name = "Viktor Makoviichuk" }]
 license = { text = "MIT" }
 
 dependencies = [
-    "torch>=2.11",             # vllm 0.22 pins a matching torch 2.11.x anyway
-    "transformers>=4.58",      # 4.58+ adds qwen3_5; vllm 0.22 will pull in 5.6.x in fresh installs
+    "torch>=2.13",             # vllm 0.28 pins torch 2.13.0; cu130 wheels via [tool.uv.sources]
+    "transformers>=4.58",      # 4.58+ adds qwen3_5; vllm 0.28 requires >=5.5.3 (locked 5.16.1)
     "datasets>=4.0",
     "accelerate>=1.13",
     "peft>=0.19",              # LoRA
-    "vllm>=0.22",              # rollout inference; 0.21+ has tokenizer_mode="fastokens" (Rust BPE)
+    "vllm>=0.28",              # rollout inference; the PyPI wheel is a CUDA 13 build (links libcudart.so.13)
     "flash-attn>=2.8",         # trainer attn_implementation="flash_attention_2"; varlen kernels skip the O(S²) score tensor
     "wandb>=0.25",
     "pyyaml>=6.0",
@@ -68,4 +68,6 @@ torchaudio = { index = "pytorch-cu130" }
 # flash-attn's setup.py imports torch at build time to detect CUDA version + GPU arches,
 # but doesn't declare torch as a build dep. Inject it so uv sync can build the wheel.
 [tool.uv.extra-build-dependencies]
-flash-attn = ["torch"]
+# Pin to the locked torch: an unpinned build env resolves latest torch and
+# compiles flash-attn against a mismatched C++ ABI (undefined c10 symbols).
+flash-attn = ["torch==2.13.0"]
