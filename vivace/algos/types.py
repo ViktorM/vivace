@@ -170,6 +170,17 @@ def validate_rl_config(cfg: RLConfig) -> None:
             f"got {cfg.cispo_normalization!r}"
         )
 
+    # Every adv_type is group-relative: G=1 gives mean==r, std==0 -> adv==0 for
+    # all samples (rloo already raises in compute_advantages; grpo/dr_grpo didn't).
+    if cfg.group_size < 2:
+        raise ValueError(f"group_size must be >= 2, got {cfg.group_size}")
+
+    # Fail here, not after model load + vLLM boot + baseline eval.
+    if cfg.loss_type not in {"grpo", "dr_grpo", "dapo", "gspo", "cispo", "rloo", "dg", "dg_cispo"}:
+        raise ValueError(f"unknown loss_type {cfg.loss_type!r}")
+    if cfg.adv_type not in {"grpo", "dr_grpo", "rloo"}:
+        raise ValueError(f"unknown adv_type {cfg.adv_type!r}")
+
 
 # --- Preset factories — unused; values predate the v1 recipes ---
 

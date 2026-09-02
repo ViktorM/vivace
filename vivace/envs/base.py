@@ -19,6 +19,8 @@ Tool use: `MultiTurnEnv` (multiturn_base.py) extends this; skeleton only.
 
 from __future__ import annotations
 
+import inspect
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable
@@ -98,8 +100,12 @@ class Env(ABC):
         Subclasses that wrap a `*_reward_batch` (gsm8k, math, ...) override this
         to return the {component_name: per_response_list} dict for wandb logging.
         """
-        tcs = response_token_counts if response_token_counts is not None else [None] * len(responses)
         fn = self.reward_fn
-        totals = [fn(r, ex, response_token_count=tc, max_new_tokens=max_new_tokens)
-                  for r, ex, tc in zip(responses, examples, tcs)]
+        # Length kwargs feed the DAPO overlong penalty; optional in the reward_fn contract.
+        if "response_token_count" in inspect.signature(fn).parameters:
+            tcs = response_token_counts if response_token_counts is not None else [None] * len(responses)
+            totals = [fn(r, ex, response_token_count=tc, max_new_tokens=max_new_tokens)
+                      for r, ex, tc in zip(responses, examples, tcs)]
+        else:
+            totals = [fn(r, ex) for r, ex in zip(responses, examples)]
         return totals, {}

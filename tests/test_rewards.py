@@ -149,3 +149,12 @@ def test_gsm8k_correctness_rewards_comma_formatted_answer():
     )
     assert comps["correct"][0] == DEFAULT_REWARD_CONFIG.correct_bonus
     assert comps["int"][0] == DEFAULT_REWARD_CONFIG.int_bonus
+
+
+def test_overlong_penalty_rejects_buffer_wider_than_budget():
+    import pytest
+    from vivace.rewards import RewardConfig, overlong_penalty_reward
+    cfg = RewardConfig(overlong_penalty=1.0, overlong_buffer_tokens=256)
+    with pytest.raises(ValueError):
+        overlong_penalty_reward([10], max_new_tokens=192, cfg=cfg)   # safe zone would be empty
+    assert overlong_penalty_reward([100, 1024], max_new_tokens=1024, cfg=cfg) == [0.0, -1.0]

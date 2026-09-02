@@ -9,6 +9,7 @@ orchestration fields live directly on TrainerConfig.
 from __future__ import annotations
 
 import gc
+import math
 import os
 import random
 import socket
@@ -545,9 +546,13 @@ class Trainer:
         warmup_steps = cfg.rl.warmup_steps
         post_warmup = max(cfg.num_steps - warmup_steps, 1)
         eta_min = cfg.rl.lr * cfg.rl.eta_min_ratio
-        scheds = [torch.optim.lr_scheduler.LinearLR(
-            self.optimizer, start_factor=0.1, total_iters=warmup_steps)]
-        milestones = [warmup_steps]
+        # warmup_steps=0: LinearLR(total_iters=0) pins lr at 0.1x and a milestone at 0
+        # never fires, so the cosine anneals *up* from 0.1x. No ramp -> start on the cosine.
+        scheds, milestones = [], []
+        if warmup_steps > 0:
+            scheds.append(torch.optim.lr_scheduler.LinearLR(
+                self.optimizer, start_factor=0.1, total_iters=warmup_steps))
+            milestones.append(warmup_steps)
         if cfg.rl.lr_restart:
             # Restart fires at the midpoint of the whole run (step num_steps // 2),
             # so first cosine runs from end-of-warmup to that midpoint.
@@ -824,7 +829,7 @@ class Trainer:
         needs more than the gsm8k training budget). None → rl.max_new_tokens.
         """
         eval_max_new = max_new_tokens if max_new_tokens is not None else self.cfg.rl.max_new_tokens
-        n = len(eval_data) if self.cfg.eval_n <= 0 else self.cfg.eval_n
+        n = len(eval_data) if self.cfg.eval_n <= 0 else min(self.cfg.eval_n, len(eval_data))
         # Cached deterministic shuffle (cfg.seed, identical across ranks): keeps
         # contiguous slices length/difficulty-balanced on sorted datasets.
         if getattr(self, "_eval_shuffle_idxs", None) is None \
@@ -832,11 +837,13 @@ class Trainer:
             self._eval_shuffle_idxs = np.random.RandomState(self.cfg.seed).permutation(len(eval_data))
 
         subset = [eval_data[i] for i in self._eval_shuffle_idxs[:n]]
-        data_per_rank = (n + self.world_size - 1) // self.world_size
-        offset = self.rank * data_per_rank
-        local = subset[offset : offset + data_per_rank]
+        # Balanced contiguous shards (np.array_split semantics): sizes differ by
+        # <=1, so no rank is empty for any n >= world_size.
+        q, r = divmod(n, self.world_size)
+        offset = self.rank * q + min(self.rank, r)
+        local = subset[offset : offset + q + (self.rank < r)]
         local_metrics, local_correct, local_incorrect = evaluate_model(
-            self.model, self.tokenizer, local, env,
+            self._inner_model, self.tokenizer, local, env,   # DDP has no generate()
             n=-1, # already sliced
             batch_size=self.cfg.eval_batch_size,
             max_new_tokens=eval_max_new,
@@ -938,7 +945,8 @@ class Trainer:
         rl = self.cfg.rl
         B, G = rl.batch_size, rl.group_size
 
-        n_prompts_per_mb = int(rl.oversample_factor * B) if rl.adaptive_sampling else B
+        # ceil: any oversample_factor > 1.0 must give > B prompts, or the top-B filter keeps every group.
+        n_prompts_per_mb = math.ceil(rl.oversample_factor * B) if rl.adaptive_sampling else B
         n_prompts = n_prompts_per_mb * rl.grad_accum_steps # generate all prompts at once
         idxs = np.random.choice(len(self.train_data), size=n_prompts, replace=False)
 
@@ -1047,8 +1055,9 @@ class Trainer:
                 examples = [ex for ex in batch_ex for _ in range(G)]
 
                 with record_function("hf_generate"):
+                    # DDP has no generate(); use the pre-wrap peft/HF handle (same object as self.model.module)
                     full_ids, responses, plen, response_lengths = sample_responses(
-                        self.model, self.tokenizer, prompts,
+                        self._inner_model, self.tokenizer, prompts,
                         max_new_tokens=rl.max_new_tokens,
                         temperature=rl.temperature, top_p=rl.top_p,
                         device=str(self.device),
@@ -1167,7 +1176,7 @@ class Trainer:
     def _reduce_learning_metrics(metrics: dict) -> dict:
         """Cross-rank reduction of training-loop metrics. No-op at world_size==1."""
         ops = {
-            "loss": "mean", "reward": "mean", "kl": "mean", "entropy": "mean",
+            "loss": "mean", "reward": "mean", "kl": "mean",
             "length_mean": "mean",
             "reward_max": "max", "length_max": "max",
             "reward_min": "min", "length_min": "min",
@@ -1176,6 +1185,7 @@ class Trainer:
             "_advantage_sum": "sum", "_advantage_sumsq": "sum",
             "_n": "sum", "_format_ok": "sum",
             "_clip_count": "sum", "_clip_tokens": "sum",
+            "_entropy_sum": "sum", "_entropy_tokens": "sum",
         }
         agg = reduce_metrics(metrics, ops)
 
@@ -1190,7 +1200,7 @@ class Trainer:
         n_g = max(int(agg["_n"]), 1)
         out = dict(metrics)
         # Mean / extrema reductions overwrite the per-rank values.
-        for k in ("loss", "reward", "kl", "entropy", "length_mean",
+        for k in ("loss", "reward", "kl", "length_mean",
                   "reward_max", "reward_min", "length_max", "length_min"):
             out[k] = agg[k]
         out["reward_std"] = _global_std(agg["_reward_sum"], agg["_reward_sumsq"], n_g)
@@ -1198,12 +1208,13 @@ class Trainer:
         out["advantage_std"] = _global_std(agg["_advantage_sum"], agg["_advantage_sumsq"], n_g)
         out["format_rate"] = agg["_format_ok"] / n_g
         out["clip_frac"] = (agg["_clip_count"] / agg["_clip_tokens"]) if agg["_clip_tokens"] > 0 else 0.0
+        out["entropy"] = (agg["_entropy_sum"] / agg["_entropy_tokens"]) if agg.get("_entropy_tokens", 0) > 0 else 0.0
         # grad_norm passes through unreduced (already global under DDP gradient sync).
         for k in ("_n", "_format_ok",
                   "_reward_sum", "_reward_sumsq",
                   "_length_sum", "_length_sumsq",
                   "_advantage_sum", "_advantage_sumsq",
-                  "_clip_count", "_clip_tokens"):
+                  "_clip_count", "_clip_tokens", "_entropy_sum", "_entropy_tokens"):
             out.pop(k, None)
         return out
     
@@ -1421,6 +1432,9 @@ class Trainer:
                     gc.collect()
                     torch.cuda.empty_cache()
 
+            # LR that rl_step's optimizer.step() calls actually used this step —
+            # read BEFORE scheduler.step() advances it to the next step's value.
+            cur_lr = self.optimizer.param_groups[0]["lr"]
             self.scheduler.step()
 
             # --- Profiler step ---
@@ -1436,7 +1450,6 @@ class Trainer:
             with record_function("rollout_token_count"):
                 rollout_tokens = int(sum(mb["mask"].sum().item() for mb in micro_batches))
             rollout_samples = int(sum(mb["mask"].shape[0] for mb in micro_batches))
-            cur_lr = self.optimizer.param_groups[0]["lr"]
 
             # Throughput is per-rank work happening concurrently → SUM across ranks
             # for system-level numbers. Wall-clock times are bottlenecked by the

@@ -28,7 +28,7 @@ eval_batch_size: 32
 eval_use_vllm: true
 checkpoint_interval: 100
 run_dir: runs/gspo_gsm8k_0.8b_lora_vllm
-weight_sync_method: nccl
+weight_sync_method: ipc   # colocated: nccl is rejected at init (two ranks on one GPU)
 seed: 42
 rl:
   loss_type: gspo

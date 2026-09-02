@@ -285,3 +285,65 @@ def test_math_correct_batch_matches_singles_and_preserves_order():
     batch = math_correct_batch(gts, preds)
     singles = [_math_correct(g, p) for g, p in zip(gts, preds)]
     assert batch == singles == [True, True, False, True, False]
+
+
+def test_compute_advantages_hand_values_bound_and_rloo_identity():
+    from vivace.algos.policy_gradient import compute_advantages
+    G = 8
+    r = torch.tensor([[1, 0, 0, 0, 0, 0, 0, 0], [1, 1, 0, 1, 0, 0, 1, 0], [1] * 8], dtype=torch.float32)
+
+    def adv(t):
+        return compute_advantages(r, RLConfig(adv_type=t, group_size=G)).view(-1, G)
+
+    rloo, drg, grpo = adv("rloo"), adv("dr_grpo"), adv("grpo")
+    # group 0 (one correct of 8): dr_grpo = [7/8, -1/8 x7], rloo = [1, -1/7 x7]
+    assert torch.allclose(drg[0], torch.tensor([7 / 8] + [-1 / 8] * 7))
+    assert torch.allclose(rloo[0], torch.tensor([1.0] + [-1 / 7] * 7))
+    assert torch.allclose(rloo, drg * G / (G - 1))                 # same estimator up to G/(G-1)
+    assert (grpo.abs() <= (G - 1) ** 0.5 + 1e-6).all()             # population z-score bound
+    assert abs(grpo[0].abs().max().item() - (G - 1) ** 0.5) < 2e-3  # hit by a one-of-G group
+    assert (rloo[2] == 0).all() and (drg[2] == 0).all() and (grpo[2] == 0).all()
+    # z-scoring lifts a 1e-3 jitter group to unit scale; centered advantages keep the raw spread
+    jitter = torch.tensor([[0.001] + [0.0] * 7])
+    assert compute_advantages(jitter, RLConfig(adv_type="grpo", group_size=G)).abs().max() > 1.0
+    assert compute_advantages(jitter, RLConfig(adv_type="rloo", group_size=G)).abs().max() < 0.01
+
+
+def test_validate_rl_config_rejects_group_size_1_and_unknown_switches():
+    for bad in (RLConfig(group_size=1), RLConfig(loss_type="dappo"), RLConfig(adv_type="rlo")):
+        with pytest.raises(ValueError):
+            validate_rl_config(bad)
+
+
+def test_grad_clip_zero_disables_clipping_instead_of_zeroing_grads():
+    from vivace.algos.policy_gradient import build_response_mask, rl_step
+
+    class _StubModel(torch.nn.Module):
+        def __init__(self, vocab=23):
+            super().__init__()
+            self.emb = torch.nn.Embedding(vocab, vocab)
+
+        def forward(self, ids, attention_mask=None, position_ids=None):
+            class _Out: ...
+            out = _Out()
+            out.logits = self.emb(ids)
+            return out
+
+    torch.manual_seed(2)
+    model = _StubModel()
+    before = model.emb.weight.detach().clone()
+    opt = torch.optim.SGD(model.parameters(), lr=1e-1)
+    cfg = RLConfig(loss_type="grpo", adv_type="grpo", group_size=2, optim_epochs=1,
+                   kl_coef=0.0, adaptive_sampling=False, grad_clip=0.0)
+    B, S, plen = 2, 8, 3
+    full_ids = torch.randint(1, 23, (B, S))
+    resp_lens = torch.tensor([5, 3])
+    mask = build_response_mask(plen, S, resp_lens)
+    mb = {"full_ids": full_ids, "plen": plen, "adv": torch.tensor([0.5, -0.5]),
+          "old_logp": None, "ref_logp": None, "mask": mask,
+          "token_count": mask.sum(dim=1).clamp(min=1.0),
+          "responses": ["<answer>1</answer>", "x"], "rewards": torch.tensor([1.0, 0.0]),
+          "pad_token_id": 0, "response_lengths": resp_lens}
+    metrics, _ = rl_step(cfg, [mb], model, None, opt, None, step=0, kl_ema=0.0)
+    assert not torch.equal(model.emb.weight.detach(), before)   # grad_clip=0 means "off", not "zero every grad"
+    assert metrics["grad_norm"] > 0

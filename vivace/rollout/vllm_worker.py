@@ -80,7 +80,8 @@ def _apply_ipc_on_vllm_worker(worker_self):
         "init_ipc_sync must be called before update_weights_via_ipc"
     )
 
-    vllm_named = dict(mr.model.named_parameters())
+    vllm_model = mr.get_model() if hasattr(mr, "get_model") else mr.model   # >=0.28 wraps mr.model
+    vllm_named = dict(vllm_model.named_parameters())
     receiver_copy_loop(aliased, vllm_named, specs)
     # Same-device memcpy may launch async; ensure all copies committed before
     # the trainer's unmerge_adapter() runs (which mutates the source storage).
@@ -104,8 +105,9 @@ def _receive_nccl_on_vllm_worker(worker_self, specs):
     # vLLM RPC may downgrade ParamSpec dataclass to dict — coerce back.
     specs = [s if isinstance(s, ParamSpec) else ParamSpec(**s) for s in specs]
 
-    # `mr.model` path holds through vLLM 0.22; re-check on upgrades.
-    vllm_named = dict(mr.model.named_parameters())
+    # vLLM >= 0.28 wraps `mr.model` in CUDA-graph / ubatch wrappers; get_model() returns the bare module.
+    vllm_model = mr.get_model() if hasattr(mr, "get_model") else mr.model
+    vllm_named = dict(vllm_model.named_parameters())
 
     if not hasattr(mr, "_weight_sync_buffers"):
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -152,7 +154,7 @@ class VLLMRolloutWorker:
 
         old_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         if old_visible:
-            outer_list = [int(x) for x in old_visible.split(",") if x.strip()]
+            outer_list = [x.strip() for x in old_visible.split(",") if x.strip()]   # may be GPU-<uuid> / MIG-<uuid>
             physical_ids = [outer_list[g] for g in gpu_ids]
         else:
             physical_ids = list(gpu_ids)

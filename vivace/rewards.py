@@ -158,6 +158,10 @@ def overlong_penalty_reward(
     -cfg.overlong_penalty at max_new_tokens. Returns one penalty per response."""
     if cfg.overlong_penalty <= 0.0:
         return [0.0] * len(response_token_counts)
+    if cfg.overlong_buffer_tokens >= max_new_tokens:
+        raise ValueError(
+            f"overlong_buffer_tokens={cfg.overlong_buffer_tokens} >= max_new_tokens={max_new_tokens}: "
+            "safe zone is empty, every response would be penalized")
     safe_zone = max_new_tokens - cfg.overlong_buffer_tokens
     out = []
     for n in response_token_counts:

@@ -153,9 +153,9 @@ def _eval_generate_hf(
         responses = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
         # Per-row real length: count non-pad positions. pad_id == eos_id with HF's
         # default => collapses EOS into pad, but that's the same first-stop signal.
+        # A row with no EOS has rl == max_new_tokens (filled budget); an all-EOS
+        # row is an empty response with rl == 0, not a capped one.
         real_lens = (gen_only != tokenizer.eos_token_id).sum(dim=1).tolist()
-        # If a row has zero pad/eos, it filled the budget — clamp to max_new_tokens.
-        real_lens = [min(rl, max_new_tokens) if rl > 0 else max_new_tokens for rl in real_lens]
         all_out.extend(zip(responses, real_lens))
     return all_out
 

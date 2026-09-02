@@ -23,6 +23,7 @@ import os
 import sys
 
 import yaml
+from dataclasses import fields
 
 
 def _peek_mode_from_argv() -> str:
@@ -36,18 +37,28 @@ def _peek_mode_from_argv() -> str:
         which uses CUDA memory pools (PyTorch issue #147851). Must stay default.
     Returns "colocated" if config can't be parsed — safer default.
     """
+    mode = "colocated"
     try:
         argv = sys.argv
         for i, a in enumerate(argv):
             if a == "--config" and i + 1 < len(argv):
                 with open(argv[i + 1]) as f:
-                    return yaml.safe_load(f).get("mode", "colocated")
+                    mode = yaml.safe_load(f).get("mode", "colocated")
             if a.startswith("--config="):
                 with open(a.split("=", 1)[1]) as f:
-                    return yaml.safe_load(f).get("mode", "colocated")
+                    mode = yaml.safe_load(f).get("mode", "colocated")
+        # Same precedence as main(): --mode beats YAML, --set mode= beats --mode.
+        for i, a in enumerate(argv):
+            if a == "--mode" and i + 1 < len(argv):
+                mode = argv[i + 1]
+            if a.startswith("--mode="):
+                mode = a.split("=", 1)[1]
+        for i, a in enumerate(argv):
+            if a == "--set" and i + 1 < len(argv) and argv[i + 1].startswith("mode="):
+                mode = argv[i + 1].split("=", 1)[1]
     except Exception:
-        pass
-    return "colocated"
+        return "colocated"
+    return mode
 
 
 if _peek_mode_from_argv() == "disaggregated":
@@ -56,7 +67,7 @@ if _peek_mode_from_argv() == "disaggregated":
 # fragmentation mitigation in colocated mode, try `max_split_size_mb:512`
 # manually — that's pool-compatible.
 
-from vivace.algos.types import RLConfig
+from vivace.algos.types import RLConfig, validate_rl_config
 from vivace.train.trainer import Trainer, TrainerConfig
 
 
@@ -76,6 +87,7 @@ def build_trainer_config(cfg_dict: dict) -> TrainerConfig:
         cfg_dict["lora_target_modules"] = tuple(cfg_dict["lora_target_modules"])
     rl_dict = cfg_dict.pop("rl", None) or {}
     cfg_dict["rl"] = RLConfig(**rl_dict)
+    validate_rl_config(cfg_dict["rl"])   # fail on bad loss/adv/group_size here, before model load + vLLM boot
     return TrainerConfig(**cfg_dict)
 
 
@@ -88,7 +100,10 @@ def _maybe_enable_vllm_callable_rpc(cfg_dict: dict) -> None:
     (i.e., before Trainer is instantiated) so the subprocess inherits it.
     Only set when actually needed — don't relax serialization defaults otherwise.
     """
-    if cfg_dict.get("weight_sync_method") in ("nccl", "ipc"):
+    # Resolve against the dataclass default: an omitted key means TrainerConfig's
+    # "nccl", not "no sync".
+    method = cfg_dict.get("weight_sync_method", TrainerConfig.weight_sync_method)
+    if method in ("nccl", "ipc"):
         os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 
@@ -161,18 +176,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+# Declared field types as annotation strings (both modules use `from __future__ import annotations`).
+_FIELD_TYPES = {f.name: f.type for f in fields(TrainerConfig)}
+_FIELD_TYPES |= {f"rl.{f.name}": f.type for f in fields(RLConfig)}
+
+
 def _apply_set_overrides(cfg_dict: dict, overrides: list[str]) -> None:
     """Apply repeatable --set FIELD=VALUE overrides to a nested config dict.
 
-    FIELD is a dotted path (e.g. 'rl.lr' or 'lora_rank'). VALUE is yaml-parsed,
-    so '3e-5' → float, '8' → int, 'true' → bool, '[1,2]' → list. Missing nested
-    keys raise KeyError so typos fail loud rather than silently no-op.
+    FIELD is a dotted path (e.g. 'rl.lr' or 'lora_rank'). VALUE is yaml-parsed
+    ('8' → int, 'true' → bool, '[1,2]' → list) unless the declared field type
+    says otherwise: str fields keep the raw text, list/tuple fields wrap a bare
+    scalar. Missing nested keys raise KeyError so typos fail loud.
     """
     for spec in overrides:
         if "=" not in spec:
             raise ValueError(f"--set expects FIELD=VALUE, got: {spec!r}")
         key, raw = spec.split("=", 1)
         value = yaml.safe_load(raw)
+        declared = _FIELD_TYPES.get(key, "")
+        if not isinstance(value, (list, type(None))):      # a bare scalar
+            if declared.startswith(("list", "tuple")):
+                value = [value]   # not tuple("q_proj") → ('q', '_', 'p', ...)
+            elif declared.startswith("str"):
+                value = raw       # yaml 1.1: 'off' → False, '2026-09-01' → date
         parts = key.split(".")
         target = cfg_dict
         for p in parts[:-1]:

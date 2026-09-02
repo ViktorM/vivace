@@ -635,7 +635,7 @@ def rl_step(
         token_norm = total_tokens / (n * get_world_size())
 
     # Stats accumulators — only populated on the last epoch
-    tot_kl = tot_pg = tot_kl_loss = tot_ent = 0.0
+    tot_kl = tot_pg = tot_kl_loss = tot_ent = tot_ent_tok = 0.0
     tot_clip = tot_tok = 0.0
     # GSPO seq_ratio samples for p50/p99 logging (diagnoses inert trust region).
     seq_ratio_chunks: list[torch.Tensor] = []
@@ -695,7 +695,10 @@ def rl_step(
                     tot_pg += pg_loss
                     tot_kl_loss += kl_loss
                     if entropy is not None:
-                        tot_ent += (entropy * mb["mask"]).sum() / mb["mask"].sum().clamp(min=1.0)
+                        # Token-weighted (sum / tokens), not a mean of micro-batch means: the
+                        # latter depends on how the batch is sharded across grad_accum x ranks.
+                        tot_ent += (entropy * mb["mask"]).sum()
+                        tot_ent_tok += mb["mask"].sum()
 
                     # Clip fraction: GSPO counts sequences, PPO-style variants count
                     # tokens — not cross-comparable. At optim_epochs=1 old_logp IS this
@@ -732,7 +735,10 @@ def rl_step(
                         tot_clip += clipped_mask.sum().float()
                         tot_tok += mb["mask"].sum()
 
-        grad_norm = clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        # grad_clip <= 0 disables clipping (max_norm=0 would zero every grad);
+        # inf still returns the pre-clip norm for the grad_norm metric.
+        max_norm = cfg.grad_clip if cfg.grad_clip > 0 else float("inf")
+        grad_norm = clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
 
     # ===== Gather stats across all micro-batches =====
@@ -763,7 +769,7 @@ def rl_step(
             "kl": (tot_kl / n).item(),
             "clip_frac": (tot_clip / tot_tok).item() if tot_tok > 0 else 0.0,
             "grad_norm": grad_norm.item(),
-            "entropy": (tot_ent / n).item(),
+            "entropy": (tot_ent / tot_ent_tok).item() if torch.is_tensor(tot_ent_tok) and tot_ent_tok > 0 else 0.0,
             # Lengths
             "length_mean": all_token_counts.mean().item(),
             "length_std": all_token_counts.std().item() if len(all_token_counts) > 1 else 0.0,
@@ -786,6 +792,8 @@ def rl_step(
             "_length_sumsq": (all_token_counts * all_token_counts).sum().item(),
             "_advantage_sum": all_advantages.sum().item(),
             "_advantage_sumsq": (all_advantages * all_advantages).sum().item(),
+            "_entropy_sum": tot_ent.item() if torch.is_tensor(tot_ent) else float(tot_ent),
+            "_entropy_tokens": tot_ent_tok.item() if torch.is_tensor(tot_ent_tok) else float(tot_ent_tok),
             "_clip_count": tot_clip.item() if torch.is_tensor(tot_clip) else float(tot_clip),
             "_clip_tokens": tot_tok.item() if torch.is_tensor(tot_tok) else float(tot_tok),
         }
