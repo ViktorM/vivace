@@ -1,6 +1,6 @@
 # Weight Sync Approaches Across RL Frameworks
 
-A survey of how major RL-for-LLM frameworks handle the trainer ↔ rollout engine weight synchronization problem. Useful background before picking our own approach.
+A survey of how major RL-for-LLM frameworks handle the trainer ↔ rollout engine weight synchronization problem. Background for the choice in "What vivace landed on" below.
 
 ## The problem
 
@@ -129,7 +129,7 @@ When this API lands in stable vLLM, it's what everyone will use. For now, most f
 
 ## Concurrency model (why we need a background thread)
 
-For our Option A implementation (single-process trainer + vLLM subprocess sharing a NCCL group), the sender and receiver of a broadcast **must be running at the same time** — NCCL collective ops are synchronous rendezvous points. If only one side has entered `dist.broadcast(...)`, it blocks until the other side arrives.
+For our Pattern A implementation (trainer process + vLLM subprocess sharing a NCCL group), the sender and receiver of a broadcast **must be running at the same time** — NCCL collective ops are synchronous rendezvous points. If only one side has entered `dist.broadcast(...)`, it blocks until the other side arrives.
 
 In our architecture:
 - The trainer is the main Python process. After `optimizer.step()`, it calls `sync_weights()`.
@@ -181,7 +181,7 @@ thread.join() ←────────────────(thread ends)
 
 ### Alternative patterns (not used here)
 
-- **Async collective_rpc** — if your vLLM version has `collective_rpc_async` returning a future, you can call it from the main thread, then run the sender, then await. Fewer moving parts than threading. Check `dir(self.llm)` on first run.
+- **Async collective_rpc** — `LLM.collective_rpc` is sync-only through vLLM 0.28; the coroutine variant exists only on `AsyncLLM`. Fewer moving parts than threading, but only reachable if we switch engines (architecture.md, Path B).
 - **Persistent listener** — start a thread inside the vLLM worker at init time that loops on a queue or pipe, triggering `receiver_broadcast_loop` when a sync is requested. This is what slime and some OpenRLHF variants do. Avoids the per-sync `collective_rpc` overhead (~ms) but is more invasive: you must inject a long-running thread into the worker, manage its lifecycle, and handle cleanup on shutdown.
 - **Split sender across threads** — when the sender has a lot of CPU-side work per broadcast (e.g. building fused tensors via `torch.cat`), you can overlap that work with in-flight broadcasts. Marginal returns at this scale. Skip until profiling says otherwise.
 
@@ -206,7 +206,7 @@ if receiver_exc:
     raise receiver_exc[0]
 ```
 
-Not strictly required for the first working version, but worth adding before deploying.
+Done for the init rendezvous in `Trainer.__init__`; `_sync_weights_nccl`'s per-step receiver thread still doesn't.
 
 ## How generation is sequenced (sync vs async)
 
@@ -226,15 +226,15 @@ Separate from how weights flow, there's **when** generation happens relative to 
 
 Three methods, picked by `weight_sync_method` in YAML / `--weight-sync-method`:
 
-- **`nccl`** — disaggregated only (trainer and vLLM on separate GPUs). Direct
-  GPU→GPU broadcast via vLLM `collective_rpc` + Pattern A (StatelessProcessGroup
-  + PyNcclCommunicator). NCCL refuses two ranks on the same device, so this
-  fails for colocated.
-- **`ipc`** — colocated default. Trainer takes CUDA IPC handles for its
-  fused/base buffers once at init; vLLM's worker opens them and copies via
-  same-device memcpy each step. ~26% wall-clock faster than disk at 200 steps
-  on Qwen2.5-0.5B + LoRA. See `vivace/utils/ipc_sync.py`.
-- **`disk`** — fallback. Saves the LoRA adapter to `/dev/shm/vivace_sync_<tag>`
+- **`nccl`** — disaggregated only (trainer and vLLM on separate GPUs); the code
+  default. Direct GPU→GPU broadcast via vLLM `collective_rpc` + Pattern A
+  (StatelessProcessGroup + PyNcclCommunicator). NCCL refuses two ranks on the
+  same device, so init rejects it for colocated.
+- **`ipc`** — what the colocated yamls set; init rejects it elsewhere. Trainer
+  takes CUDA IPC handles for its fused/base buffers once at init; vLLM's worker
+  opens them and copies via same-device memcpy each step. ~26% wall-clock faster
+  than disk at 200 steps on Qwen2.5-0.5B + LoRA. See `vivace/utils/ipc_sync.py`.
+- **`disk`** — fallback, LoRA only. Saves the adapter to `/dev/shm/vivace_sync_<tag>`
   by default; vLLM reloads via `update_lora`. Works in any topology, slowest.
 
 Not used: Ray orchestration (verl/OpenRLHF), HTTP weight push (slime), separate
@@ -274,9 +274,9 @@ The worker prints its device as `cuda:0` because of `CUDA_VISIBLE_DEVICES` remap
 
 #### Required environment
 
-The script sets `VLLM_ALLOW_INSECURE_SERIALIZATION=1` automatically. This is **required** for vLLM 0.19.x because the default serializer refuses to pickle user-defined callables through `collective_rpc`. Without it, the worker thread errors silently and the trainer hangs at the TCP rendezvous.
+The script sets `VLLM_ALLOW_INSECURE_SERIALIZATION=1` automatically. **Required** on vLLM 0.19–0.28 (default off in `vllm/envs.py`): the default serializer refuses to pickle user-defined callables through `collective_rpc`. Without it, the worker thread errors silently and the trainer hangs at the TCP rendezvous.
 
-If you're running `collective_rpc` with callables from other scripts (e.g., a future `_init_nccl_on_worker` in `Trainer.__init__`), set the same env var before importing `vllm`, or export it in your shell.
+`train.py::_maybe_enable_vllm_callable_rpc` sets it for `nccl`/`ipc` before `Trainer` builds the vLLM subprocess. Any other script shipping callables through `collective_rpc` must set it before vLLM spawns, or export it in the shell.
 
 #### Failure modes
 
@@ -287,7 +287,7 @@ If you're running `collective_rpc` with callables from other scripts (e.g., a fu
 
 ### 2. verify_weights_match — end-to-end check against a sync backend
 
-Once the smoke test passes, validate the full sync against a known working backend (disk). Then run the same test against NCCL. The script `tests/test_weight_sync.py` runs a 3-step protocol:
+Once the smoke test passes, validate the full sync with disk, then NCCL. `tests/test_weight_sync.py` (`--method disk|nccl`, disaggregated only; `ipc` has no harness) runs a 3-step protocol:
 
 1. Fresh trainer + fresh vLLM — expect AGREE (same checkpoint loaded both sides).
 2. Perturb trainer's trainable params with gaussian noise — expect DISAGREE.
@@ -305,9 +305,9 @@ Step 1 passing proves the comparator works on identical weights. Step 2 passing 
 
 If all three steps pass, the test harness is trustworthy.
 
-- Step 1 fails → `verify_weights_match` has a bug (or HF↔vLLM baseline numerical noise exceeds the tolerance; check atol).
+- Step 1 fails → `verify_weights_match` has a bug, or HF↔vLLM baseline noise flipped the top-1 (the gate is top-1 match AND top-5 overlap ≥ 0.6; `atol` is unused). Try another `--test-prompt`.
 - Step 2 fails → perturbation too small to detect. Increase `--perturb-scale`.
-- Step 3 fails with top-1 mismatch AND `max_logprob_diff ≫ step 1's value` → NOT necessarily a sync bug. HF and vLLM use different attention kernels, rotary implementations, and norm kernels. On a perturbed (ill-conditioned) model these implementation differences amplify into large logprob gaps even when weights are bit-identical. Try `--perturb-scale 0.001` to confirm. The default (0.01) is tuned to keep the post-sync model well-conditioned enough that implementation noise stays bounded.
+- Step 3 passes iff `max_logprob_diff ≤ max(3 × step 1's, 0.5)` — no top-1 gate, since peft's LoraLinear computes `base@x + B@(A@x)` and vLLM the merged `(base + B@A)@x`, equal in math, not in bf16. Failing is NOT necessarily a sync bug: HF and vLLM use different attention, rotary and norm kernels, and on a perturbed (ill-conditioned) model these amplify into large logprob gaps even with bit-identical weights. Try `--perturb-scale 0.001` to confirm. The default (0.01) keeps the post-sync model well-conditioned enough that implementation noise stays bounded.
 
 ### 3. NCCL end-to-end
 
@@ -319,10 +319,10 @@ Only after (1) and (2) pass with disk, switch to NCCL:
     --method nccl
 ```
 
-Same expected output. If step 3 fails with NCCL but passed with disk, the bug is in your NCCL implementation — most likely a name-mapping gap in `strip_wrapper_prefixes` or a spec-ordering mismatch between sender and receiver. The script's diagnostics print top-k agreement and max logprob diff for each step, which narrows it further:
+Same expected output. If step 3 fails with NCCL but passed with disk, the bug is in the NCCL path — most likely a name-mapping gap (`canonical_named_parameters`, `strip_wrapper_prefixes`, or `FUSION_GROUPS`). Spec order can't diverge: the receiver iterates the same `specs` list the sender ships over RPC, and `receiver_broadcast_loop` asserts shape/dtype per tensor. The script's diagnostics print top-k agreement and max logprob diff for each step, which narrows it further:
 
 - `agreement ≈ 0` → broadcast wrote to wrong tensors (name mismatch).
-- `agreement ≈ 0.5` → partial sync (some params landed, others didn't — likely different iteration order).
+- `agreement ≈ 0.5` → partial sync (some params landed, others didn't).
 - `agreement ≈ 0.8 + small diff` → likely just bf16 noise, may actually be passing.
 
 ## Sources

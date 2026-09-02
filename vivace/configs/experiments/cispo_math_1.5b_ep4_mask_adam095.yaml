@@ -1,6 +1,6 @@
-# CISPO math 1.5B disagg — current best (gsm8k 68.8 / math500 28.0 @ 500 steps,
-# peak math500 31.6 at step 250). Beats DAPO winner (67.2 / 27.8) on both axes.
-# Mask formulation (MiniMax-M1 eq. 7) + ep=4 + lr=2e-5 + clip_cispo_high=5.0.
+# CISPO math 1.5B disagg — the pre-v1 headline recipe (gsm8k 68.8 / math500 28.0 @ 500
+# steps, pre-9f3027e verifier): mask formulation (MiniMax-M1 eq. 7) + ep=4 + lr=2e-5 +
+# clip_cispo_high=5.0, plus MiniMax-M1 Adam (β₂=0.95, ε=1e-15) the headline run lacked.
 model_name: Qwen/Qwen2.5-1.5B
 env_name: math
 eval_envs:

@@ -12,7 +12,7 @@ turn, sending the full prefix (prompt + concatenated prior turns) each
 call. Option B (stateful KV-cache continuation) stays documented below
 as the v1.1 perf-optimization migration target.
 
-Skeletons of the Option A implementation already exist in:
+Option A stubs (`NotImplementedError` bodies) are in:
 - [`vivace/envs/multiturn_base.py`](../vivace/envs/multiturn_base.py) — `MultiTurnEnv` ABC
 - [`vivace/envs/math_python.py`](../vivace/envs/math_python.py) — first concrete env (MATH + Python tool)
 - [`vivace/rollout/multiturn.py`](../vivace/rollout/multiturn.py) — the rollout loop
@@ -24,7 +24,7 @@ tool-output tokens are re-prefilled per call.
 - Pros: simplest to implement; no vLLM API extension; trivially
   compatible with the existing weight-sync path (NCCL / IPC) since the
   engine is reset between turns from the caller's POV; works today on
-  vLLM 0.21 unchanged.
+  vLLM 0.22 unchanged.
 - Cons: each turn pays a re-prefill on freshly-injected tool outputs;
   ~2× slower than Option B at long trajectories with many tool calls.
 
@@ -43,9 +43,9 @@ where the model stopped.
 - Cons: requires either vLLM's logits-processor hook OR a
   prefix-extension API; adds session lifecycle management; weight sync
   must coordinate with the open session. Lands cleanest after the
-  vLLM v1.1 stack (Keep Mode pause/resume — see
+  vLLM v1.x migration (Keep Mode pause/resume — see
   [`docs/vllm_v1_migration.md`](vllm_v1_migration.md) Phase 2 — which
-  is what makes Option B mechanically simple upstream).
+  makes Option B mechanically simple upstream).
 
 ## Goals
 
@@ -70,88 +70,85 @@ where the model stopped.
 
 ## Architecture
 
-### 1. `MultiTurnEnv` interface (new ABC alongside `Env`)
+### 1. `MultiTurnEnv` interface (`vivace/envs/multiturn_base.py`, subclasses `Env`)
 
 ```python
 class MultiTurnEnv(Env):
     """Env that supports tool calls during rollout."""
 
+    tool_stop_strings: tuple[str, ...] = ()   # e.g. ("</python>",)
+    max_new_tokens_per_turn: int = 512
+    max_total_tokens: int = 4096
+    max_turns: int = 8
+
     @property
     @abstractmethod
     def tool_registry(self) -> dict[str, Callable[[str], str]]:
-        """Map tool name → handler. Each handler takes the call string,
-        returns the result string. Errors are returned as text, never
-        raised (rollout must continue)."""
+        """name → handler (call str → result str). Errors return as text, never raise."""
 
     @abstractmethod
     def parse_tool_call(self, partial_response: str) -> ToolCall | None:
-        """Detect a tool call in the model's output. Return None if the
-        model is still generating freely. Return ToolCall(name, args,
-        span_start, span_end) when a call is complete and ready to
-        execute."""
+        """Called after vLLM hits a tool_stop_string; None (EOS, max_tokens,
+        malformed) means final answer."""
 
     @abstractmethod
-    def is_done(self, trajectory: list[Turn]) -> bool:
-        """Decide whether the trajectory has ended (final answer
-        produced, or budget exhausted, or unrecoverable error)."""
+    def is_done(self, traj: Trajectory) -> bool:
+        """Last assistant turn holds a final answer, or budget exhausted, or
+        EOS without a tool call."""
 ```
 
-`Turn` is a small dataclass: `(role: Literal["assistant", "tool"], text: str,
-token_ids: list[int])`.
+`ToolCall(name, args, span_start, span_end)` (spans unused by Option A, kept for
+B); `Turn(role, text, token_ids, tool_call, tool_result_summary)`;
+`Trajectory(example, prompt, prompt_token_ids, turns, total_new_tokens,
+final_reward, step_rewards)` — `response_mask` is the per-turn masks concatenated.
 
 ### 2. Rollout loop changes
 
-Today's `vllm_worker.py` does a single generation call. The multi-turn version
-loops:
+`vllm_worker.generate` only needs a `stop=` kwarg threaded into
+`SamplingParams`; the loop is `rollout_multiturn` in `vivace/rollout/multiturn.py`:
 
 ```python
 prompt = env.format_prompt(example)
-turns: list[Turn] = []
-total_new_tokens = 0
-while not env.is_done(turns) and total_new_tokens < cfg.max_total_tokens:
-    out = llm.generate(prompt + concat(turns),
-                       max_tokens=cfg.max_new_tokens,
-                       stop=tool_stop_strings)
-    turns.append(Turn("assistant", out.text, out.token_ids))
-    total_new_tokens += len(out.token_ids)
+traj = Trajectory(example, prompt, tokenize(prompt))
+while not env.is_done(traj) and traj.total_new_tokens < env.max_total_tokens:
+    out = llm.generate(prompt + concat(traj.turns),
+                       max_tokens=env.max_new_tokens_per_turn,
+                       stop=env.tool_stop_strings)
+    traj.turns.append(Turn("assistant", out.text, out.token_ids))
+    traj.total_new_tokens += len(out.token_ids)
 
     call = env.parse_tool_call(out.text)
     if call is None:
-        break   # model didn't request a tool — final answer
+        break   # no tool requested — final answer
     result = env.tool_registry[call.name](call.args)
-    turns.append(Turn("tool", result, tokenize(result)))
+    traj.turns.append(Turn("tool", result, tokenize(result)))
 ```
 
-**Loss mask construction:** the response mask flips between 1 (model-generated,
-loss applies) and 0 (tool output, no loss). This is computed alongside the
-trajectory and carried into `RolloutBatch.response_mask`.
+**Loss mask:** `build_response_arrays(traj)` flattens turns into
+`(response_token_ids, response_mask, response_text)`, mask 1 on model tokens, 0
+on tool output. The trainer derives the mask from response lengths today, so its
+`RolloutBatch` builder must take this one instead; loss code unchanged.
 
-### 3. Tokenization + KV-cache continuation (Option A path)
+### 3. Per-turn calls and prefix caching (Option A)
 
-Each loop iteration sends the full prefix (prompt + all prior turns) as a
-fresh `llm.generate()` call. vLLM's prefix caching avoids re-prefilling
-the tokens that were generated in a prior turn; only freshly-inserted
-tool-output tokens get prefilled this turn.
-
-Concretely each call looks like:
 ```
 call k: llm.generate(prompt + turn_1 + result_1 + ... + turn_{k-1} + result_{k-1},
                      stop=tool_stop_strings,
-                     max_tokens=cfg.max_new_tokens)
+                     max_tokens=max_new_tokens_per_turn)
 ```
 
-The tool output is text inserted into the running prefix wrapped in
-`<result>...</result>`. From vLLM's perspective each call is independent
-— no session state to manage. This is what makes Option A cheap to
-implement: the only "multi-turn" logic lives in the rollout loop,
-nothing in vLLM or in the weight-sync path needs to change.
+Tool output is inserted as text wrapped in `<result>...</result>`, tokenized
+with `add_special_tokens=False` (mid-trajectory tokens) and masked 0 as one
+block. From vLLM's perspective each call is independent — no session state —
+which is what makes Option A cheap: the only multi-turn logic lives in the
+rollout loop; vLLM and the weight-sync path are untouched.
 
-**Performance note.** vLLM's prefix cache is per-engine; the first turn's
-assistant tokens are still warm when call 2 issues, so the only fresh
-prefill is `len(result_1)` tokens. At MATH-level trajectories (3-5 turns,
-~200-token results), the dominant cost is still the assistant decode, not
-the re-prefill — which is why Option A is acceptable as v1. Option B will
-matter most at long trajectories (16K+ tokens, 10+ turns).
+**Performance note.** vLLM's prefix cache is per-engine; the previous turn's
+assistant tokens are still warm when call k issues, so the only fresh prefill
+is `len(result_{k-1})` tokens. At MATH-level trajectories (3-5 turns,
+~200-token results) the dominant cost is the assistant decode, not the
+re-prefill — which is why Option A is acceptable as v1. Option B will matter
+most at long trajectories (16K+ tokens, 10+ turns).
 
 ### 4. Reward shaping
 
@@ -189,14 +186,17 @@ nsjail is the lowest-overhead.
 
 ## Sequencing
 
-1. **Spec** (this doc + Viktor review)
-2. **Single-turn refactor**: introduce `MultiTurnEnv` ABC, make `Env` a
-   degenerate subclass (zero-turn rollout) so existing code path stays.
-3. **vllm_worker multi-turn loop**: implement fresh-call-per-turn path.
-4. **Loss-mask plumbing**: extend `RolloutBatch` carry over mask boundaries.
-5. **math_python env**: implement, smoke-test against MATH-500.
-6. **Sandboxing**: integrate nsjail or equivalent before any real training.
-7. **First run**: 200-step CISPO/mask/ep=4 on `math_python` env.
+1. **Spec** (this doc + Viktor review) — done.
+2. **ABC**: `MultiTurnEnv(Env)` landed; `Env` and the single-turn path untouched.
+3. **Rollout loop**: fill in `rollout/multiturn.py`; `vllm_worker.generate`
+   gains a `stop=` passthrough.
+4. **Loss-mask plumbing**: `MultiTurnRolloutOutput` → `RolloutBatch` builder;
+   loss code unchanged.
+5. **math_python env**: sandbox, `parse_tool_call`, a system prompt announcing
+   the tool; smoke-test on MATH-500.
+6. **Sandboxing**: nsjail or equivalent before any real training; the
+   `subprocess.run` placeholder is unconfined.
+7. **First run**: 200-step CISPO (canonical+hybrid, ep=4) on `math_python`.
 
 ## Out of scope for v1
 
@@ -213,7 +213,8 @@ nsjail is the lowest-overhead.
    choice.)
 2. How to handle tool-output tokens in the IS ratio? They have no policy
    logprob, so they're naturally excluded.
-3. Should `max_new_tokens` apply per-turn or to the assistant's total
-   generation across all turns? (Per-turn simpler; total enforces total budget.)
+3. ~~Per-turn or total `max_new_tokens`?~~ Both, in the skeleton:
+   `max_new_tokens_per_turn=512`, `max_total_tokens=4096`, `max_turns=8`.
 4. Long-trajectory KV-cache memory at vLLM side — need to verify Qwen2.5
-   handles 16K-token contexts in our memory budget.
+   handles 16K-token contexts in our memory budget (math configs run
+   `vllm_max_model_len: 1280` today).

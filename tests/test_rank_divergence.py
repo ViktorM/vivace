@@ -1,9 +1,9 @@
 """Verify that DDP ranks pick distinct rollouts.
 
-Tests the per-rank seeding plumbing: each rank gets `cfg.seed + rank` as its
-numpy seed, so `np.random.choice` over the train set yields different prompt
-indices per rank. If this test fails, all ranks would be sampling the same
-prompts and DDP gradient averaging collapses to single-GPU dynamics with
+Mirrors the trainer's per-rank seeding (`cfg.seed + 1000*rank`; here
+`SEED + rank`): distinct numpy seeds make `np.random.choice` over the train set
+yield different prompt indices per rank. If this fails, all ranks sample the
+same prompts and DDP gradient averaging collapses to single-GPU dynamics at
 2x the wall-clock cost.
 
 Scope:

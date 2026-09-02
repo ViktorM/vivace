@@ -4,10 +4,10 @@
 WHY THIS IS A STUB
 ==============================================================================
 
-You explicitly asked to implement the distributed + checkpoint paths
-yourself for learning value. The comments below are intentionally heavy
-on the "why" — what to save, what each piece costs, and what failure
-modes look like.
+You asked to implement checkpointing yourself for learning value. trainer.py
+already saves weights via `save_pretrained` (weight sync, `final_model`); periodic
+`ckpt-<step>` waits on `save_checkpoint`. Comments below are heavy on the "why":
+what to save, what it costs, how it fails.
 
 ==============================================================================
 WHAT TO SAVE IN A CHECKPOINT
@@ -88,7 +88,7 @@ def save_checkpoint(model, optimizer, scheduler, step: int, path: str) -> None:
             "step": step,
             "rng": {
                 "python": random.getstate(),
-                "numpy": numpy.random.get_state(),
+                "numpy": np.random.get_state(),
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all(),
             },
@@ -128,7 +128,7 @@ def load_checkpoint(path: str) -> dict:
       — DDP will move things to the right device on first forward.
     - Restore RNG state if present:
         random.setstate(ckpt["rng"]["python"])
-        numpy.random.set_state(ckpt["rng"]["numpy"])
+        np.random.set_state(ckpt["rng"]["numpy"])
         torch.set_rng_state(ckpt["rng"]["torch"])
         torch.cuda.set_rng_state_all(ckpt["rng"]["cuda"])
     """
@@ -139,7 +139,8 @@ def load_checkpoint(path: str) -> dict:
 def save_lora_adapter(model, path: str) -> None:
     """Save just the LoRA adapter (no base weights).
 
-    For peft-wrapped models. Adapter checkpoints are ~MBs, not GBs.
+    For peft-wrapped models; adapters are ~MBs, not GBs. trainer.py already
+    does this via `_inner_model.save_pretrained` on rank 0.
 
     HINTS
     -----

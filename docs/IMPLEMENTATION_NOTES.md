@@ -1,8 +1,8 @@
 # Implementation Notes
 
-What's still pending in the codebase. Priority 1 (single-GPU vertical slice)
-and Priority 5 (vLLM rollout) from the original plan are done. Update this
-file as items land.
+Pending work, landed infrastructure, and experiment notes without a home yet.
+Priority 1 (single-GPU slice) and Priority 5 (vLLM rollout) are done. Update
+as items land.
 
 ## SFT warmup
 Stubs exist; never actually needed for GSM8K + Qwen instruct. Implement when
@@ -14,53 +14,57 @@ required by an env that genuinely benefits from cold-start SFT.
 - `vivace/scripts/sft.py::main` — raises NotImplementedError
 
 ## Checkpointing
-LoRA adapter save/load works via peft for the disk weight-sync path. Full FT
-checkpoint round-trip is not wired up.
+`Trainer.train` saves the final policy to `{run_dir}/final_model` (LoRA:
+adapter + tokenizer; full FT: full HF checkpoint). No mid-run checkpoint or
+resume: the periodic `save_checkpoint` call is commented out.
 
-- `vivace/utils/checkpointing.py`: `save_checkpoint`, `load_checkpoint`,
-  `save_lora_adapter`, `load_lora_adapter`
+- `vivace/utils/checkpointing.py`: all four functions raise NotImplementedError
 - `vivace/scripts/eval.py::main` — wire up `load_checkpoint` for eval-only
 
 ## Distributed (DDP)
 
 What works:
-- N-rank DDP under torchrun in colocated mode. DDP wrap in `Trainer.__init__`
-  (peft → DDP order; `_inner_model` saved before wrap so peft methods stay
-  reachable through DDP's `__getattr__` wall).
-- Per-rank seeding (`cfg.seed + rank`) — verified by `tests/test_rank_divergence.py`.
-- Eval / logging / wandb / checkpoint-save gated on rank 0 with barriers.
-- `torch.cuda.empty_cache()` between train_phase and the next iteration's
-  vLLM wake_up (colocated only) — keeps the trainer's PyTorch allocator pool
-  from squeezing vLLM's pool over long runs (otherwise trips vLLM's
-  `freed_bytes >= 0` sleep-time assertion after several hundred steps).
-- `cfg.find_unused_parameters` exposed; default False is correct for LoRA on
-  attention+MLP projections.
+- N-rank DDP under torchrun, colocated and disaggregated. DDP wrap in
+  `Trainer.__init__` (peft → DDP order; `_inner_model` saved before wrap so
+  peft methods stay reachable through DDP's `__getattr__` wall;
+  `device_ids=[self.device.index]`, not `local_rank`, so `trainer_gpus=[2,3]`
+  works without an outer CUDA_VISIBLE_DEVICES mask).
+- Disaggregated DDP: 1:1 trainer:rollout pairing (`len(rollout_gpus) ==
+  WORLD_SIZE`, disjoint sets); each rank owns its vLLM worker and its own NCCL
+  sync comm on a rank-spaced port (29600 + 10·rank) — no global trainer↔vLLM
+  group.
+- Per-rank seeding `cfg.seed + 1000*rank` (seed 41 rank 1 ≠ seed 42 rank 0) —
+  verified by `tests/test_rank_divergence.py`.
+- Sharded eval: `_run_eval` gives each rank a contiguous slice of a seed-fixed
+  shuffle, all-reduces counts/sums, `all_gather_object`s the per-sample lists.
+  Every rank must enter `_run_eval_all` or the collectives deadlock.
+- Learning metrics reduced across ranks (`_reduce_learning_metrics`): means /
+  extrema directly, stds from Σx/Σx² (mean-of-stds under-estimates spread),
+  rates from summed counts; grad_norm passes through — DDP already averaged
+  the gradients.
 - Throughput metrics (`tokens_per_sec`, `samples_per_sec`, `rollout_tokens`,
   `rollout_samples`) summed across ranks; wall-clock times max'd across
   ranks — via `reduce_metrics` in `vivace/utils/distributed.py`.
+- DDP `no_sync()` on every micro-batch but the last per epoch in `rl_step`.
+  Bit-identical math; ~0.1% saving at LoRA r=16 / 2×4090 PCIe, ~20% at
+  full-FT 0.5B.
+- Token-mean losses (dapo; cispo token/hybrid) divide by the global token
+  count — all-reduced, then / (n_micro × world_size). Per-micro-batch or
+  per-rank denominators upweight short micro-batches and low-token ranks.
+- Allocator hygiene: colocated does `gc.collect()` + `empty_cache()` before
+  `vllm.sleep()` and `empty_cache()` before `wake_up()`, so the trainer's pool
+  doesn't squeeze vLLM's and trip its `freed_bytes >= 0` sleep assertion;
+  disaggregated does both once per step (variable-T blocks otherwise drift
+  the pool up until OOM ~step 150-200 on 1.5B + MATH).
+- `cfg.find_unused_parameters` exposed; default False is correct for LoRA on
+  attention+MLP projections.
 
-In progress:
-- Sharded eval across ranks (currently rank-0-only with a barrier on the
-  others). Eval is fast at small scale but becomes a real cost at larger
-  models / eval sets.
-- Cross-rank reduction of *learning* metrics (loss/reward/kl/grad_norm/...).
-  Helper exists; only throughput is wired today, so wandb learning curves
-  reflect rank-0-local values.
-
-Future optimizations (enable when these constraints actually bind):
-- **DDP `no_sync()` during gradient accumulation.** Suppresses all_reduce on
-  every backward except the last per optimizer step. Bit-identical math;
-  pure plumbing. At LoRA r=16 / 2 GPUs PCIe the saving is ~0.1% (below noise);
-  at full-FT 0.5B it's ~20%; at 4+ GPU or larger LoRA ranks it's a
-  meaningful win. Wire when switching to full-FT or scaling past 2 ranks.
-  ~5 lines: a `_grad_sync_ctx(model, sync_now)` helper returning
-  `model.no_sync()` if DDP-wrapped and not the last micro-batch, else
-  `nullcontext()`. Apply at the `loss.backward()` call site in `rl_step`.
-- **Disaggregated DDP (4+ GPUs).** Trainer ranks on one set of GPUs, vLLM
-  workers on another. Today's colocated DDP shares GPUs via vllm.sleep;
-  splits to separate trainer vs rollout pools when GPU count grows.
-- **Sharded vLLM weight sync (TP > 1).** v1 forces tensor_parallel_size=1.
-  Lifting requires per-shard handle building in `pack_ipc_handles`.
+Not done:
+- **Sharded vLLM weight sync (TP > 1).** `tensor_parallel_size != 1` raises
+  at init; the worker hard-codes `tp_rank = 0` and `pack_ipc_handles` builds
+  one handle per full tensor.
+- **Dedicated eval workers** (`cfg.eval_gpus`): field exists, construction is
+  a TODO; eval reuses the rollout worker.
 
 ## Training-quality ideas to explore later
 

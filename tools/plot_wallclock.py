@@ -3,7 +3,7 @@
 Figure 1 (v2 only): per-algo per-step time breakdown (rollout / train / other)
 and total run wall-clock per seed.
 Figure 2 (v1 vs v2): optimization impact — total run minutes and per-step
-breakdown, last night's pre-optimization runs vs today's.
+breakdown, pre-optimization v1 (20260609) vs v2 (20260610).
 
 Run: .venv/bin/python tools/plot_wallclock.py [--v1-date 20260609_0140] [--v2-date 20260610_1029]
 """

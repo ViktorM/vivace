@@ -1,6 +1,5 @@
-# CISPO math 1.5B disagg — current best (gsm8k 68.8 / math500 28.0 @ 500 steps,
-# peak math500 31.6 at step 250). Beats DAPO winner (67.2 / 27.8) on both axes.
-# Canonical clipped-IS CISPO + hybrid normalization + ep=4 + lr=2e-5.
+# CISPO math 1.5B ablation off math/cispo_2x4090.yaml (canonical clipped-IS + hybrid
+# normalization, ep=4, lr=2e-5) at 500 steps: kl_coef 0.01 -> 0.02.
 model_name: Qwen/Qwen2.5-1.5B
 env_name: math
 eval_envs:

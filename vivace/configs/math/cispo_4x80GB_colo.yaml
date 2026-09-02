@@ -3,10 +3,10 @@
 # the 1x and 2x configs: bs=4, gs=8, accum=2 → 64 traj per rank per
 # optimizer step. Global = 4 × 64 = 256 trajectories/step.
 #
-# At 256 traj/step we're 2× the validated 4090 desktop scale. The lr
-# is left at 2e-5 (no scaling rule applied) — adjust upward if the
-# scaling experiment shows the optimizer is undershooting; downward if
-# the larger batch causes early entropy collapse.
+# At 256 traj/step we're 8× the 4090 desktop's 32 (2× the 2-GPU colo config).
+# The lr is left at 2e-5 (no scaling rule applied) — adjust upward if the
+# scaling experiment shows the optimizer is undershooting; downward if the
+# larger batch causes early entropy collapse.
 #
 # Launch with: torchrun --nproc_per_node=4 -m vivace.scripts.train ...
 model_name: Qwen/Qwen2.5-1.5B

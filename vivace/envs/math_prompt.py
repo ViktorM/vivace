@@ -1,4 +1,4 @@
-"""Shared prompt for the LaTeX-answer math envs (MATHEnv, MATH500Env, AIMEEnv).
+"""Shared prompt for the LaTeX-answer math envs (MATHEnv, MATH500Env, AIME*Env).
 
 Identical wording to GSM8K's prompt — keeps the comparison across math benchmarks
 (GSM8K → MATH-500 → AIME) honest by holding the schema fixed.

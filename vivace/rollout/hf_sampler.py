@@ -1,12 +1,9 @@
-"""Hugging Face `model.generate` rollout — single-GPU dev path.
+"""Hugging Face `model.generate` rollout — single-GPU dev path (`use_vllm: false`).
 
-For early development and CI smoke tests, you don't want vLLM in the
-critical path. This module wraps `model.generate` in the same interface
-the trainer expects from a rollout backend, so you can train end-to-end
-without ever building a vllm.LLM.
-
-When you outgrow this (anything beyond ~hundreds of prompts/min on
-single GPU), switch the trainer over to `vivace/rollout/vllm_worker.py`.
+Wraps `model.generate` in the rollout-backend interface the trainer expects, so
+smoke tests and early dev train end-to-end without building a vllm.LLM. Tops
+out at ~hundreds of prompts/min on one GPU; past that use `vllm_worker.py`
+(`use_vllm: true`, the default).
 """
 
 from __future__ import annotations
@@ -38,26 +35,18 @@ def sample_responses(
 
     BATCHING NOTE
     -------------
-    This is a single batched `model.generate` call — `len(prompts)` forward
-    passes happen in parallel, one kernel launch, one KV cache allocation.
-    It is NOT a Python loop over prompts.
+    One batched `model.generate` call, not a Python loop: all `len(prompts)`
+    sequences decode in lockstep, sharing each step's kernels and one KV cache.
 
-    For GROUP sampling (G responses per unique prompt, as in GRPO), the
-    caller duplicates each prompt G times in the input list:
+    GROUP sampling (G responses per prompt, as in GRPO): the caller repeats each
+    prompt G times (trainer: `np.repeat(prompts, G)`); `do_sample=True` +
+    temperature gives each copy a different continuation. This function is
+    group-unaware — B*G prompts in, B*G responses out.
 
-        prompts = [p for ex in batch_ex for p in [make_prompt(ex)] * G]
-
-    Each duplicate gets a different continuation because `do_sample=True`
-    + temperature introduces sampling noise. This function is unaware of
-    groups — it just sees B*G distinct prompts and returns B*G responses.
-
-    This is slightly wasteful on the prompt side: HF recomputes the prompt
-    KV cache G times (once per duplicate). vLLM's `SamplingParams(n=G)`
-    is the more efficient production path — it shares the prompt KV cache
-    across siblings and only diverges during the decode phase. See
-    `vivace/rollout/vllm_worker.py::generate`. `hf_sampler` trades that
-    efficiency for simplicity and zero non-torch dependencies, which is
-    what you want during single-GPU dev.
+    Cost: HF prefills the prompt KV G times, once per copy. vLLM's
+    `SamplingParams(n=G)` shares the prompt KV across siblings and diverges only
+    at decode (`vllm_worker.py::generate`); hf_sampler trades that for
+    simplicity and zero non-torch dependencies.
 
     THEORY
     ------

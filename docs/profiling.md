@@ -19,9 +19,9 @@ Run training as usual:
 vivace-train --config vivace/configs/your_config.yaml --num-steps 10
 ```
 
-After step 8, the profiler will:
-1. Print a summary table to console (top CUDA kernels, CPU operators, memory allocators)
-2. Save a Chrome trace to `{run_dir}/profiling/trace_step5-8.json`
+Step 5 is the profiler's warmup; steps 6-7 are recorded. After step 8 it writes to `{run_dir}/profiling/`:
+1. `trace_step5-8_<timestamp>.json` — Chrome/Perfetto trace
+2. `summary_step5-8_<timestamp>.txt` — top CUDA kernels, CPU operators, memory allocators
 
 ## Viewing the trace
 
@@ -29,7 +29,7 @@ Open the trace in either:
 - **Chrome**: navigate to `chrome://tracing`, click "Load", select the `.json` file
 - **Perfetto**: go to https://ui.perfetto.dev, drag and drop the file
 
-The trace shows a timeline of all CUDA kernels, CPU operators, and memory events across the profiled steps. You can zoom into individual steps to see rollout vs. train phase breakdown at the kernel level.
+The trace shows CUDA kernels, CPU operators, and memory events across the profiled steps. Phases are named `record_function` ranges: `step_N` → `rollout` / `train_phase` / `vllm_wake_up` / `weight_sync`.
 
 ## Config options
 
@@ -47,7 +47,7 @@ profiling:
 
 ### Choosing the profiling window
 
-- **Skip warmup**: the first few steps have JIT compilation, CUDA allocator warmup, and vLLM initialization overhead. Start at step 5+ for representative numbers.
+- **Skip warmup**: early steps carry CUDA allocator warmup and first-call kernel selection (vLLM is built before step 0). Start at step 5+ for representative numbers.
 - **Keep it short**: 3-5 steps is enough. Profiling adds overhead (~10-20%) and traces grow large.
 - **For before/after comparisons**: use the same window (e.g., steps 5-8) across both runs.
 
@@ -55,9 +55,9 @@ profiling:
 
 When `with_stack: true`, the trace includes Python call stacks for each operator. This lets you see *which line of code* launched each kernel. Very useful for understanding unfamiliar code paths, but roughly doubles profiling overhead. Use it for targeted debugging, not routine profiling.
 
-## Reading the summary table
+## Reading the summary file
 
-The console output includes three tables:
+`summary_step*_<timestamp>.txt` holds three tables:
 
 1. **Top CUDA kernels by GPU time** — shows which GPU operations dominate. Look for:
    - `aten::mm` / `aten::bmm` — matrix multiplications (forward + backward)
@@ -69,22 +69,18 @@ The console output includes three tables:
 
 3. **Top memory allocators** — shows which operators allocate the most GPU memory.
 
-## Example: profiling before/after NCCL weight sync
+## Example: profiling disk vs NCCL weight sync
+
+Same disaggregated config and window; flip `--weight-sync-method disk` /
+`nccl` between the two launches, each with its own `output_dir`:
 
 ```yaml
-# Before: disk-based LoRA sync
 profiling:
   enabled: true
   start_step: 5
   end_step: 8
-  output_dir: runs/profile_disk_sync
-
-# After: NCCL weight sync (same config, different output_dir)
-profiling:
-  enabled: true
-  start_step: 5
-  end_step: 8
-  output_dir: runs/profile_nccl_sync
+  output_dir: runs/profile_disk_sync   # runs/profile_nccl_sync for the nccl launch
 ```
 
-Compare the sync_weights time in the summary tables and visually in the traces.
+Compare the `weight_sync` range in the two traces and `nccl*` kernels in the
+summary tables.

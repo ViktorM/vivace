@@ -12,7 +12,7 @@ Usage:
 
     # Anything else via the generic --set escape hatch (dotted path, yaml value):
     vivace-train --config <path> --set rl.clip_cispo_high=10.0 \
-                                 --set adam_beta2=0.95 \
+                                 --set rl.adam_beta2=0.95 \
                                  --set rl.lr_restart=true
 """
 
@@ -68,12 +68,9 @@ def load_config(path: str) -> dict:
 def build_trainer_config(cfg_dict: dict) -> TrainerConfig:
     """Instantiate TrainerConfig from a parsed YAML dict.
 
-    The YAML uses a nested `rl:` block for RL hyperparameters (see RLConfig).
-    This helper converts that nested dict into an RLConfig instance before
-    constructing TrainerConfig, since dataclasses don't auto-convert nested
-    dicts into nested dataclasses.
-
-    Tuple fields (e.g. lora_target_modules) are also coerced from YAML lists.
+    The nested `rl:` block becomes an RLConfig (dataclasses don't auto-convert
+    nested dicts); `lora_target_modules` is coerced from YAML list to tuple.
+    `profiling:` stays a dict — Trainer builds ProfilingConfig from it.
     """
     if "lora_target_modules" in cfg_dict:
         cfg_dict["lora_target_modules"] = tuple(cfg_dict["lora_target_modules"])
@@ -106,11 +103,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     # --- Algorithm / loss ---
     p.add_argument("--algo", type=str, default=None,
-                   help="override algo_name (cispo / dapo / gspo / grpo)")
+                   help="override algo_name (grpo / dr_grpo / dapo / gspo / cispo); label only, dispatch is --loss/--adv")
     p.add_argument("--loss", type=str, default=None,
                    help="override rl.loss_type")
     p.add_argument("--adv", type=str, default=None,
-                   help="override rl.adv_type (rloo / grpo)")
+                   help="override rl.adv_type (grpo / dr_grpo / rloo)")
 
     # --- Most-tweaked RL hyperparameters ---
     p.add_argument("--lr", type=float, default=None, help="override rl.lr")
@@ -154,12 +151,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="override TrainerConfig.wandb_group (clusters runs in wandb UI)")
 
     # --- Generic escape hatch for any other field ---
-    # Apply repeatedly: --set rl.clip_cispo_high=10.0 --set adam_beta2=0.95
+    # Repeatable: --set rl.clip_cispo_high=10.0 --set rl.adam_beta2=0.95
     # Values are yaml-parsed so types are inferred (int, float, bool, str, list).
     p.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE",
                    dest="overrides",
                    help="dotted-path override of any config field, e.g. "
-                        "'--set rl.lora_dropout=0.05 --set adam_beta2=0.95'. Repeatable.")
+                        "'--set lora_dropout=0.05 --set rl.adam_beta2=0.95'. Repeatable.")
 
     return p.parse_args(argv)
 

@@ -1,10 +1,10 @@
 """View training plots from a saved stats file.
 
-Usage:
-    python -m vivace.scripts.plot runs/gspo_gsm8k_0.8b_lora/stats.pt
-    python -m vivace.scripts.plot runs/gspo_gsm8k_0.8b_lora/stats.pt --save
-    python -m vivace.scripts.plot runs/gspo_gsm8k_0.8b_lora/stats.pt --only perf
-    python -m vivace.scripts.plot run1/stats.pt run2/stats.pt --compare
+Usage (the trainer writes `<run_dir>/stats_<loss>_<adv>_<N>steps_<timestamp>.pt`):
+    python -m vivace.scripts.plot runs/gspo_gsm8k/stats_*.pt
+    python -m vivace.scripts.plot runs/gspo_gsm8k/stats_*.pt --save
+    python -m vivace.scripts.plot runs/gspo_gsm8k/stats_*.pt --only perf
+    python -m vivace.scripts.plot runs/a/stats_*.pt runs/b/stats_*.pt --compare
 """
 
 from __future__ import annotations

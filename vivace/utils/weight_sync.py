@@ -1,6 +1,6 @@
-"""NCCL-based weight synchronization between trainer and vLLM worker.
-
-Direct GPU→GPU broadcast that replaces disk-based LoRA adapter loading.
+"""NCCL weight sync (trainer → vLLM worker, disaggregated) plus the spec/name
+helpers `ipc_sync.py` reuses (colocated). Both supersede the disk adapter
+reload (`weight_sync_method: disk`, still the fallback).
 See docs/weight_sync_approaches.md for the library survey and design notes.
 """
 
@@ -116,8 +116,9 @@ FUSION_GROUPS = [
 
 
 def build_param_specs(model: nn.Module, filter_fn=None, fuse=True) -> list[ParamSpec]:
-    """Build a sorted list of ParamSpec. `filter_fn(name, p) -> bool` to keep
-    only a subset (e.g. LoRA). Sort is what guarantees sender/receiver order match.
+    """Returns (specs sorted by name, fusion_map). `filter_fn(name, p) -> bool` keeps
+    a subset (e.g. LoRA targets). Both sides iterate this same list, so the sort only
+    makes the order deterministic.
 
     Names are canonical HF names (peft `.base_layer.` segments stripped, LoRA
     adapter params skipped). For NCCL sync of LoRA models, callers must call
@@ -193,7 +194,7 @@ def allocate_fused_buffers(model, specs, device):
 
 
 def is_lora_param(name: str, _p: nn.Parameter) -> bool:
-    """Filter for build_param_specs: LoRA adapter params only."""
+    """Unused, and inert as a build_param_specs filter: canonical names drop `lora_*`."""
     return "lora_" in name
 
 
@@ -233,10 +234,8 @@ def sender_broadcast_loop(
     is a rendezvous. `specs` is the contract: sender + receiver iterate in the
     same order, or they deadlock / misroute tensors.
     """
-    # Canonical names match what's in `specs` and `fusion_map` (peft `.base_layer.`
-    # stripped, LoRA adapter params dropped). For LoRA + NCCL, the caller has
-    # already merge_adapter()'d so the canonical-named base tensors hold the
-    # merged base+LoRA values.
+    # Canonical names match `specs` / `fusion_map`; for LoRA the caller has
+    # merge_adapter()'d, so these base tensors already hold merged base+LoRA.
     named = dict(canonical_named_parameters(model))
 
     for spec in specs:

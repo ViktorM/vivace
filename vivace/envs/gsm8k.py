@@ -1,12 +1,9 @@
 """GSM8K environment.
 
-Parsing, prompt formatting, and reward wiring for GSM8K. Loads
-`openai/gsm8k` via HuggingFace datasets, parses the `####`-delimited
-answer field, and exposes the train/test splits as `Example` lists.
-
-The system prompt asks the model to respond in
-`<think>...</think><answer>...</answer>` format. This makes the format
-rewards in `vivace/rewards.py` meaningful.
+Loads `openai/gsm8k` (HF datasets), splits the `####`-delimited answer field
+into reasoning + final answer, and exposes train/test as `Example` lists. The
+system prompt requests `<think>...</think><answer>...</answer>`, which is what
+the format rewards in `vivace/rewards.py` score.
 """
 
 from __future__ import annotations

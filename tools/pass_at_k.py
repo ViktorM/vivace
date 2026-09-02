@@ -40,7 +40,7 @@ def load_env(name: str):
 
 
 def is_correct(env_name: str, response: str, answer: str) -> bool:
-    """Reuse the SAME correctness reward the trainer logs as eval/{env}/accuracy."""
+    """Same matcher env.is_correct uses for eval/{env}/accuracy_pct."""
     from vivace.rewards import correctness_reward, math_correctness_reward
     if env_name == "gsm8k":
         return correctness_reward([response], [answer])[0] > 0

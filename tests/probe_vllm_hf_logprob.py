@@ -1,10 +1,11 @@
 """Probe: do vLLM's returned logprobs match an HF forward at the same temperature?
 
-This is the load-bearing question for the (3) optimization (use vLLM logprobs as
-old_log_prob and skip the recompute forward). If vLLM applies temperature inside
-its softmax-for-logprobs the way our `compute_token_logprobs(logits / T)` does,
-the two paths agree within bf16 numerics. If vLLM returns something else (raw
-log_softmax, top-p-renormalized, etc.), we'd silently corrupt importance ratios.
+This was the load-bearing question for the (3) optimization (use vLLM logprobs as
+old_log_prob, skip the recompute forward): if vLLM's logprobs are not
+log_softmax(logits / T) like `compute_token_logprobs`, importance ratios corrupt
+silently. Outcome: they are (vllm_worker.py sets logprobs_mode="processed_logprobs"),
+but (3) was dropped anyway — the peft-unmerged vs vLLM-merged bf16 gap biases the
+ratios, so trainer.py reuses rl_step's epoch-1 forward as old_logp.
 
 Protocol:
   1. Build vLLM, sample N tokens at temperature T with logprobs=0.
@@ -13,8 +14,9 @@ Protocol:
   4. Repeat at multiple temperatures (1.0, 0.9, 0.5) — if disagreement scales
      with (1/T - 1), vLLM is not applying T.
 
-Pass criterion: max_abs_diff < 0.05 across all temperatures (bf16 floor between
-vLLM's fused kernels and HF's separate kernels is ~0.01-0.03 in practice).
+Pass criterion: max_abs_diff < BF16_FLOOR (0.5) at every T, and max|Δ| at the
+smallest T < 4x its T=1.0 value (a vLLM ignoring T scales with 1/T - 1).
+bf16 floor is ~0.1-0.3 in practice; fp32 ~1e-3-2e-2.
 
 Usage:
     .venv/bin/python -m tests.probe_vllm_hf_logprob \\

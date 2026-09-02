@@ -2,8 +2,8 @@
 
 These are deliberately data-only — no methods, no ABCs, no factories.
 
-`RolloutBatch` is what a rollout phase produces and what the loss
-functions consume. `RLConfig` has two string fields (`loss_type`,
+`RolloutBatch` is documentation only — `rollout_phase` hands `rl_step` plain
+dicts and nothing constructs it. `RLConfig` has two string fields (`loss_type`,
 `adv_type`) that drive composable dispatch in
 `vivace/algos/policy_gradient.py`. `SFTConfig` is a small companion
 for the optional SFT warmup path.
@@ -49,18 +49,18 @@ class RLConfig:
     """
 
     # --- Algorithm switches ---
-    loss_type: str = "grpo"   # grpo | dr_grpo | dapo | gspo | cispo | dg | dg_cispo | rloo
+    loss_type: str = "grpo"   # grpo | dr_grpo | dapo | gspo | cispo | rloo (dg | dg_cispo: stubs)
     adv_type: str = "grpo"    # grpo (z-scored) | dr_grpo (no std) | rloo (leave-one-out)
 
     # --- Training ---
-    steps: int = 100
+    steps: int = 100               # unread; the trainer runs TrainerConfig.num_steps
     batch_size: int = 1
     group_size: int = 8
     lr: float = 1e-6
     warmup_steps: int = 10
     grad_clip: float = 1.0
     grad_accum_steps: int = 4
-    optim_epochs: int = 2          # RLOO should use 1
+    optim_epochs: int = 2          # RLOO: validate_rl_config forces 1
 
     # --- LR schedule (post-warmup cosine) ---
     eta_min_ratio: float = 0.2     # cosine floor as fraction of peak lr (peak * ratio = eta_min)
@@ -71,7 +71,7 @@ class RLConfig:
     adam_beta2: float = 0.999      # MiniMax-M1 / CISPO paper uses 0.95
     adam_eps: float = 1e-8         # MiniMax-M1 / CISPO paper uses 1e-15
 
-    # --- Adaptive LR (DAPO-style) ---
+    # --- Adaptive LR — inert: rl_step's block is `pass` ---
     use_adaptive_lr: bool = False
     kl_target: float = 0.05
     kl_factor: float = 1.5         # how far from target triggers adjustment
@@ -89,7 +89,7 @@ class RLConfig:
     # --- Clipping ---
     clip_low: float = 0.2          # epsilon_low
     clip_high: float = 0.2         # epsilon_high (set > clip_low for DAPO), but asymmetric can be used with other algorithms
-    clip_ratio: float = 0.25       # PPO-style clip (referenced by some variants; currently unused by default loss)
+    clip_ratio: float = 0.25       # unread by any loss (compute_loss uses clip_low/clip_high); kept because yamls set it
     clip_cispo_high: float = 5.0   # CISPO upper IS-weight cap. Paper tunes this side.
     clip_cispo_low: float = 0.0    # CISPO lower IS-weight floor. 0.0 disables lower clipping.
     # Canonical CISPO keeps all token gradients. Eq. 7 / PPO-style dropping is opt-in.
@@ -100,9 +100,9 @@ class RLConfig:
 
     # --- KL ---
     kl_coef: float = 0.02          # KL regularization coefficient (some implementations call this kl_beta)
-    adv_eps: float = 1e-4
+    adv_eps: float = 1e-4          # std floor of the grpo z-score
 
-    # --- DG (delight-gating) ---
+    # --- DG (delight-gating) — stub; dg_eta unread ---
     dg_eta: float = 1.0
 
     # --- Adaptive sampling (DAPO-style) ---
@@ -111,8 +111,8 @@ class RLConfig:
     # See docs/pilot_findings.md for the cross-algo evidence.
     adaptive_sampling: bool = True
     oversample_factor: float = 2.0
-    reward_threshold: float = 1.8  # responses above this count as "correct"
-    min_reward_spread: float = 0.5
+    reward_threshold: float = 1.8  # unread
+    min_reward_spread: float = 0.5 # alive_rate metric only; the filter keeps the top-B groups by spread
 
     # --- Memory / numerics ---
     # Chunk entropy along the time axis in `compute_token_logprobs` to bound
@@ -123,7 +123,7 @@ class RLConfig:
     # savings — backprop through entropy then silently yields zero gradients.
     entropy_grad: bool = False
 
-    # --- Logging ---
+    # --- Logging (unread; trainer mirrors its own log_interval here) ---
     log_interval: int = 10
     preview_interval: int = 100
 
@@ -133,7 +133,7 @@ class RLConfig:
 
 
 def validate_rl_config(cfg: RLConfig) -> None:
-    """Check for known-bad config combinations. Warns and fixes in-place."""
+    """Warn+fix known-bad combos; raise on invalid CISPO settings."""
     import warnings
 
     if cfg.loss_type == "rloo" and cfg.optim_epochs != 1:
@@ -171,7 +171,7 @@ def validate_rl_config(cfg: RLConfig) -> None:
         )
 
 
-# --- Preset factories ---
+# --- Preset factories — unused; values predate the v1 recipes ---
 
 def grpo_config(**kw) -> RLConfig:
     return RLConfig(loss_type="grpo", adv_type="grpo", **kw)

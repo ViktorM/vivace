@@ -64,11 +64,9 @@ DTYPE_MAP = {
 
 @dataclass
 class TrainerConfig:
-    """Trainer orchestration config. RL-math hyperparameters live in the
-    nested `rl: RLConfig` — see `vivace/algos/types.py`. This separation
-    keeps training infrastructure (model loading, device placement, logging)
-    distinct from the algorithm itself, and lets `rl_step` consume `RLConfig`
-    directly without the trainer re-translating fields.
+    """Trainer orchestration config. RL-math hyperparameters live in the nested
+    `rl: RLConfig` (vivace/algos/types.py) so `rl_step` consumes it directly and
+    infrastructure (model loading, device placement, logging) stays out of the algorithm.
     """
 
     # ----- what to train -----
@@ -87,15 +85,12 @@ class TrainerConfig:
     # env_name is a single string (backward-compat); must be set explicitly
     # when env_name is a list.
     eval_envs: list[str] | None = None
-    # Per-eval-env constructor kwargs (parallel list to eval_envs). None →
-    # no overrides. Most evals use vanilla envs, so this stays None for most
-    # configs; set only when an eval env needs custom reward params.
+    # Per-eval-env constructor kwargs (parallel list to eval_envs); None → vanilla
+    # envs. Set only when an eval env needs custom reward params.
     eval_env_kwargs: list[dict] | None = None
-    # Per-eval-env generation budget (parallel list to eval_envs). None → every
-    # eval env uses rl.max_new_tokens. Set this when an eval env needs a longer
-    # budget than training: e.g. train gsm8k at max_new=256 but eval AIME at
-    # 4096, since AIME chain-of-thought is much longer and would otherwise be
-    # truncated to an artificial 0%.
+    # Per-eval-env generation budget (parallel list to eval_envs); None → rl.max_new_tokens
+    # everywhere. For evals needing more than the training budget: train gsm8k at
+    # max_new=256, eval AIME at 4096 — its chain-of-thought truncated at 256 reads as 0%.
     eval_max_new_tokens: list[int] | None = None
     algo_name: str = "grpo"
 
@@ -130,17 +125,16 @@ class TrainerConfig:
     # ----- training loop orchestration -----
     num_steps: int = 500
     use_vllm: bool = True
-    gpu_memory_utilization: float = 0.4  # only used when use_vllm = True
+    gpu_memory_utilization: float = 0.4  # vLLM's GPU share; shipped: 0.8 disagg, 0.5-0.7 colo (vLLM sleeps during train)
     enforce_eager: bool = False          # disable CUDA graphs in vLLM (safer for weight updates, slower)
     vllm_max_model_len: int | None = None   # cap vLLM's context window. None → use model default (huge for Qwen3.5)
     vllm_max_num_seqs: int | None = None    # cap vLLM's concurrent-decode count. Qwen3.5 needs this to fit Mamba cache.
 
     # ----- RL hyperparameters (algorithm, optimizer, clipping, generation, adaptive sampling/LR) -----
-    # Previously ~25 fields were duplicated here and copied into RLConfig at __init__.
-    # Now they live canonically in RLConfig and are accessed via cfg.rl.X.
+    # Canonical home; the trainer reads them as cfg.rl.X.
     rl: RLConfig = field(default_factory=RLConfig)
 
-    # ----- SFT warmup (optional) -----
+    # ----- SFT warmup (stub) -----
     sft_warmup: bool = False
     sft_warmup_steps: int = 0
 
@@ -148,7 +142,7 @@ class TrainerConfig:
     eval_n: int = 500               # number of eval examples; <=0 = full eval set
     eval_batch_size: int = 32        # batch size for eval generation
     eval_use_vllm: bool = True       # use vLLM for eval when available (much faster)
-    eval_gpus: list[int] = field(default_factory=list)  # separate eval GPUs (empty = use rollout worker)
+    eval_gpus: list[int] = field(default_factory=list)  # inert: TODO stub in __init__; eval reuses the rollout worker
 
     # ----- training-data filter -----
     # Drop training prompts whose tokenized length exceeds this. Bounds the
@@ -160,38 +154,35 @@ class TrainerConfig:
     # ----- logging -----
     wandb_project: str = "vivace"
     wandb_run_name: str | None = None
-    # Optional wandb group: runs that share a group cluster together in the
-    # wandb UI (good for seed sweeps — set the group in the YAML once, vary
-    # --seed and --run-dir per launch, all runs show up grouped).
+    # wandb group = aggregation bucket: set once in the YAML, vary --seed and
+    # --run-dir per launch, and the seeds plot grouped in the UI.
     wandb_group: str | None = None
     log_interval: int = 1
     eval_interval: int = 50
-    checkpoint_interval: int = 100
+    checkpoint_interval: int = 100  # inert stub; only final_model is saved
     run_dir: str = "runs/default"
 
     # ----- profiling -----
     profiling: dict | None = None    # maps to ProfilingConfig; None = disabled
 
     # ----- weight sync -----
-    # "nccl": direct GPU->GPU broadcast via vLLM collective_rpc (default, fast).
-    #         Works for full FT and LoRA (LoRA via merge-broadcast-unmerge).
-    # "disk": LoRA adapter save + vLLM LoRARequest reload (simple, slower, kept
-    #         as a fallback for debugging and as a reference path).
+    # "nccl": GPU->GPU broadcast via vLLM collective_rpc (default; disaggregated only).
+    #         Full FT and LoRA (merge-broadcast-unmerge).
+    # "ipc":  colocated only; vLLM aliases the trainer's buffers via CUDA IPC handles
+    #         taken once at init, so each sync is one same-device copy.
+    # "disk": LoRA adapter save + vLLM LoRARequest reload (slow debugging fallback).
     weight_sync_method: str = "nccl"
-    # Where the disk-sync path writes the adapter. None auto-picks /dev/shm (tmpfs,
-    # RAM-backed) on Linux, falling back to run_dir if /dev/shm isn't a directory.
-    # tmpfs is ~10× faster than NVMe for the small adapter files; persistence isn't
-    # needed (each step overwrites). Override to a regular path if you want the
-    # adapter on disk for inspection.
+    # Disk-sync adapter location. None → /dev/shm/vivace_sync_<run_basename> (tmpfs,
+    # ~10× faster than NVMe for the small adapter files; each step overwrites, so
+    # persistence is moot), or run_dir/adapter_sync when /dev/shm isn't a directory.
+    # Set a regular path to keep the adapter on disk for inspection.
     weight_sync_disk_path: str | None = None
 
     # ----- DDP -----
-    # Set True when not every trainable parameter participates in every forward
-    # pass (e.g. LoRA on `embed_tokens` with conditional paths, or full-FT with
-    # frozen layer ranges). False is correct for typical LoRA on attention/MLP
-    # projections — every forward touches every adapter, and the extra graph
-    # traversal `True` triggers slows each step. DDP itself warns at run time
-    # if you have it set to True with no actual unused params.
+    # True only when some trainable param can skip a forward (LoRA on `embed_tokens`
+    # with conditional paths, full-FT with frozen layer ranges). LoRA on attention/MLP
+    # projections touches every adapter each forward, so False — and skips the per-step
+    # graph traversal True adds. DDP warns at runtime if True finds no unused params.
     find_unused_parameters: bool = False
 
     # ----- misc -----
@@ -205,14 +196,12 @@ def _set_seed(seed: int):
 
 
 def _find_free_port(rank_hint: int = 0) -> int:
-    """Pick a free loopback port for one-shot rendezvous at startup.
+    """Pick a free loopback port for the one-shot NCCL rendezvous at startup.
 
-    For multi-rank disagg, each trainer rank calls this independently and a
-    naive port-0 grab can produce identical ports across ranks (the OS may
-    reuse a just-released port). We try a rank-spaced range first
-    (29600 + rank_hint*10 .. +9), falling back to OS allocation if that range
-    is fully busy. This eliminates the cross-rank race in practice while
-    keeping behavior identical for the single-rank case.
+    Each disagg trainer rank calls this independently, and a naive port-0 grab
+    can hand two ranks the same just-released port. Try the rank-spaced range
+    29600 + 10*rank_hint .. +9 first, fall back to OS allocation if all ten are
+    busy; single-rank runs start at 29600.
     """
     base = 29600 + rank_hint * 10
     for candidate in range(base, base + 10):
@@ -317,7 +306,8 @@ class Trainer:
     Loop invariants:
       - Weight sync runs AFTER optimizer.step(), BEFORE the next rollout.
         Flipping this makes the rollout use stale weights, biasing the importance ratio.
-      - Eval and checkpoint run on rank 0 only; other ranks must hit the same `barrier()`.
+      - Every rank runs `_run_eval` (sharded, all-reduced); sample JSON, final save and
+        wandb are rank 0 behind a shared `barrier()`.
       - Metric logging all-reduces BEFORE the rank-0 print.
     """
 
@@ -325,8 +315,9 @@ class Trainer:
         """Build model, tokenizer, env, rollout backend, optimizer, stats, and
         (optionally) the NCCL weight-sync comm.
 
-        Wrap order for LoRA + DDP: load base -> peft wrap -> .to(device) -> DDP.
-        Other orders silently break checkpointing or gradient sync.
+        Wrap order for LoRA + DDP: load base -> .to(device) -> peft wrap -> DDP.
+        DDP registers params at construction, so peft must precede it; other orders
+        break checkpointing or gradient sync.
 
         Ref model: LoRA uses `with model.disable_adapter():` for zero extra VRAM.
         Full FT needs a frozen deepcopy (~2× model VRAM).
@@ -354,11 +345,11 @@ class Trainer:
         _print_system_info()
         torch.backends.cuda.matmul.allow_tf32 = True
 
-        # --- Distributed init (must come BEFORE any validation that uses world_size) ---
+        # --- Distributed init (before validation — it needs world_size) ---
         rank, local_rank, world_size = init_distributed()
         self.rank, self.local_rank, self.world_size = rank, local_rank, world_size
 
-        # --- Validation (now world_size is in scope) ---
+        # --- Validation ---
         if cfg.tensor_parallel_size != 1:
             raise NotImplementedError("vLLM TP > 1 not supported yet")
         if len(cfg.trainer_gpus) != world_size:
@@ -392,10 +383,8 @@ class Trainer:
                 )
 
         # --- Resolve devices ---
-        # trainer_gpus / rollout_gpus are the full GPU pools (per cfg). For DDP,
-        # each rank picks its own primary by LOCAL_RANK from these pools.
-        # trainer_devices / rollout_devices are kept only for the startup banner
-        # (_print_training_info) — not used for any GPU op.
+        # Each rank picks its primary device by LOCAL_RANK from the cfg pools;
+        # trainer_devices / rollout_devices only feed the startup banner.
         if torch.cuda.is_available():
             self.trainer_devices = [torch.device(f"cuda:{g}") for g in cfg.trainer_gpus]
             self.rollout_devices = [torch.device(f"cuda:{g}") for g in cfg.rollout_gpus]
@@ -405,11 +394,9 @@ class Trainer:
             self.rollout_devices = [torch.device("cpu")]
             self.device = self.trainer_devices[0]
 
-        # Per-rank RNG offset by 1000*rank (not +rank) so distinct cfg.seed values
-        # never produce overlapping per-rank streams across runs. With +rank,
-        # consecutive seeds collide (run(41).rank1 == run(42).rank0); the 1000x
-        # spacing keeps seeds independent for up to 1000 ranks. Preserves
-        # per-rank diversity within a run (each rank still samples differently).
+        # Per-rank seed = cfg.seed + 1000*rank, not +rank: with +rank consecutive
+        # seeds collide across runs (run(41).rank1 == run(42).rank0). 1000x spacing
+        # keeps streams disjoint up to 1000 ranks while ranks still differ within a run.
         self.seed = cfg.seed + 1000 * rank
         _set_seed(self.seed)
 
@@ -474,7 +461,7 @@ class Trainer:
         #    time, repairing the chain. Idempotent on full-FT.
         #  - use_reentrant=False: the modern torch.utils.checkpoint path.
         #    The legacy reentrant path is deprecated and breaks with DDP.
-        # use_cache=False is already set above (line ~354), which gc requires.
+        # gc also needs use_cache=False, set right after model load above.
         if cfg.gradient_checkpointing:
             self.model.enable_input_require_grads()
             self.model.gradient_checkpointing_enable(
@@ -501,12 +488,10 @@ class Trainer:
         self._inner_model = self.model
 
         if world_size > 1:
-            # device_ids must match the device the model actually lives on
-            # (self.device, set above from cfg.trainer_gpus[local_rank]).
-            # Using bare local_rank here breaks whenever trainer_gpus is not
-            # 0..N-1 in order — e.g., trainer_gpus=[2,3] with no outer
-            # CUDA_VISIBLE_DEVICES mask. NCCL then asserts with
-            # "Tensor on cuda:X but backend constrained to cuda:Y".
+            # device_ids must be the device the model lives on (self.device from
+            # cfg.trainer_gpus[local_rank]), not bare local_rank — that breaks whenever
+            # trainer_gpus isn't 0..N-1 in order (e.g. [2,3] with no outer CUDA_VISIBLE_DEVICES
+            # mask): NCCL asserts "Tensor on cuda:X but backend constrained to cuda:Y".
             self.model = DDP(self.model, device_ids=[self.device.index],
                              find_unused_parameters=cfg.find_unused_parameters)
 
@@ -521,12 +506,10 @@ class Trainer:
             self.compiled_ref = None  # LoRA: use compiled_model with disable_adapter()
 
         if cfg.use_vllm:
-            # vLLM only needs Punica (enable_lora=True) when we're pushing LoRA
-            # adapters to it via LoRARequest (disk path). For NCCL sync with LoRA
-            # we merge on the trainer and broadcast merged base weights — vLLM
-            # runs pure base generation, and enable_lora=True would re-parent
-            # its linear weights under `.base_layer.weight`, breaking name
-            # matching in the NCCL broadcast loop.
+            # vLLM needs Punica (enable_lora=True) only for the disk path (adapters via
+            # LoRARequest). nccl/ipc merge on the trainer and ship merged base weights, so
+            # vLLM runs pure base generation — and enable_lora=True would re-parent its
+            # linear weights under `.base_layer.weight`, breaking name matching in the sync loop.
             vllm_enable_lora = cfg.use_lora and cfg.weight_sync_method == "disk"
             self.rollout_worker = VLLMRolloutWorker(
                 model_name=cfg.model_name,
@@ -541,11 +524,9 @@ class Trainer:
         else:
             self.rollout_worker = None  # HF sampler path
 
-        # --- RLConfig: now owned directly by TrainerConfig.rl, no re-translation needed ---
+        # --- RLConfig ---
         self.rl_cfg = cfg.rl
-        # Trainer-side log_interval controls console/wandb cadence and is
-        # separate from RLConfig's log_interval (which controls rl_step's own
-        # internal prints). Keep the trainer one authoritative by mirroring.
+        # RLConfig.log_interval has no consumer left; mirror the trainer's so they never disagree.
         self.rl_cfg.log_interval = cfg.log_interval
         validate_rl_config(self.rl_cfg)
 
@@ -591,7 +572,7 @@ class Trainer:
             self.optimizer, schedulers=scheds, milestones=milestones)
 
         # EMA of per-step KL(policy ∥ reference) — smooths the noisy batch-level
-        # `kl` so the cumulative-drift trend is visible. alpha=0.05 → ~20-step
+        # `kl` so the cumulative-drift trend is visible. alpha=0.05 → ~14-step
         # half-life. Logged as `kl_to_ref_ema`.
         self.kl_to_ref_ema: float | None = None
 
@@ -652,8 +633,8 @@ class Trainer:
         self._nccl_sync_state = None
         if cfg.weight_sync_method == "nccl" and self.rollout_worker is not None:
             # NCCL can't communicate between two ranks on the same GPU device
-            # (ncclCommInitRank rejects with NCCL_INVALID_USAGE). For colocated
-            # mode, disk sync is the only working option.
+            # (ncclCommInitRank rejects with NCCL_INVALID_USAGE); colocated mode
+            # must use "ipc" (or "disk").
             if cfg.mode == "colocated":
                 shared = set(cfg.trainer_gpus) & set(cfg.rollout_gpus)
                 if shared:
@@ -944,11 +925,12 @@ class Trainer:
     def rollout_phase(self) -> list[dict]:
         """Sample prompts -> generate -> score -> compute advantages. Returns
         `grad_accum_steps` micro-batches in the format `rl_step` expects:
-        {full_ids, plen, adv, old_logp, ref_logp, mask, token_count, responses, rewards}.
+        {full_ids, plen, adv, old_logp, ref_logp, mask, token_count, responses,
+        rewards, pad_token_id, response_lengths}.
 
-        old_logp is computed under the same model that just sampled (fine in
-        our synchronous setup). LoRA ref logp uses `model.disable_adapter()`
-        to forward through base weights without a separate ref model.
+        old_logp is left None; rl_step fills it from its epoch-1 forward (same
+        weights that sampled). LoRA ref logp uses `model.disable_adapter()` to
+        forward through base weights without a separate ref model.
         """
         micro_batches, alive_rates_step, spread_step = [], [], []
         # Per-component reward accumulator across kept responses for wandb logging.
@@ -966,7 +948,7 @@ class Trainer:
 
         if self.rollout_worker is not None:
             # --- vLLM path ---
-            # 1. Build unique_prompts (B, no G-repeat — vLLM handles n=G internally)
+            # 1. One prompt per example, no G-repeat — vLLM handles n=G internally
             unique_prompts = [self.env.format_prompt(ex) for ex in batch_ex_all]
 
             # 2. Tokenize with HF tokenizer for consistent token IDs.
@@ -994,23 +976,21 @@ class Trainer:
                 )
 
             # Colocated: sleep vLLM IMMEDIATELY after generation — everything
-            # below (rewards, advantages, old/ref logprob recompute) is
-            # trainer-side, and the recompute's full-vocab [B*G, S-1, V]
-            # logits need the memory vLLM would otherwise hold (at util 0.7
-            # the 1.5B math configs OOM if vLLM stays awake here). The drain
-            # gives vLLM's `freed_bytes >= 0` sleep invariant a stable baseline.
+            # below (rewards, advantages, ref logprob forward) is trainer-side,
+            # and the ref forward's full-vocab [B*G, S-1, V] logits need the
+            # memory vLLM would otherwise hold (at util 0.7 the 1.5B math
+            # configs OOM if vLLM stays awake here).
             if self.rollout_worker.colocated:
                 # The one gc.collect() per step: breaks ref cycles holding CUDA
                 # blocks so the pre-sleep drain gives vLLM's `freed_bytes >= 0`
-                # invariant a stable baseline. (gc.freeze() at train() start
-                # exempts the long-lived model/optimizer graph from the scan.)
+                # sleep invariant a stable baseline. (gc.freeze() at train()
+                # start exempts the long-lived model/optimizer graph from the scan.)
                 gc.collect()
                 torch.cuda.empty_cache()
                 with record_function("vllm_sleep"):
                     self.rollout_worker.sleep()
                 torch.cuda.empty_cache()
 
-        # {full_ids, plen, adv, old_logp, ref_logp, mask, token_count, responses, rewards}
         for i in range(rl.grad_accum_steps):
 
             start, end = i * n_prompts_per_mb, (i + 1) * n_prompts_per_mb
@@ -1059,12 +1039,10 @@ class Trainer:
             else:
                 # --- HF path ---
 
-                # Flatten: each prompt repeated G times, each answer repeated G times
-                # TODO: investigate vectorizing format_prompt — would need Env.format_prompt_batch(examples)
-                # or a batched string template. Current per-example call is ~microseconds so low priority,
-                # but at large batch sizes (256+ prompts) the Python loop may show up in profiles.
+                # Flatten: each prompt and example repeated G times.
+                # TODO: batch format_prompt (Env.format_prompt_batch) only if this
+                # ~µs/call Python loop shows up in profiles at 256+ prompts.
 
-                # prompts = [self.env.format_prompt(ex) for ex in batch_ex for _ in range(G)]
                 prompts = np.repeat([self.env.format_prompt(ex) for ex in batch_ex], G).tolist()
                 examples = [ex for ex in batch_ex for _ in range(G)]
 
@@ -1157,7 +1135,7 @@ class Trainer:
         self._last_spread_mean = float(np.mean([s[0] for s in spread_step])) if spread_step else 0.0
         self._last_spread_max = float(max(s[1] for s in spread_step)) if spread_step else 0.0
         # Fraction of training rollouts that hit max_new_tokens — leading indicator
-        # of length-gaming or policy regression (lagging eval-time cap_rate_pct).
+        # of length-gaming/regression; eval cap_rate_pct lags by eval_interval.
         all_lens = torch.cat([mb["response_lengths"] for mb in micro_batches])
         self._last_cap_rate = (all_lens >= self.cfg.rl.max_new_tokens).float().mean().item()
         # Per-component reward means (kept responses, this step). Empty for envs
@@ -1232,25 +1210,24 @@ class Trainer:
     def sync_weights(self) -> None:
         """Push trainer weights to the rollout worker.
 
-        Dispatches to the backend configured by `cfg.weight_sync_method`:
+        Dispatches on `cfg.weight_sync_method`:
           - "disk": LoRA adapter save + vLLM LoRARequest reload. Simple, slow,
                    always works. Requires `cfg.use_lora=True`.
-          - "nccl": direct GPU->GPU broadcast via vLLM collective_rpc.
-                   Fast, supports full FT. See vivace/utils/weight_sync.py.
+          - "nccl": GPU->GPU broadcast via vLLM collective_rpc. Fast, supports
+                   full FT; disaggregated only (NCCL can't pair two ranks on one
+                   GPU). See vivace/utils/weight_sync.py.
+          - "ipc":  vLLM aliases the trainer's GPU buffers, colocated only.
+                   See vivace/utils/ipc_sync.py.
 
-        No-op only when there's no rollout worker (HF sampler shares weights
-        by reference). Colocated mode still needs sync: vLLM runs in a separate
-        EngineCore subprocess with its own memory, so trainer updates do NOT
-        propagate by reference even on the same GPU.
+        No-op only when there's no rollout worker (HF sampler shares weights by
+        reference). Colocated mode still needs sync: vLLM runs in a separate
+        EngineCore subprocess, so trainer updates don't propagate by reference
+        even on the same GPU. (An early return for colocated on that false
+        assumption once left vLLM on its __init__ weights all run.)
         """
-        # No rollout worker (HF sampler) — model shared by reference, nothing to sync.
         if self.rollout_worker is None:
             return
 
-        # Both colocated and disaggregated need explicit sync — vLLM is a separate
-        # subprocess in either case. (Earlier code returned early for colocated based
-        # on a false "shared tensors" assumption; that left vLLM permanently on the
-        # weights it loaded at __init__ and produced bit-identical pre/post eval.)
         if self.cfg.weight_sync_method == "disk":
             self._sync_weights_disk()
         elif self.cfg.weight_sync_method == "nccl":
@@ -1264,7 +1241,7 @@ class Trainer:
             )
 
     def _sync_weights_disk(self) -> None:
-        """Disk-based LoRA adapter sync. Rank 0 saves; vLLM reloads via update_lora.
+        """Disk LoRA sync: rank 0 saves; after the barrier each rank's vLLM reloads.
 
         Uses /dev/shm (RAM-backed tmpfs) by default — the adapter is overwritten
         every step and never needs to persist to real disk. Override by setting
@@ -1294,7 +1271,7 @@ class Trainer:
             "the weight_sync_method='nccl' setup block"
         )
 
-        # For LoRA: fold A @ B into base so `named_parameters()` yields the full
+        # For LoRA: fold B @ A into base so `named_parameters()` yields the full
         # current policy. Must unmerge in `finally` — if broadcast raises and we
         # skip unmerge, the next training step treats merged weights as base
         # and applies the adapter a second time on top.
@@ -1355,7 +1332,7 @@ class Trainer:
 
     def train(self) -> None:
         """Main training loop: optional SFT warmup, baseline eval, N steps of
-        (rollout -> train -> sync -> log/eval/ckpt), final eval, cleanup.
+        (rollout -> train -> sync -> log/eval), final-model save, final eval, cleanup.
         """
         self.maybe_sft_warmup()
 
@@ -1384,8 +1361,8 @@ class Trainer:
         barrier()
 
         # --- Initial weight sync ---
-        # vLLM starts with the base model only. Sync the initial LoRA adapter
-        # so vLLM and the trainer use the same policy from step 0.
+        # vLLM loaded base weights; push the step-0 policy (adapter or full-FT
+        # weights) so vLLM and the trainer agree from step 0.
         self.sync_weights()
 
         # --- Profiler (optional) ---
@@ -1407,8 +1384,8 @@ class Trainer:
             self.step = step
 
             # Colocated step order: generate (vLLM awake) → sleep (inside
-            # rollout_phase, right after the generate call) → logprob
-            # recompute + train → wake → sync. Sync MUST happen while vLLM
+            # rollout_phase, right after the generate call) → ref logprob
+            # + train → wake → sync. Sync MUST happen while vLLM
             # is awake — level-1 sleep unmaps the weight pages, so a sync
             # into a sleeping engine hits unmapped memory and crashes the
             # worker (CUDA illegal memory access). vLLM stays awake from the
@@ -1543,10 +1520,9 @@ class Trainer:
                         aux = [f"alive={perf['alive_rate']:.1%}",
                                f"spread_mean={perf['spread_mean']:.3f}",
                                f"spread_max={perf['spread_max']:.3f}"] + aux
-                    # Memory-leak diagnostic (disagg OOMs at step ~170; track which
-                    # category grows). Tear down once the leak is found.
-                    # Peak is captured since last reset_peak_memory_stats — call
-                    # it AFTER reading so the next step's peak measurement is clean.
+                    # Allocator watch: mem_res - mem_alloc is the cached pool whose
+                    # drift OOMed disagg at step ~170 (now drained per step). Peak is
+                    # since the last reset_peak_memory_stats — reset AFTER reading.
                     if torch.cuda.is_available():
                         mem_alloc = torch.cuda.memory_allocated() / 1e9
                         mem_reserved = torch.cuda.memory_reserved() / 1e9
@@ -1604,7 +1580,7 @@ class Trainer:
                     if self._last_reward_components:
                         log_metrics({f"reward_components/{name}": v
                                      for name, v in self._last_reward_components.items()}, step)
-                    # Adaptive sampling (logged even when disabled — 0 values)
+                    # Adaptive sampling (only when enabled)
                     if self.cfg.rl.adaptive_sampling:
                         log_metrics({
                             "sampling/alive_rate": perf["alive_rate"],

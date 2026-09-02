@@ -1,13 +1,14 @@
 """Inspect eval samples from a completed training run.
 
-Reads `eval_samples_final.json` (written by the trainer's final-eval block)
-and prints per-sample question + response with a clear label for which list
-(CORRECT / INCORRECT), char + token lengths, and reward.
+Reads `eval_samples_final.json` and prints per-sample question + response
+labelled CORRECT / INCORRECT, with char + token lengths and reward. The trainer
+now writes `eval_samples_final_<env>.json` per env; this script still opens the
+old name — symlink the one to inspect.
 
-Token counting needs a tokenizer; defaults to the Qwen2.5-0.5B-Instruct
-tokenizer used by the current configs. Override with --tokenizer for other
-models. Token length is computed in this script if the saved samples don't
-already carry it (older runs predate that field).
+Token counting needs a tokenizer; default Qwen2.5-0.5B-Instruct (its tokenizer.json
+is identical to Qwen2.5-0.5B / -1.5B, so counts hold for the 1.5B v1 runs).
+Override with --tokenizer for other families. Token length is computed here only
+if samples lack `length_tokens` (older runs).
 
 Usage:
     python -m tests.inspect_eval_samples --run-dir runs/dapo_rloo_nocompile_seed42_
@@ -49,8 +50,7 @@ def _ensure_token_lengths(items: list[dict], tokenizer_name: str) -> None:
 
 
 def _print_sample(tag: str, idx: int, total: int, x: dict) -> None:
-    """Print one sample with the formatting Viktor asked for: clear label, blank line
-    between header and response, both char and token length."""
+    """Print one sample: label header, Q, GT/PRED/reward/length line, blank line, response."""
     print()
     cap_marker = "  [CAPPED]" if x.get("capped") else ""
     print(f"=== {tag}  {idx + 1}/{total} ==={cap_marker}")

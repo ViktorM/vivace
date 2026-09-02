@@ -6,7 +6,7 @@ model already follows the format. Keep this path optional.
 
 When you DO use it: run SFT first, save a checkpoint, then point
 `vivace-train` at that checkpoint as its starting weights. Two-stage
-workflow.
+workflow. Status: stub — only `build_sft_data` is implemented.
 """
 
 from __future__ import annotations
@@ -37,8 +37,7 @@ def build_sft_data(examples: list, n: int, tokenizer, make_prompt) -> list[dict]
     data = []
     for ex in examples[:n]:
         prompt = make_prompt(ex.problem)
-        # Build the ideal response in the same <think>/<answer> format
-        # the RL reward functions expect.
+        # Target = strict_format_reward's exact shape + EOS so the model learns to stop.
         reasoning = ex.metadata.get("reasoning", "") if ex.metadata else ""
         target = (
             f"<think>\n{reasoning}\n</think>\n"

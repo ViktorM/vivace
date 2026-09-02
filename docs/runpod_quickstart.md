@@ -14,7 +14,7 @@ cheapest end-to-end validation. After the recipe reproduces there, scale to
 
 Sign up at [runpod.io](https://www.runpod.io/), confirm email, and add a
 payment method. Load $20–50 in credits to start — enough to cover the Phase 1
-smoke + first 500-step run with margin. Runpod bills by the second, so unused
+smoke + first 200-step run with margin. Runpod bills by the second, so unused
 credits stay on the account.
 
 Once signed in, the **Settings** page collects the three things you'll need
@@ -26,8 +26,8 @@ auth (only if you keep your image private).
 Runpod's SSH only authenticates *you* into the pod — it doesn't grant access to
 any GitHub repo. You can reuse an existing key or generate a new one. **Read-only
 vs read-write isn't a thing for SSH keys themselves** — that distinction applies
-to GitHub *deploy keys* (which we don't use here, since the repo is cloned into
-the Docker image at build time).
+to GitHub *deploy keys* (which we don't use here; the working tree is `COPY`'d
+into the image at build time).
 
 If you don't already have an `id_ed25519` pair:
 
@@ -156,6 +156,7 @@ changes (which would make the `<git-sha>` tag misleading).
 ```bash
 docker/push.sh v0.1.0              # push :v0.1.0 and :<git-sha>
 docker/push.sh v0.1.0 --latest     # also push :latest if this is stable
+docker/push.sh v0.1.0 --yes        # no dirty-tree prompt
 GH_USER=foo docker/push.sh v0.1.0  # override the default username
 ```
 
@@ -191,8 +192,9 @@ delete + recreate if you won't use it for >2 weeks).
 ### First pod: 2× A100 80GB SXM (cheapest validation, ~$2.98/hr)
 
 Use this for the first end-to-end test — same 80 GB VRAM as H100 (so the
-existing 2× H100 config runs unchanged), just slower compute. ~$3/hr vs ~$6/hr,
-so the smoke + first 500-step run total is ~half the cost.
+existing 2× 80GB config runs unchanged) at ~half the compute. ~$3/hr vs ~$6/hr
+at half the speed: a full run costs about the same; the saving is on smoke
+tests, debugging and idle time.
 
 **Web UI path:**
 
@@ -314,9 +316,9 @@ trajectories/step). That is intentional — each layout has its own
 memory/throughput sweet spot, and the goal of the comparison is to find the
 best operating point per mode, not to force a batch-matched ablation. The same
 logic applies as we scale up: on 8-GPU runs the GPU split itself becomes a
-tuning knob (e.g. 2 rollout + 6 trainer if that improves utilization), with
-different batch sizes on each side. Compare best-of-mode vs best-of-mode on
-the wandb plots, not matched-batch curves.
+tuning knob (e.g. 2 rollout + 6 trainer; needs a trainer change — disagg is
+1:1 today), with different batch sizes on each side. Compare best-of-mode vs
+best-of-mode, not matched-batch curves.
 
 ## Verify GPU memory utilization
 
@@ -357,10 +359,11 @@ vivace logs the trainer-side allocator state on every log line:
   this is the number to watch
 
 **`mem_peak` should land in the 50–70 GB range during the forward+backward**
-on 80 GB. If you see 25–35 GB consistently → trainer is under-subscribed,
-bump `batch_size` from 4 → 6 or 8, or `group_size` from 16 → 24. If you see
-75+ GB or hit OOM → back off (drop `gradient_checkpointing: false` to `true`,
-or reduce batch_size).
+on 80 GB. `cispo_2x80GB.yaml` (bs=8, gs=8, max_new=1024) peaks ~52 GB with GC
+on, ~78 GB without. If you see 25–35 GB consistently → trainer is
+under-subscribed, bump `batch_size` or `group_size`. If you see 75+ GB or hit
+OOM → reduce `batch_size` (GC is already on in the disagg config; the colo
+configs run GC off — flip it there first).
 
 ### Check vLLM-side actual KV utilization
 
@@ -373,7 +376,7 @@ INFO ... [executor_base.py] # cuda blocks: 24576, # CPU blocks: 0
 
 `Maximum concurrency for 1280 tokens` means vLLM can hold 92 concurrent
 sequences at that context length within the pre-allocated budget. If that
-number is much higher than `vllm_max_num_seqs` (128), KV is over-provisioned
+number is much higher than `vllm_max_num_seqs` (256), KV is over-provisioned
 relative to what we ask for — fine for headroom, but we won't actually use it
 unless we push concurrency higher.
 
@@ -399,16 +402,16 @@ GPU since nothing else is using that card).
 
 Run a 10-step smoke, watch both `mem_peak` (trainer) and the vLLM engine
 stats once they print. Decide from those numbers whether the next run should
-bump batch_size further. The current config (128 traj/step) is a conservative
-starting point assuming ~50% utilization; you'll likely have headroom on
-both sides to push to 192 or 256.
+bump batch_size further. The current configs (64 traj/step disagg, 128 colo)
+are conservative starting points assuming ~50% utilization; you'll likely have
+headroom on both sides to push to 192 or 256.
 
 ## Monitor + tear down
 
-- **wandb** — runs auto-sync if `WANDB_API_KEY` is set. Group follows
-  `cispo_math_1.5b_500step_ep4_lr2e5_mask_<hw>`.
-- **Live metrics in pod** — `tail -f /workspace/checkpoints/<run-dir>/*.log` or
-  `nvidia-smi -l 2`.
+- **wandb** — runs auto-sync if `WANDB_API_KEY` is set. Group is the
+  `--wandb-group` above: `cispo_math_qw25_1.5b_ep2_lr2e5_{disagg,colo}_<hw>`.
+- **Live metrics in pod** — trainer logs to stdout only, so launch inside tmux
+  (`tmux_quickstart.md`) and reattach, or `nvidia-smi -l 2`.
 - **Stop the pod** when training finishes (web UI → Stop). Stopped pods cost
   $0 for compute; the network volume keeps billing at ~$1.20/day.
 - **Delete the pod** if you won't use it for >24h; the container disk
@@ -420,17 +423,17 @@ both sides to push to 192 or 256.
 |---|---|---|
 | First image push (one-time) | $0 (your bandwidth) | $0 |
 | Smoke test (~5 min) | <$0.30 | <$0.50 |
-| Full CISPO 500-step run (~30 min on H100, ~50 min on A100) | ~$2.50 | ~$3 |
+| CISPO 200-step run (27 s/step measured on 2× A100 → ~90 min; H100 ~half) | ~$4.50 | ~$4.50 |
 | Network volume per month (idle) | $35 | $35 |
-| 3-seed sweep × full run | ~$8 | ~$9 |
+| 3-seed sweep × full run | ~$13.50 | ~$13.50 |
 
-Suggested order: do the smoke + first 500-step run on 2× A100 (~$3 total) to
+Suggested order: do the smoke + first 200-step run on 2× A100 (~$5 total) to
 validate the image and config. Then switch to 2× H100 for the actual research
 runs and seed sweeps.
 
-If you scale up to Phase 2 (4× / 8× H100), update the `--gpu-count` flag and
-load the corresponding `_4xH100` / `_8xH100` config (to be added once Phase 1
-baseline is reproduced).
+For Phase 2 (4× / 8×), bump `--gpu-count` and use
+`math/cispo_{4x,8x}80GB_colo.yaml` (`--nproc_per_node=4`/`8`, 256/512 traj/step);
+run all scaling points on one 8-GPU node, subsetting GPUs (`cluster_support.md`).
 
 ## Troubleshooting
 
@@ -438,10 +441,10 @@ baseline is reproduced).
   the template requests GPUs.
 - **Slow first download of Qwen weights** — point `HF_HOME=/workspace/hf_cache`
   (already set in the Dockerfile) so subsequent pods reuse the volume.
-- **`vllm sleep`/wake assertion errors** — colocated mode quirk; this config
-  is disaggregated so should not hit. If you switch to colocated, ensure
-  trainer + vLLM are on the same physical GPU (`trainer_gpus: [0]`,
-  `rollout_gpus: [0]`).
+- **vLLM sleep/wake assertion (`freed_bytes >= 0`)** — colocated only: the
+  trainer's allocator pool grows over steps and squeezes vLLM's; the trainer
+  calls `empty_cache()` around sleep/wake to hold it off. Never set
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments` in colo — it breaks vLLM sleep.
 - **NCCL timeout on weight sync** — check that both `trainer_gpus` and
   `rollout_gpus` are on the same node. Multi-node NCCL needs additional
   setup (Phase 4).

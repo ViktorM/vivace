@@ -1,8 +1,8 @@
 """Smoke test for NCCL weight sync via StatelessProcessGroup + PyNcclCommunicator.
 
-Goal: prove the cross-process NCCL comm channel works BEFORE wiring it into
-the trainer. If this test passes, the Pattern A plumbing is correct and any
-later bugs are in higher-level code (spec building, name mapping, etc.).
+Isolates the Pattern A plumbing (StatelessProcessGroup + PyNcclCommunicator)
+behind trainer.py's weight_sync_method=nccl. If this passes, any sync bug is in
+higher-level code (spec building, name mapping, etc.).
 
 What it does:
   1. Build a minimal vLLM worker on the second GPU
@@ -206,11 +206,8 @@ def main():
     received_values = received[0] if isinstance(received, list) else received
     print(f"[worker] received: {received_values}")
 
-    # Compare as tensors in the broadcast dtype. NCCL transfers bytes exactly,
-    # so same-dtype same-device comparison is bit-identical. We use allclose
-    # anyway — caller may swap test values without thinking about float32
-    # rounding, and a tolerance check stays meaningful for any sensible
-    # test inputs. Real NCCL corruption would exceed atol by many orders.
+    # NCCL moves bytes exactly, so same-dtype comparison is bit-identical; allclose
+    # only so swapped test values needn't mind float32 rounding. Corruption >> atol.
     received_tensor = torch.tensor(received_values, dtype=torch.float32)
     if not torch.allclose(received_tensor, test_tensor.cpu(), rtol=1e-5, atol=1e-6):
         print(f"FAIL — sent {test_values}, received {received_values}", file=sys.stderr)

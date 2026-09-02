@@ -12,7 +12,7 @@ Usage in YAML config:
 
 Then view the trace:
     chrome://tracing  or  https://ui.perfetto.dev
-    File → Open → runs/<your_run>/profiling/trace_step5-8.json
+    File → Open → runs/<your_run>/profiling/trace_step5-8_<timestamp>.json
 
 The profiler adds zero overhead when disabled (not even instantiated).
 """
@@ -32,8 +32,8 @@ from torch.profiler import profile, ProfilerActivity, schedule
 @dataclass
 class ProfilingConfig:
     enabled: bool = False
-    start_step: int = 5          # first step to profile (0-indexed, after warmup)
-    end_step: int = 8            # last step to profile (exclusive)
+    start_step: int = 5          # profiler warmup step; recording covers start_step+1 .. end_step-1
+    end_step: int = 8            # exclusive (defaults record steps 6-7)
     record_shapes: bool = True
     profile_memory: bool = True
     with_stack: bool = False     # captures Python stack — expensive, off by default
@@ -44,11 +44,9 @@ class ProfilingConfig:
 def create_profiler(cfg: ProfilingConfig) -> profile | None:
     """Create a torch.profiler.profile context manager, or None if disabled.
 
-    The returned profiler uses a schedule where:
-    - wait = start_step  (skip these steps, no overhead)
-    - warmup = 1         (profiler warmup on first active step)
-    - active = (end_step - start_step - 1)  (actually profiled steps)
-    - repeat = 1         (one window only)
+    Schedule: wait = start_step (no overhead), warmup = 1 (step start_step, not
+    recorded), active = end_step - start_step - 1 (steps start_step+1 .. end_step-1),
+    repeat = 1. Defaults 5/8 record steps 6-7.
 
     The caller must call prof.step() at the end of each training step.
     """
@@ -102,7 +100,7 @@ def export_and_summarize(
 
     prof.export_chrome_trace(trace_path)
 
-    # Build the summary into a string buffer — used both for stdout and file.
+    # Full summary goes to the file; stdout gets the compact block below.
     buf = io.StringIO()
     with redirect_stdout(buf):
         print(f"{'=' * 80}")
@@ -136,11 +134,10 @@ def export_and_summarize(
 
     full_summary = buf.getvalue()
 
-    # Save full summary to file
     with open(summary_path, "w") as f:
         f.write(full_summary)
 
-    # Print a compact version to stdout (the tables can be huge; file is the source of truth)
+    # Compact stdout version — the tables can be huge; the file is the source of truth.
     print(f"\n{'=' * 80}")
     print(f"  Profiler Summary (steps {cfg.start_step}-{cfg.end_step})")
     print(f"  Trace:   {trace_path}")

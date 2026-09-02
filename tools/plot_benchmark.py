@@ -1,11 +1,11 @@
 """N-algorithm comparison figure for a 3-seed benchmark sweep (gsm8k or math).
 
 Two panels:
-  (left)  gsm8k eval accuracy vs training step — one line per algo (mean across
-          seeds), shaded band = ±1 std. Base pass@8 drawn as a reference line.
-  (right) final gsm8k accuracy bar chart with ±std error bars across seeds.
+  (left)  --metric (gsm8k | math500) eval accuracy vs step — one line per algo
+          (seed mean), band = ±1 std; base pass@8 / greedy as reference lines.
+  (right) final accuracy bar chart, ±std across seeds.
 
-Pulls from wandb (groups overnight-1.5b-gsm8k-<date>_<algo>).
+Pulls wandb groups <--group-prefix><--date>_<algo> (default overnight-1.5b-gsm8k-).
 
 Run: .venv/bin/python tools/plot_benchmark.py [--date 20260609_0140] [--out FILE.png]
 """

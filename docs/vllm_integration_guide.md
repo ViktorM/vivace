@@ -11,9 +11,9 @@ padded prompt length — so it can mask out prompt tokens from the loss.
 `[B*G, prompt_len + response_len]` tensor directly. `plen` is just
 `enc["input_ids"].shape[1]`. Done.
 
-**vLLM gives you strings.** `generate()` returns `list[list[str]]` — response
-texts only, no prompt, no token IDs. You must reconstruct `full_ids` and
-`plen` yourself.
+**vLLM gives you `RequestOutput`s.** `generate()` returns `(raw_outputs, texts)` —
+per-completion `token_ids` and `text`, no padded tensor. You must reconstruct
+`full_ids` and `plen` yourself.
 
 Three approaches, ordered from simplest to most robust.
 
@@ -78,71 +78,62 @@ prompt_ids_batch = prompt_enc.input_ids.tolist()   # list of list[int], shape [B
 plen = prompt_enc.input_ids.shape[1]               # single int, uniform across batch
 ```
 
-**Step 2: Pass token IDs to vLLM (not raw text).**
+**Step 2: Pass token IDs to vLLM (not raw text), leading pads stripped.**
 
 ```python
-sp = SamplingParams(
-    temperature=cfg.temperature, top_p=cfg.top_p,
-    max_tokens=cfg.max_new_tokens, n=G,
-)
-outputs = self.rollout_worker.llm.generate(
-    prompt_token_ids=prompt_ids_batch,
-    sampling_params=sp,
+# vLLM has no attention_mask: fed the pads it conditions on them and diverges from HF.
+stripped = [ids[next((j for j, t in enumerate(ids) if t != pad_id), len(ids)):]
+            for ids in prompt_ids_batch]
+outputs, _ = self.rollout_worker.generate(
+    prompt_token_ids=stripped, temperature=rl.temperature,
+    top_p=rl.top_p, max_tokens=rl.max_new_tokens, n=G,
 )
 ```
 
-This way vLLM sees the exact tokens your tokenizer produced — no
-re-tokenization, no boundary issues.
-
-**Step 3: Build full_ids from vLLM's output.**
+**Step 3: Collect response token IDs; right-pad them.**
 
 ```python
-all_ids = []       # will be [B*G] list of list[int]
-all_responses = [] # will be [B*G] list of str
-
+all_resp_ids, responses = [], []
 for req_output in outputs:
-    p_ids = list(req_output.prompt_token_ids)  # includes left-padding
     for completion in req_output.outputs:
-        r_ids = list(completion.token_ids)
-        all_ids.append(p_ids + r_ids)
-        all_responses.append(completion.text)
+        all_resp_ids.append(list(completion.token_ids))
+        responses.append(completion.text)
+
+# True lengths before padding drive both the attention and loss masks
+# (pad_id == eos_id on Qwen, so pads can't be told from EOS afterwards).
+response_lengths = torch.tensor([len(r) for r in all_resp_ids], device=self.device)
+max_resp_len = max(len(r) for r in all_resp_ids)
+all_resp_ids = [r + [pad_id] * (max_resp_len - len(r)) for r in all_resp_ids]
 ```
 
-**Step 4: Left-pad to uniform total length.**
+**Step 4: Prepend the *padded* prompt from step 1 (not the stripped one).**
 
 ```python
-max_len = max(len(ids) for ids in all_ids)
-pad_id = self.tokenizer.pad_token_id
-
-full_ids = torch.tensor(
-    [[pad_id] * (max_len - len(ids)) + ids for ids in all_ids],
-    device=self.device,
-)
+# [left_pad | prompt | response | right_pad], every row plen + max_resp_len wide
+all_ids = [prompt_ids_batch[b] + all_resp_ids[b * G + g]
+           for b in range(len(outputs)) for g in range(G)]
+full_ids = torch.tensor(all_ids, device=self.device)
 ```
 
 **Why this works:**
-- `plen` is still a single int — all prompts were padded to the same
-  length in step 1.
-- Prompt tokens in `full_ids` start at position `left_pad_offset + 0`
-  where `left_pad_offset = max_len - len(this_sequence)`. This is
-  exactly the same left-padding convention as the HF sampler path.
-- The response mask in `compute_token_logprobs` uses
-  `start = max(plen - 1, 0)` which is measured from position 0 of the
-  un-padded content. Since the left-padding is accounted for by the
-  attention mask (`cumprod(is_pad)`), the mask logic works correctly.
+- `plen` is still a single int: prompts were padded to the same length in
+  step 1 and responses on the right, so every response starts at target
+  index `plen - 1`.
+- The loss mask needs no forward pass:
+  `build_response_mask(plen, S, response_lengths)` is `[plen-1, plen-1+resp_len)`.
+- `compute_token_logprobs` masks left pads with `1 - cumprod(is_pad)` and right
+  pads with `pos < plen + resp_len`, then sets `position_ids = cumsum(mask) - 1`
+  so RoPE starts at 0 on the first real token — the positions vLLM used on the
+  stripped prompt. Without it, a differently padded batch shifts every rotary
+  angle and HF/vLLM logprobs disagree.
 
-### What about `prompt_token_ids` including padding?
+### Why strip the pads instead of letting vLLM see them?
 
-Yes — when you tokenize with `padding=True`, shorter prompts get
-left-padded with `pad_token_id`. These padding tokens become part of
-`prompt_token_ids` passed to vLLM. vLLM will see them as real tokens
-and "attend" to them. This is slightly wasteful (vLLM processes padding)
-but correct — the attention mask in `compute_token_logprobs` handles it.
-
-For better vLLM efficiency, you could pass un-padded prompt IDs (each
-prompt has different length) and then re-pad the full_ids yourself.
-But this makes `plen` per-sequence, which requires API changes
-(Approach 3). Not worth the complexity for now.
+Correctness, not efficiency. HF masks pads via `attention_mask`; vLLM has no
+such input, so `[pad ... pad | prompt]` yields different logits than `[prompt]`
+and the rollout policy no longer matches what `compute_token_logprobs` scores.
+The padded `prompt_ids_batch` still builds `full_ids`, so `plen` stays one int;
+per-sequence prompt lengths (Approach 3) would drop the padding entirely.
 
 ---
 
@@ -193,38 +184,36 @@ lengths within a batch).
 | 2. vLLM token IDs + uniform plen | Correct | Medium | Now |
 | 3. Per-sequence plen | Correct + efficient | Higher | Multi-turn / tool-use |
 
-**Start with Approach 2.** The key steps are:
+**Approach 2 is what ships** (`rollout_phase`, vLLM branch). The key steps:
 1. Tokenize prompts with HF tokenizer → `prompt_ids_batch`, `plen`
-2. Pass `prompt_token_ids=prompt_ids_batch` to vLLM
-3. Concatenate `prompt_token_ids + completion.token_ids` per response
-4. Left-pad all sequences to `max_len`
-5. `plen` stays a single int, everything downstream works unchanged
+2. Strip leading pads; pass `prompt_token_ids=` to `rollout_worker.generate`
+3. Record `response_lengths`; right-pad `completion.token_ids`
+4. `full_ids` = padded prompt + padded response
+5. `plen` stays a single int; `build_response_mask` is the loss mask, no forward needed
 
 ---
 
-## Checklist for the vLLM path in rollout_phase
+## Checklist for the vLLM path in rollout_phase (all shipped)
 
-- [ ] Build `unique_prompts` (B prompts, NOT repeated G times)
-- [ ] Tokenize with HF tokenizer → `prompt_ids_batch`, `plen`
-- [ ] Build `SamplingParams(n=G, ...)` — vLLM handles G-duplication internally
-- [ ] Call `llm.generate(prompt_token_ids=prompt_ids_batch, sampling_params=sp)`
-- [ ] Flatten outputs: `[B][G]` → `[B*G]` for both token IDs and response strings
-- [ ] Build `examples` list: `[ex for ex in batch_ex for _ in range(G)]` (same as HF path)
-- [ ] Construct `full_ids` tensor: left-pad `prompt_ids + response_ids` to `max_len`
-- [ ] Compute rewards, advantages, old_logp, ref_logp — identical to HF path from here
-- [ ] Pack micro_batch dict — same keys as HF path
+- [x] Build `unique_prompts` (B prompts, NOT repeated G times)
+- [x] Tokenize with HF tokenizer → `prompt_ids_batch`, `plen`; strip leading pads for vLLM
+- [x] `rollout_worker.generate(prompt_token_ids=..., n=G)` — vLLM handles G-duplication internally
+- [x] Flatten outputs: `[B][G]` → `[B*G]` for token IDs and response strings; record `response_lengths`
+- [x] Build `examples` list: `[ex for ex in batch_ex for _ in range(G)]` (same as HF path)
+- [x] Construct `full_ids`: padded prompt + right-padded response
+- [x] Compute rewards, advantages, ref_logp — identical to HF path (`old_logp` comes from `rl_step`'s epoch-1 forward)
+- [x] Pack micro_batch dict — same keys as HF path
 
 ---
 
 ## Future cleanup: encapsulate vLLM generation in the worker
 
-The current implementation calls `self.rollout_worker.llm.generate()` directly
-from `rollout_phase`, reaching into the worker's internal `LLM` instance.
-This works but breaks encapsulation — `rollout_phase` knows about vLLM's
-`RequestOutput` structure, `prompt_token_ids`, `completion.token_ids`, etc.
+Half done. `VLLMRolloutWorker.generate()` accepts `prompt_token_ids` and
+`rollout_phase` calls it (no more reaching into `rollout_worker.llm`), but it
+returns the raw `RequestOutput`s, so `rollout_phase` still reads
+`completion.token_ids` / `completion.text` itself.
 
-A cleaner alternative: extend `VLLMRolloutWorker.generate()` to accept
-`prompt_token_ids` and return both texts AND token IDs:
+Remaining step:
 
 ```python
 def generate(self, prompt_token_ids: list[list[int]], *,
@@ -234,8 +223,6 @@ def generate(self, prompt_token_ids: list[list[int]], *,
     """Returns (response_texts[B][G], response_token_ids[B][G][T])"""
 ```
 
-Then `rollout_phase` calls `self.rollout_worker.generate(prompt_ids_batch, ...)`
-and gets back everything it needs without knowing about vLLM internals.
-The `full_ids` construction moves into the worker or into a shared helper.
-
-Do this when the current approach is validated and stable — not before.
+and the `full_ids` construction moves into the worker or a shared helper. Low
+priority: the raw-output access is three lines, and `verify_weights_match` reads
+`outputs[0].outputs[0].logprobs`, so the raw return has a second caller.

@@ -55,9 +55,7 @@ def _maybe_enable_vllm_callable_rpc(method: str) -> None:
 
 
 def _disable_wandb() -> None:
-    """The test builds a Trainer (which calls init_wandb) but doesn't actually train.
-    Disable wandb so the test run doesn't prompt for login or pollute the project's
-    run history with one-off diagnostic runs."""
+    """Trainer() calls init_wandb; disable it so diagnostics don't prompt for login or pollute run history."""
     os.environ.setdefault("WANDB_MODE", "disabled")
 
 
@@ -129,16 +127,10 @@ def main(argv: list[str] | None = None) -> None:
     r3 = verify_weights_match(**kwargs)
     _print_result("result", r3)
 
-    # Verdicts.
-    # Step 1: trainer ↔ vLLM should agree on the original (un-perturbed) weights.
-    # Step 2: perturbation should produce detectable disagreement.
-    # Step 3 is trickier — for LoRA configs, peft's LoraLinear forwards as
-    # `base@x + B@(A@x)` while vLLM uses the merged `(base + B@A)@x`. These are
-    # mathematically equal but numerically different in bf16, and the gap grows
-    # with LoRA contribution magnitude. After sync, weights ARE bit-identical
-    # but the forward paths can still differ. Pass step 3 if max_logprob_diff
-    # is roughly back to step 1's baseline (sync recovered the agreement that
-    # exists between the two implementations on identical weights).
+    # Verdicts. Steps 1-2 are absolute (agree / disagree). Step 3 is relative: with
+    # LoRA, peft forwards `base@x + B@(A@x)` while vLLM runs merged `(base + B@A)@x`
+    # — equal in math, not in bf16, gap growing with the LoRA contribution. Weights
+    # ARE bit-identical post-sync, so pass when max_logprob_diff is back near step 1's.
     step3_relative_pass = r3["max_logprob_diff"] <= max(3.0 * r1["max_logprob_diff"], 0.5)
 
     step_results = [

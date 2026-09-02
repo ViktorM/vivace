@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Math 3-seed benchmark: 4 algos (DAPO, CISPO, Dr.GRPO + GSPO, the gsm8k v2
 # winner) x 3 seeds = 12 runs at Qwen2.5-1.5B, trained on Hendrycks MATH,
-# eval on gsm8k + math500 + AIME 24/25/26.
+# eval on gsm8k + math500 + AIME 24/25/26. GRPO added later by
+# tools/run_grpo_math_addendum.sh (same TS; 15 runs total).
 #
-# Seeds OUTER loop (7 -> 13 -> 42): a full 3-algo ranking lands after the first
-# third; mean+-std firms as the later seeds complete. ~2-2.5h/run pre-fix; expect
-# roughly half that after the Jun-10 perf batch + max_num_seqs/mem-util fixes.
+# Seeds OUTER loop (7 -> 13 -> 42): a full 4-algo ranking lands after the first
+# third; mean+-std firms as the later seeds complete. ~2-2.5h/run pre-fix, ~53
+# min/run after the Jun-10 perf batch + max_num_seqs/mem-util fixes.
 #
 # One wandb GROUP per algo; aggregate with:
 #   .venv/bin/python tools/aggregate_seeds.py math-1.5b-<date>_<algo>

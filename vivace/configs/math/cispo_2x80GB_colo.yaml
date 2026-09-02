@@ -3,10 +3,10 @@
 # math/cispo_1x80GB_colo.yaml: bs=4, gs=8, accum=2 → 64 traj per rank per
 # optimizer step. Global = 2 × 64 = 128 trajectories/step.
 #
-# Compare against math/cispo_2x80GB.yaml (disaggregated, same 128 traj/step):
-# this config splits trainer+vLLM colocated on each rank and DDPs the
-# gradient across ranks, vs the disaggregated split (trainer GPU 0,
-# vLLM GPU 1). Same global batch, different communication pattern.
+# Compare against math/cispo_2x80GB.yaml (disaggregated: trainer GPU 0, vLLM
+# GPU 1, 64 traj/step from bs=8 × gs=8 × accum=1): this config colocates
+# trainer+vLLM on both ranks and DDPs the gradient at 128 traj/step. Different
+# batch and communication pattern — not batch-matched.
 #
 # Launch with: torchrun --nproc_per_node=2 -m vivace.scripts.train ...
 model_name: Qwen/Qwen2.5-1.5B

@@ -1,11 +1,13 @@
 """Evaluation harness — pass@1, maj@k, pass@k.
 
-Supports two generation backends:
+Two generation backends:
   - HF: model.generate() — works everywhere, slower
-  - vLLM: VLLMRolloutWorker.generate() — much faster, requires a worker instance
+  - vLLM: greedy eval calls `worker.llm.generate` directly (one call, current
+    LoRA attached); sampling eval uses `VLLMRolloutWorker.generate(n=k)`.
 
-`evaluate_model` is the workhorse: greedy decode (T=0), score each response
-with the env's reward function, return metrics + correct/incorrect lists.
+`evaluate_model` is the workhorse: greedy decode (T=0), `env.is_correct_batch`
+for accuracy and `env.reward_breakdown` for avg_reward, returns metrics +
+correct/incorrect lists.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ def evaluate_model(
         model: HF model (used for HF backend, ignored if vllm_worker is set)
         tokenizer: HF tokenizer
         examples: list of Example objects from env.load_split("eval")
-        env: Env instance (for format_prompt and reward_fn)
+        env: Env instance (format_prompt, reward_breakdown, is_correct_batch)
         n: number of examples to evaluate (-1 = all)
         batch_size: batch size for generation
         max_new_tokens: max response length

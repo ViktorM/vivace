@@ -18,12 +18,13 @@ WHY this design:
     memory and compare clipping styles directly.
 
 WHAT THIS FILE OWNS:
+  - build_response_mask  - loss mask from response lengths, no forward
   - compute_advantages   - 3-way dispatch on cfg.adv_type
   - compute_token_logprobs - forward pass, masking, optional entropy
   - compute_kl           - Schulman k3 estimator
-  - compute_loss         - 8-way dispatch on cfg.loss_type
-  - rl_step              - the full step: collect micro-batches,
-                           multi-epoch optimization, adaptive LR
+  - compute_loss         - 8-way dispatch on cfg.loss_type (dg*: stubs)
+  - rl_step              - multi-epoch optimization over the trainer's
+                           micro-batches; adaptive LR is a stub
 
 WHAT THIS FILE DOES NOT OWN:
   - Sampling (that's vivace/rollout/{hf_sampler,vllm_worker}.py)
@@ -73,8 +74,8 @@ def compute_advantages(rewards: torch.Tensor, cfg: RLConfig) -> torch.Tensor:
     """Compute per-sequence advantages from group rewards.
 
     Args:
-        rewards: shape [B, G]. Per-prompt-per-sample scalar rewards.
-        cfg: RLConfig — only `adv_type` and `adv_eps` matter here.
+        rewards: [B, G] or flat [B*G]; reshaped to (-1, G) internally.
+        cfg: RLConfig — `adv_type`, `group_size`, `adv_eps` are read.
 
     Returns:
         Tensor of shape [B*G], detached. To be broadcast against the
@@ -94,7 +95,7 @@ def compute_advantages(rewards: torch.Tensor, cfg: RLConfig) -> torch.Tensor:
 
     HINTS
     -----
-    - rg = rewards.view(B, G) where B = rewards.shape[0]
+    - rg = rewards.view(-1, G) — B inferred from the total, robust to adaptive filtering
     - For RLOO: total = rg.sum(-1, keepdim=True); baseline = (total - rg) / (G - 1)
     - For GRPO z-score: use rg.std(-1, keepdim=True, unbiased=False) — biased std
       is what most papers report.
@@ -147,52 +148,37 @@ def compute_token_logprobs(
         temperature: logit scaling — must match the sampling temperature.
         return_entropy: if True, also return per-token entropy [B, S-1].
         entropy_chunk_size: when > 0 and < T, compute entropy in slices of
-                       this many time steps along axis 1 to bound peak temp
-                       memory (the `[B, T, V]` `exp()` and product). 0 forces
-                       single-shot. Default 64 is a sweet spot at Qwen2.5
-                       vocab; see `cfg.entropy_chunk_size` for the rationale
-                       and `RLConfig` for the algo-level knob.
-        entropy_grad: True (default) keeps the chunked entropy compute inside
-                       the autograd graph via `torch.cat` — required for
-                       entropy-bonus variants where entropy enters the loss.
-                       False switches to a no_grad pre-allocated buffer with
-                       in-place writes, freeing ~50% more peak memory but
-                       producing a tensor with no `grad_fn`. Use False only
-                       when the caller treats entropy as logging-only;
-                       trying to backprop through it silently produces zero
-                       gradients (the in-place write breaks the graph).
+                       this many time steps to bound the `[B, chunk, V]` exp()
+                       temporaries; 0 = single-shot. 64 is the sweet spot at
+                       Qwen2.5 vocab (`RLConfig.entropy_chunk_size`).
+        entropy_grad: True (default) keeps the chunked entropy in the autograd
+                       graph via `torch.cat` — needed when entropy enters the
+                       loss. False writes a no_grad pre-allocated buffer: frees
+                       ~50% more peak memory but no `grad_fn` — backprop through
+                       it silently yields zero, so logging-only callers only.
         pad_token_id: token id used for left-padding. Used to build
                       the attention_mask for the forward pass.
-        stop_token_id: which token marks "end of response" for the LOSS mask.
-                       Defaults to pad_token_id if None — correct for
-                       single-turn GSM8K where EOS == pad == stop.
-
-                       For MULTI-TURN or TOOL-USE: EOS may appear mid-response
-                       as a turn separator. In that case set stop_token_id to
-                       the actual end-of-response delimiter, e.g.:
-                           tokenizer.encode("</answer>")[0]
-                       This way the mask includes the full multi-turn body and
-                       only stops at the real end signal.
-
-                       If stop_token_id never appears (max_tokens hit), ALL
-                       response tokens are included — the model didn't choose
-                       to stop, so every token carries signal.
+        stop_token_id: end-of-response token for the LOSS mask; only used when
+                       `response_lengths` is None. Defaults to pad_token_id —
+                       right for single-turn GSM8K where EOS == pad == stop.
+                       Multi-turn / tool-use: EOS is a turn separator, so pass
+                       the real delimiter, e.g. tokenizer.encode("</answer>")[0].
+                       If it never appears (max_tokens hit) every response token
+                       stays in the mask — the model never chose to stop.
         padding_side: "left" (only supported value for now).
-        response_lengths: optional [B] tensor of true response lengths (pre
-                       right-padding). When provided, the response mask is
-                       built exactly from these; without it, the function
-                       falls back to a stop-token heuristic that off-by-ones
+        response_lengths: optional [B] true response lengths (pre right-padding);
+                       the trainer always passes it. Builds the response mask
+                       exactly; without it the stop-token fallback off-by-ones
                        on max-tokens truncation when pad_id == eos_id.
 
     THEORY
     ------
     The trainer needs log-probs of the SAMPLED tokens under the CURRENT
-    policy (call them "new log-probs"). It also needs the same quantity
-    under the rollout policy ("old log-probs") for the importance ratio,
-    and under the frozen reference ("ref log-probs") for KL.
-
-    All three uses go through this same function. The caller picks which
-    model to pass in.
+    policy ("new"), the rollout policy ("old", importance ratio) and the
+    frozen reference ("ref", KL). New and ref call this function with
+    different models; old is the detached epoch-1 policy forward, which
+    equals a recompute because rollout weights == epoch-1 weights
+    (needs dropout == 0, enforced at trainer init).
 
     TWO MASKS, TWO PURPOSES
     -----------------------
@@ -201,12 +187,14 @@ def compute_token_logprobs(
       attention_mask: tells the transformer "which positions exist vs pad."
         Passed to model(full_ids, attention_mask=...). Without it, the model
         attends to pad tokens and produces garbage logits. Built from
-        pad_token_id. Operates INSIDE the forward pass.
+        pad_token_id (left pads) + response_lengths (right pads). Operates
+        INSIDE the forward pass.
 
       mask (response mask): tells the loss "which token log-probs count."
         Even on positions where the model produced valid logits, we zero out
-        prompt tokens and everything after the first stop token. Built from
-        stop_token_id. Operates OUTSIDE the forward pass, on the loss.
+        prompt tokens and everything past the response. Built from
+        response_lengths (stop_token_id is the fallback). Operates OUTSIDE
+        the forward pass, on the loss.
 
     Temperature scaling on the logits matches the rollout sampling
     temperature so the importance ratio is on the same distribution.
@@ -220,8 +208,8 @@ def compute_token_logprobs(
       attention mask must be 1 - cumprod(is_pad). With right-padding, it's
       different. This codebase uses left-padding throughout — stick with it.
     - log_softmax runs in bf16 to match the rest of the pipeline (model
-      forward, vLLM, gradients). Saves ~Vx memory on the [B, S-1, V] tensor
-      and avoids an extra cast vs. fp32. Importance ratios and KL still
+      forward, vLLM, gradients). Halves the [B, S-1, V] tensor vs fp32
+      and avoids an extra cast. Importance ratios and KL still
       reduce in fp32 downstream where it matters.
     - The entropy computation re-uses log_probs — compute probs as
       log_probs.exp() (no redundant softmax) and cast the [B, S-1] reduction
@@ -234,7 +222,8 @@ def compute_token_logprobs(
     - targets = full_ids[:, 1:]
     - log_probs = F.log_softmax(logits, dim=-1)   # bf16
     - token_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    - For the RESPONSE MASK, use stop_token_id (not pad_token_id):
+    - RESPONSE MASK: build_response_mask(...) from response_lengths; the
+      fallback uses stop_token_id (not pad_token_id):
         stop_id = stop_token_id if stop_token_id is not None else pad_token_id
         is_stop = (targets == stop_id)
         is_stop[:, :start] = False
@@ -361,40 +350,32 @@ def compute_kl(
     `policy`. They differ in variance and sign behavior.
 
     k1 — NAIVE LOG-RATIO
-        KL_k1 ≈ E_{x~policy}[ log policy(x) - log ref(x) ] = E[log_r * -1]
+        KL_k1 ≈ E_{x~policy}[ log policy(x) - log ref(x) ]
+        per token: `policy_logp - ref_logp` = -log_r
 
-        Shape used here (per-token): `kl_per_token = -(ref_logp - policy_logp)`
-                                    = `policy_logp - ref_logp`
-
-        Properties:
-          + Simplest possible estimator, one line of math.
-          + Unbiased in expectation (that's the definition of KL).
-          - HIGH VARIANCE. A single outlier token with ratio ~0.01 or ~100
-            dominates the mean.
-          - Can go NEGATIVE on any finite sample. Looks wrong on a plot
-            even though the expectation is correct. Newcomers get confused
-            and start "fixing" it with abs().
-          - Bad signal for adaptive KL control (noisy -> LR oscillates).
+        + Simplest estimator, unbiased by definition.
+        - HIGH VARIANCE: one outlier token with ratio ~0.01 or ~100
+          dominates the mean.
+        - Can go NEGATIVE on any finite sample — expected, don't "fix" it
+          with abs().
+        - Noisy signal for adaptive KL control (LR oscillates).
 
     k3 — SCHULMAN UNBIASED
         KL_k3 ≈ E[ r - log(r) - 1 ]   where r = exp(ref_logp - policy_logp)
 
-        Properties:
-          + ALWAYS >= 0 (r - log(r) - 1 has minimum 0 at r=1).
-          + Unbiased (same expectation as k1, different finite-sample
-            distribution).
-          + Lower variance than k1 in practice.
-          + Stable signal for adaptive KL / LR control.
-          - Slightly more compute than k1 (one exp + one add).
+        + ALWAYS >= 0 (r - log(r) - 1 has minimum 0 at r=1).
+        + Unbiased (same expectation as k1, different finite-sample
+          distribution), lower variance in practice, stable signal for
+          adaptive KL / LR control.
+        - One exp + one add more than k1.
 
         See John Schulman's blog post "Approximating KL Divergence"
         (http://joschu.net/blog/kl-approx.html) for the derivation and
-        variance analysis. This is what GRPO/DAPO/etc. actually use.
+        variance analysis. This is the GRPO paper's estimator (DAPO drops
+        the KL term; vivace's dapo recipes keep it).
 
-    DEFAULT: k3. Use k1 only for debugging / comparison / when you want
-    to confirm your k3 implementation matches the naive version in
-    expectation (run both over many steps, compare means — they should
-    agree to within ~sampling noise).
+    DEFAULT: k3. k1 is for debugging / comparison — run both over many
+    steps; the means should agree to within sampling noise.
 
     HINTS
     -----
@@ -407,11 +388,10 @@ def compute_kl(
 
     GOTCHA
     ------
-    For k3, clamp log_r before exp() if you're seeing nan/inf in training:
-        log_r = (ref_logp - policy_logp).clamp(-10, 10)
-    `rl_step` clamps the POLICY ratio to [-5, 5] but that's a different
-    ratio (policy/old, not ref/policy). For the KL ratio, -10/+10
-    is looser and sufficient for stability without distorting typical values.
+    k3 clamps log_r to [-10, 10] before exp() so one outlier token cannot
+    produce inf. `compute_loss` / `rl_step` clamp the POLICY log-ratio
+    (policy/old) to [-5, 5] — a different ratio; ±10 is looser and sufficient
+    here without distorting typical values.
     """
     policy_logp_f = policy_logp.float()
     ref_logp_f = ref_logp.float()
@@ -444,8 +424,8 @@ def compute_loss(
     """Policy gradient loss for the configured variant.
 
     Args:
-        cfg: RLConfig — `loss_type`, `clip_low`, `clip_high`, `clip_ratio`,
-             `clip_cispo_high`, `clip_cispo_low`, `dg_eta`, `max_new_tokens` are all read.
+        cfg: RLConfig — reads `loss_type`, `clip_low`, `clip_high`, `clip_cispo_low`,
+             `clip_cispo_high`, `cispo_use_token_mask`, `cispo_normalization`, `max_new_tokens`.
         policy_logp: [B*G, S-1] under current policy (with grad).
         old_logp: [B*G, S-1] under rollout policy (no grad).
         advantages: [B*G] (no grad).
@@ -484,16 +464,15 @@ def compute_loss(
     - "cispo"    : Importance-clipped policy-gradient. Detach the clamped
                    weight and multiply policy_logp directly. Canonical CISPO
                    preserves gradients for all tokens; the MiniMax-M1 eq. 7
-                   / PPO-style token mask is available as an explicit
-                   opt-in via cfg.cispo_use_token_mask.
+                   / PPO-style token mask is an opt-in via
+                   cfg.cispo_use_token_mask. cfg.cispo_normalization picks
+                   token mean, per-sequence mean, or hybrid (average; default).
 
-    - "dg"       : Delight-gated PG. Compute "delight" = eta * adv * surprisal
-                   (surprisal = -policy_logp.detach()), pass through sigmoid
-                   to get a per-token gate, multiply against the policy
-                   gradient term.
+    - "dg"       : STUB (NotImplementedError). Design: gate the PG term by
+                   sigmoid(eta * adv * surprisal), surprisal = -policy_logp.detach().
 
-    - "dg_cispo" : DG and CISPO combined. Use the clamped importance weight
-                   from CISPO AND the sigmoid gate from DG.
+    - "dg_cispo" : STUB (NotImplementedError). Design: CISPO's clamped
+                   importance weight AND DG's sigmoid gate.
 
     GOTCHAS
     -------
@@ -576,7 +555,7 @@ def compute_loss(
 
 
 # =============================================================================
-# 5. FULL RL STEP — collect, multi-epoch optimize, adaptive LR
+# 5. FULL RL STEP — multi-epoch optimize over pre-collected micro-batches, build metrics
 # =============================================================================
 def rl_step(
     cfg: RLConfig,
@@ -592,20 +571,21 @@ def rl_step(
 
     Args:
         cfg: RLConfig
-        micro_batches: list of pre-collected micro-batches. Each is a dict with
-                       keys: full_ids, plen, adv, old_logp, ref_logp, mask,
-                       token_count, responses, rewards. Built by the trainer's
-                       rollout_phase.
+        micro_batches: list of pre-collected micro-batches from the trainer's
+                       rollout_phase. Keys: full_ids, plen, adv, old_logp (None
+                       on entry — filled from the epoch-1 forward), ref_logp
+                       (None when kl_coef == 0), mask, token_count, responses,
+                       rewards, pad_token_id, response_lengths.
         model: trainable policy (already DDP-wrapped if distributed).
-        ref_model: frozen reference (LoRA: base model with disable_adapter;
-                   full FT: separate frozen copy).
         optimizer: AdamW or similar, already constructed.
-        stats: TrainingStats instance to log into.
-        step: current step number (for logging cadence).
-        kl_ema: rolling KL EMA from previous step (for adaptive LR).
+        ref_model/stats/step: unused — kept for call-site compatibility
+                       (ref_logp is precomputed in rollout_phase; the trainer
+                       is the single stats.log() caller).
+        kl_ema: returned unchanged (adaptive LR is a stub).
 
     Returns:
-        (metrics_dict, new_kl_ema). metrics_dict has loss/reward/kl/clip_frac.
+        (metrics_dict, kl_ema). metrics_dict has loss/reward/kl/clip_frac/...
+        plus `_*` sufficient stats the trainer reduces across ranks and drops.
 
     PHASES
     ------
@@ -617,12 +597,10 @@ def rl_step(
          c. (only on the LAST epoch) accumulate clip stats, entropy, etc.
          d. clip_grad_norm_ + optimizer.step
 
-    2. Adaptive LR (if cfg.use_adaptive_lr):
-       - Update kl_ema with the per-step mean KL (capped at kl_target * 10).
-       - If kl_ema > kl_target * kl_factor: shrink LR (keep above min_lr).
-       - If kl_ema < kl_target / kl_factor: grow LR (keep below max_lr).
+    2. Adaptive LR (cfg.use_adaptive_lr): STUB — `pass`, so kl_target /
+       kl_factor / lr_factor / min_lr / max_lr have no effect.
 
-    3. Stats logging (push into TrainingStats).
+    3. Build and return the metrics dict — no logging here.
 
     GOTCHAS
     -------
@@ -633,8 +611,8 @@ def rl_step(
       averages across grad accumulation.
     - clip_frac counting differs between sequence-level (GSPO) and
       token-level (everything else) — see the branching below.
-    - For RLOO, optim_epochs=1 should be set by the config, should add a warning
-      (the trainer should do this).
+    - RLOO: validate_rl_config (trainer init) warns and forces optim_epochs=1.
+    - Learning metrics reflect the LAST epoch only (`if last`).
 
     """
     model.train()
@@ -719,15 +697,10 @@ def rl_step(
                     if entropy is not None:
                         tot_ent += (entropy * mb["mask"]).sum() / mb["mask"].sum().clamp(min=1.0)
 
-                    # Clip fraction — differs between sequence-level (GSPO) and
-                    # token-level (PPO-style). For GSPO the denominator counts
-                    # sequences, so clip_frac is NOT cross-comparable to PPO's
-                    # token-level rate; treat it as "fraction of sequences
-                    # whose ratio left the trust region this step."
-                    # NOTE: at optim_epochs=1 these stats are degenerate by
-                    # construction — old_logp IS this epoch's forward, so the
-                    # ratio is exactly 1 and clip_frac is exactly 0. Expected,
-                    # not a bug. Real clip activity needs epochs >= 2.
+                    # Clip fraction: GSPO counts sequences, PPO-style variants count
+                    # tokens — not cross-comparable. At optim_epochs=1 old_logp IS this
+                    # epoch's forward, so ratio ≡ 1 and clip_frac ≡ 0 by construction;
+                    # real clip activity needs epochs >= 2.
                     if cfg.loss_type == "gspo":
                         seq_lp = (policy_logp * mb["mask"]).sum(dim=1) / mb["token_count"]
                         old_seq_lp = (mb["old_logp"] * mb["mask"]).sum(dim=1) / mb["token_count"]

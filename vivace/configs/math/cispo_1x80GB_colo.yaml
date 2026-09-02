@@ -4,12 +4,10 @@
 # per-rank batch_size=4, group_size=8, grad_accum_steps=2 → 64 trajectories
 # per rank per optimizer step. Global trajectories = N_ranks × 64.
 #
-# Trainer + vLLM share each GPU via vLLM sleep/wake. gpu_memory_utilization
-# is bumped from the disaggregated 0.8 down to 0.35 to leave room for the
-# trainer's activations + Adam state on the same card. On 80GB:
-#   vLLM = 0.35 × 80 = 28 GB (weights ~3 GB + KV ~20 GB at vllm_max_num_seqs=128)
-#   Trainer = ~25 GB (1.5B model + LoRA + Adam + activations at micro-bs 32)
-# Leaves ~25 GB headroom on each card.
+# Trainer + vLLM share the GPU via sleep/wake: vLLM takes 0.7 × 80 = 56 GB while
+# generating (weights ~3 GB, rest KV at vllm_max_num_seqs=256), then level-1
+# sleeps (weights to CPU, KV freed) for the train phase, which needs ~25 GB
+# (1.5B + LoRA + Adam + activations at micro-bs 32).
 #
 # Recipe (loss / lr / kl / clipping) matches the validated math winner from
 # 2x4090 (math/cispo_2x4090.yaml) so results are comparable to that baseline.

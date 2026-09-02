@@ -6,17 +6,18 @@ which provider to use. Companion to [`docs/architecture.md`](architecture.md)
 
 ## Why we need this
 
-The 2× 4090 local box has worked for the GRPO/DAPO/CISPO algo zoo at
-Qwen2.5-1.5B + LoRA r=16. Beyond that, we're hitting:
+The 2× 4090 local box has carried the 5-algo × 3-seed v1 benchmark
+(GRPO/DAPO/GSPO/CISPO/Dr.GRPO, `docs/v1_results.md`) at Qwen2.5-1.5B + LoRA
+r=16. Beyond that, we're hitting:
 
-- **Effective batch ceiling** — 8 trajectories/gradient step is small. Most
-  observed RL-instability patterns at this scale resolve with bigger batches.
-  Paper recipes (MiniMax CISPO at 512 H800s, DeepSeek R1) need cluster-class
-  effective batches to reproduce faithfully.
+- **Effective batch ceiling** — 32 trajectories/gradient step (bs=1 × gs=8 ×
+  accum=4) is small. Most observed RL-instability patterns at this scale
+  resolve with bigger batches. Paper recipes (MiniMax CISPO at 512 H800s,
+  DeepSeek R1) need cluster-class effective batches to reproduce faithfully.
 - **Model ceiling** — Qwen2.5-7B + LoRA fits one H100 but not one 4090. Full-FT
   7B and any larger model needs FSDP across multiple GPUs.
-- **Seed sweeps** — single 500-step run is ~3h. 3 seeds × N variants serial
-  is intractable locally. Cluster runs them in parallel for ~the same wall.
+- **Seed sweeps** — a 200-step Math run is ~53 min; the 15-run v1 matrix took
+  ~13 h serial. Cluster runs them in parallel for ~the same wall.
 
 ## Decision
 
@@ -39,7 +40,7 @@ speed at H100 price, with EU-only footprint and eviction risk. Park as
 "consider for long batch jobs that tolerate restart."
 
 **Skip:** Lambda (reservations-only for clusters), Together (8-GPU minimum kills
-single-H100 iteration), Together / cs336 list's reserved-only options.
+single-H100 iteration), the cs336 list's other reserved-only options.
 
 ## Per-axis comparison (Modal vs Runpod)
 
@@ -97,8 +98,9 @@ where available. Numbers from public pricing pages as of 2026-05-13; verify befo
 
 ### Wall-time and cost estimates (CISPO 500-step math, 1.5B)
 
-Local 2× 4090 baseline is ~2.5–3h wall (current config: group=8, batch=1,
-grad_accum=4, max_new=768). At cluster scale we can push group_size + batch_size
+Local 2× 4090 baseline (group=8, batch=1, grad_accum=4, max_new=768): ~2.5–3h
+wall for 500 steps before the June 2026 perf fixes; ~53 min per 200-step run
+now. At cluster scale we can push group_size + batch_size
 much higher, reduce grad_accum, and the rollout itself runs ~2–3× faster on
 H100/H200/B200. Estimates assume we tune the recipe accordingly.
 
@@ -124,48 +126,52 @@ matrix (15 runs) at 2× H100 is ~$45 total.
 
 ## Implementation plan
 
-### Phase 1 — Runpod 2× H100 (week 1, ~1 day work)
+### Phase 1 — Runpod 2× 80GB (done May 2026)
 
-We skip the 1× H100 baseline because real vivace runs are at least 2-GPU (disagg:
-trainer + vLLM on separate cards), matching the current desktop topology.
+We skipped a 1× disagg baseline because real vivace runs are at least 2-GPU
+(disagg: trainer + vLLM on separate cards), matching the desktop topology;
+`math/cispo_1x80GB_colo.yaml` is the 1× colocated point for Phase 2 instead.
 
-1. Write `docker/Dockerfile`. Use `nvidia/cuda:13.1.0-devel-ubuntu24.04` for all
-   GPU types — works for torch 2.11 (current vivace stack) via forward
-   compatibility, works for torch 2.12 (future), and is required for B200
-   (sm_100 compute capability). Single base image keeps H100/H200/B200 setups
-   identical.
-   Installs `uv`, copies repo, runs `uv sync` to build the venv (vLLM 0.20 +
-   torch 2.11 + deps). Sets `WANDB_API_KEY` and `HF_HOME` via runtime env vars.
-   Entrypoint: `bash` (don't auto-train; user attaches via SSH or `torchrun`
-   directly).
-2. Push to `ghcr.io/<user>/vivace:latest`.
-3. Create a Runpod template referencing the image, attach a 500 GB network
-   volume mounted at `/workspace/checkpoints` and `/workspace/wandb`.
-4. Spin up a **2× H100 80GB SXM Secure** pod; `git pull`, `torchrun
-   --nproc_per_node=1 ... train` with disagg (trainer on GPU 0, vLLM on
-   GPU 1). Compare wall-clock + final accuracy against local 2× 4090
-   numbers as a sanity check.
-5. Tear down. Cost target: <$5 per smoke test, <$20 for a full 500-step run.
+1. `docker/Dockerfile` — `nvidia/cuda:13.0.1-devel-ubuntu24.04` for all GPU
+   types (cu13 covers B200 sm_100; one base keeps H100/H200/B200 identical);
+   `uv sync --frozen` from `uv.lock` (torch 2.13.0+cu130 + vLLM 0.28.0). **Stay on
+   `devel`**: vLLM/flashinfer JIT-compile sm_100 kernels via nvcc at first
+   model load, which `runtime` lacks — H100 works there, B200 crashes.
+   `HF_HOME=/workspace/hf_cache`, `WANDB_DIR=/workspace/wandb` are baked in;
+   `WANDB_API_KEY` comes from the pod env. `docker/entrypoint.sh` starts sshd
+   from Runpod's `PUBLIC_KEY`, writes the venv env to `/etc/profile.d/` (SSH
+   logins don't inherit Docker `ENV`), then `sleep infinity` — training is
+   launched by hand over SSH.
+2. `docker/push.sh <version> [--latest] [--yes]` pushes
+   `ghcr.io/<user>/vivace:<version>` + `:<git-sha>`; `:latest` only on request.
+3. Runpod template + 500 GB network volume mounted at `/workspace`
+   (`checkpoints/`, `wandb/`, `hf_cache/`).
+4. Validated on 2× A100 80GB SXM with `math/cispo_2x80GB.yaml` (disagg, bs=8,
+   gs=8, accum=1, max_new=1024, GC on): 27 s/step. Recipe in
+   `docs/runpod_quickstart.md`.
 
-### Phase 2 — Runpod 4× and 8× H100 single-node (week 2, ~1 day)
+### Phase 2 — 1/2/4/8-GPU scaling study (configs landed 2026-05-18; curve not yet run)
 
-Step up from 2-GPU to 4 and 8 once the 2-GPU Phase 1 baseline is reproduced.
+`math/cispo_{1x,2x,4x,8x}80GB_colo.yaml` keep per-rank work identical (bs=4,
+gs=8, accum=2 → 64 traj/rank/step), so global batch = 64 × ranks: 64 / 128 /
+256 / 512 traj/step (2×–16× the desktop's 32). `math/cispo_2x80GB.yaml` is the
+disagg counterpart at 64 traj/step.
 
-1. **4× H100** first (`nproc_per_node=2` DDP for trainer + 2 vLLM workers, or
-   `nproc_per_node=4` colocated). Test scale-up: `batch_size: 2`, `group_size:
-   8`, `grad_accum_steps: 2` → 64 trajectories per gradient step (2× the
-   desktop). If stable + faster, push further.
-2. **8× H100** next (`nproc_per_node=4` DDP + 4 vLLM workers, or
-   `nproc_per_node=8` colocated). Push to `batch_size: 4`, `group_size: 8`,
-   `grad_accum_steps: 2` → 128 trajectories per gradient step (4× the
-   desktop). **This is the direct test of "small batch is the cause" of the
-   collapse pattern we've been hitting at 32 trajectories.**
-3. Try **2× H200** as an alternative — same compute as 2× H100 but more
-   memory for fitting bigger group_size without gradient_checkpointing
-   (which costs ~30% step-time). Compare wall-clock at matched recipe.
-4. If anything is stable that wasn't locally: run the deferred experiments
-   queue (Adam/rank=32/kl=0.02/etc.) at scale to see whether they were
-   variant problems or scale problems.
+1. Run all four points on **one 8-GPU node**, subsetting GPUs — never four
+   separate cloud invocations (5–15% per-host speed variance; the 8× point
+   needs the real NVLink topology). H100 SXM for writeup numbers, A100 only
+   as availability fallback.
+2. Disagg DDP is 1:1 trainer:rollout by construction (trainer validation), so
+   4× = `nproc_per_node=2` + 2 vLLM GPUs or `nproc_per_node=4` colo; 8× = 4 + 4
+   or `nproc_per_node=8` colo. An asymmetric split needs a trainer change.
+3. The 8× colo run (512 traj/step) is the direct test of "small batch is the
+   cause" of the step-200 collapse seen at 32 trajectories and of the 20-pt
+   seed spread at 128 (2026-05-13).
+4. **2× H200** as an alternative — same compute as 2× H100, memory for a bigger
+   group_size without gradient_checkpointing (~30% step-time).
+5. Part of the deferred queue already ran as the May 2026 4×H200 colo set
+   (Adam(0.95,1e-15), kl=0.02, ep=2/4/8 — `docs/ablation_studies.md`); rank=32
+   and the rest remain.
 
 ### Phase 3 — Modal port for seed sweep (week 3, ~2 days)
 
@@ -197,7 +203,7 @@ Step up from 2-GPU to 4 and 8 once the 2-GPU Phase 1 baseline is reproduced.
   Modal image.
 - **Modal `@clustered` beta + 8-GPU-per-node enforcement (post-2026-05-31).**
   No `H100:4` clusters. For 2× 4090-equivalent dev jobs, stay local.
-- **vLLM subprocess model.** Our trainer forks vLLM as a child process. Need
+- **vLLM subprocess model.** vLLM spawns an EngineCore child per rank. Need
   to verify this works under Modal's container model (Modal has historically
   preferred single-process functions; subprocess may need explicit
   permission or a different decorator).

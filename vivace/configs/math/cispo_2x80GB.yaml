@@ -4,32 +4,27 @@
 #
 # Same family as the 4090 math recipe (canonical clipped-IS CISPO, lr=2e-5,
 # kl=0.01), but:
-# - batch_size: 8 (was 1 on 4090) — 8 unique prompts per micro-batch.
-#   Direct scale-up of the 4090's gs=8/bs=1 baseline, just wider. Keeps
-#   the validated per-prompt advantage variance (gs=8) and trades more
-#   prompts per step for diversity. gs=16 is an explicit ablation, not
-#   the default (see docs/ablation_studies.md).
-# - group_size: 8 (matches the 4090 baseline)
+# - batch_size: 8 (was 1 on 4090) — 8 unique prompts per micro-batch for
+#   diversity; gs=8 kept so per-prompt advantage variance matches the validated
+#   baseline. gs=16 is an explicit ablation (docs/ablation_studies.md), not the
+#   default.
 # - grad_accum_steps: 1 (was 4 on 4090) — 80GB fits the whole step in one
 #   microbatch. Validated 27 s/step on 2× A100 SXM at this setting.
-# - Net: 8 × 8 × 1 = 64 trajectories per gradient step (2× the desktop's 32).
-#   This is also the first cluster-scale test of the "small batch is the cause"
+# - Net: 8 × 8 × 1 = 64 trajectories per gradient step (2× the desktop's 32);
+#   also the first cluster-scale test of the "small batch is the cause"
 #   hypothesis for the step-200 collapse pattern.
-# - gradient_checkpointing ON — bs=8 × max_new=1024 hits ~78 GB peak on the
-#   trainer GPU without checkpointing, leaving no room for the SiLU forward
-#   spike. GC brings peak to ~52 GB. ~30% slower per step, but the only
-#   way bs=8 at max=1024 fits on 80GB.
-# - gpu_memory_utilization: 0.80 — disagg rollout GPU is dedicated to vLLM
-#   (no trainer sharing), so vLLM gets ~64 GB of KV cache. Distinct from
-#   the colocated config where 0.25 is right because the trainer needs the
-#   rest of the card.
-# - vllm_max_num_seqs: 256 — wide enough that rollout bursts and full-set
-#   eval generation never serialize (rollout burst: 8×8×2.0 = 128 concurrent).
+# - gradient_checkpointing ON — bs=8 × max_new=1024 peaks ~78 GB on the trainer
+#   GPU without it, no room for the SiLU forward spike; GC brings peak to ~52 GB
+#   at ~30% slower steps. The only way bs=8 at max=1024 fits on 80GB.
+# - gpu_memory_utilization: 0.80 — the rollout GPU is vLLM's alone: ~64 GB pool
+#   (weights ~3 GB, rest KV). Colocated configs use 0.7 and rely on vLLM sleep.
+# - vllm_max_num_seqs: 256 — rollout bursts (8×8×2.0 = 128 concurrent) and
+#   full-set eval generation never serialize.
 # - eval_batch_size: 128 — eval runs through vLLM; same headroom applies.
 #
-# Verify GPU memory utilization (see runpod_quickstart.md "Verify GPU
-# memory utilization" section) and bump batch_size / group_size further
-# if either GPU has significant headroom.
+# Verify GPU memory utilization (runpod_quickstart.md, "Verify GPU memory
+# utilization") and bump batch_size / group_size further if either GPU has
+# significant headroom.
 model_name: Qwen/Qwen2.5-1.5B
 env_name: math
 eval_envs:

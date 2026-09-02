@@ -21,17 +21,16 @@ module docstrings. Read before making non-obvious changes to `Trainer`,
 
 ## Wrap order: LoRA + DDP
 
-Setting up a LoRA + DDP model must happen in this order:
+`Trainer.__init__` builds the model in this order:
 
-1. Load base model (HF, bf16, `low_cpu_mem_usage=True`)
+1. Load base model (HF, bf16, `low_cpu_mem_usage=True`), `.to(device)`
 2. `peft.get_peft_model(base, lora_cfg)` — LoRA wrap
-3. `.to(device)`
-4. `DDP(model, device_ids=[local_rank])` — DDP wrap
+3. `gradient_checkpointing_enable(use_reentrant=False)` if enabled
+4. `DDP(model, device_ids=[self.device.index])` — DDP wrap
 
-Other orders appear to work but silently break checkpointing or gradient
-sync. The peft wrap must happen before DDP so DDP sees the LoRA modules as
-part of the param list; `.to(device)` must happen before DDP because DDP
-reads device info at wrap time.
+peft before DDP so DDP registers the LoRA params for gradient sync; on-device
+before DDP because DDP reads device info at wrap time. `device_ids` is the
+model's device, not `local_rank` (`trainer_gpus=[2,3]` under no outer mask).
 
 For full FT (no LoRA): skip step 2.
 
@@ -39,9 +38,10 @@ For full FT (no LoRA): skip step 2.
 
 RL uses a reference model for the KL penalty. Two strategies:
 
-**With LoRA** (preferred): there is no separate ref model. Use
-`with model.disable_adapter():` inside `compute_token_logprobs` to forward
-through the base weights. Zero extra VRAM; the base is already loaded.
+**With LoRA** (preferred): there is no separate ref model. `rollout_phase`
+wraps the ref `compute_token_logprobs` call in
+`with self._inner_model.disable_adapter():` to forward through the base
+weights. Zero extra VRAM. Skipped entirely when `kl_coef == 0`.
 
 **Without LoRA**: need a frozen deepcopy.
 
@@ -67,73 +67,69 @@ for p in ref_model.parameters():
 
 ## Colocated memory budget
 
-On 2×4090 (24 GB each) with Qwen2.5-0.5B + LoRA:
+Colocated mode time-shares the card: vLLM is built with
+`enable_sleep_mode=True` (without it `sleep()` frees zero bytes), level-1
+sleeps right after generate and wakes before sync. The trainer gets the whole
+card during train; what binds is the awake phase, when trainer weights + LoRA
++ Adam state sit next to vLLM's `gpu_memory_utilization`.
 
-```
-~ 2.0 GB   base model (bf16)
-~ 0.5 GB   LoRA params + grads + optimizer state (Adam 4× params in fp32)
-~ 4.0 GB   activation memory during forward + backward
-~ 8.0 GB   vLLM KV cache (tunable via gpu_memory_utilization)
-~ 9.0 GB   headroom (CUDA overhead, fragmentation)
-```
-
-Set `gpu_memory_utilization ≈ 0.35` for vLLM in colocated mode — trainer
-gets the rest implicitly. In disaggregated mode, crank to 0.85 since the
-rollout GPU has nothing else on it.
-
-For larger models (Qwen2.5-1.5B+), colocated gets tight on 24 GB. Use
-disaggregated mode (trainer on one GPU, vLLM on another).
+Shipped values: 0.7 for 0.5B colo; 0.65 for 1.5B DDP-colo on 2×4090 (0.7
+OOMs in `merge_adapter` once the desktop eats 2.4 GB); 0.5 for 3B DDP-colo
+(5.8 GB of weights in both trainer and vLLM during sync); 0.8 for every
+disaggregated yaml. Never set `expandable_segments` in colocated mode — it
+breaks sleep mode's CUDA memory pools (PyTorch #147851). 1.5B MATH on 24 GB
+also needs `gradient_checkpointing: true`.
 
 ## vLLM construction gotchas
 
-- `enforce_eager=True` during dev. CUDA graphs and hot weight updates don't
-  always cooperate; eager is slower but simpler. Drop once `update_weights`
-  is solid.
+- `enforce_eager` defaults to False (CUDA graphs on): level-1 sleep and
+  in-place IPC/NCCL sync keep virtual addresses stable, so graphs survive
+  both.
 - Match dtypes exactly across trainer and vLLM (bf16 default). Mixed dtype
   makes in-place weight copy fail mid-broadcast.
-- Build `LLM` AFTER `init_distributed()` and AFTER `torch.cuda.set_device()`,
-  otherwise vLLM grabs cuda:0 on every rank.
-- `enable_lora=True` + `max_lora_rank` reserve a little extra memory at
-  init (vLLM pre-allocates LoRA buffers). Set `max_lora_rank` to the
-  largest rank you'll use across all training runs.
 - vLLM spawns an `EngineCore` subprocess that inherits `CUDA_VISIBLE_DEVICES`
-  at spawn time. `torch.cuda.set_device()` does NOT propagate to child
-  processes. Pin vLLM with env var mutation before `LLM()`, restore after.
+  at spawn time; `torch.cuda.set_device()` does NOT propagate. The worker
+  sets the env var (physical ids) around `LLM()` and pops torchrun's
+  `RANK/LOCAL_RANK/WORLD_SIZE/MASTER_*` for the same window — EngineCore
+  otherwise tries torchrun's TCPStore.
+- `enable_lora=True` only on the disk-sync path: NCCL/IPC ship merged base
+  weights, and `enable_lora` re-parents vLLM's linears under
+  `.base_layer.weight`, breaking the broadcast-spec name matching.
+- `logprobs_mode="processed_logprobs"`: v1's default `raw_logprobs` ignores
+  temperature; `compute_token_logprobs` uses `logits/T`.
 
 ## LoRA hot-swap via disk
 
-Minimal sync path when NCCL is overkill or not yet working:
+Minimal sync path (`weight_sync_method: disk`), LoRA only:
 
 ```python
-# trainer:
-peft_model.save_pretrained(adapter_path)
-# worker:
-self.llm.add_lora(LoRARequest(name, lora_int_id, adapter_path))
+# trainer (rank 0, then barrier); adapter_path defaults to /dev/shm
+self._inner_model.save_pretrained(adapter_path)
+# worker: bump lora_int_id; pass the request on every generate()
+self._lora_counter += 1
+self._current_lora = LoRARequest(f"adapter-{n}", lora_int_id=n, lora_path=adapter_path)
 ```
 
-Then pass that `LoRARequest` on every `generate` call. Key gotcha: vLLM
-caches adapters by `lora_int_id`. You MUST increment on each sync, or vLLM
-silently serves the stale adapter and training looks broken for no reason.
+Key gotcha: vLLM caches adapters by `lora_int_id`. You MUST increment on each
+sync, or vLLM silently serves the stale adapter and training looks broken for
+no reason.
 
-Works always; slow (~300-500 ms/sync). Graduate to in-place NCCL when perf
+Works always; slow (~300-500 ms/sync). Graduate to IPC / NCCL when perf
 matters.
 
 ## KV cache sleep/wake in colocated mode
 
-In colocated mode, vLLM's KV cache is the biggest VRAM consumer during
-rollout. After rollout ends, free it so the trainer can use that memory
-for activations + grads:
+vLLM's KV cache is the biggest VRAM consumer during rollout. `rollout_phase`
+sleeps vLLM right after `generate` — the reward / advantage / logprob
+recompute that follows is trainer-side and needs the memory:
 
 ```python
-self.llm.sleep()         # recent vLLM (≥0.6.x)
-torch.cuda.empty_cache()  # actually return to allocator pool
+gc.collect(); torch.cuda.empty_cache()   # stable baseline for vLLM's freed_bytes >= 0 check
+self.llm.sleep(level=1)                  # weights → CPU, KV discarded; needs enable_sleep_mode=True
 ```
 
-Pair with `wake_up()` before the next rollout. Forget one and OOM on the
-next step.
-
-Older vLLM (<0.6): set `driver_worker.cache_engine = None` manually. Feature
-detect with `hasattr`.
+`wake_up()` runs after `train_phase` and BEFORE `sync_weights()`: a sync into
+a sleeping engine writes to unmapped pages and crashes the worker.
 
 ## torch.distributed primer
 
@@ -204,7 +200,7 @@ Not needed for DDP (each rank has the full param).
   reference for weight sync and scheduler
 - [verl](https://github.com/volcengine/verl) — HybridEngine, sophisticated
   resharding between training and generation layouts
-- [slime](https://github.com/THUDM/slime) — ByteDance, clean
-  trainer + SGLang separation over HTTP
+- [slime](https://github.com/THUDM/slime) — THUDM / Z.ai (GLM post-training),
+  clean trainer + SGLang separation over HTTP
 - [TRL vLLM integration](https://huggingface.co/docs/trl/main/en/vllm_integration) — HuggingFace's client/server-mode pattern
 - [vLLM RFC #31848: Native weight syncing APIs](https://github.com/vllm-project/vllm/issues/31848) — future stable API

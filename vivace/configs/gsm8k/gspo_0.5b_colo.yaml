@@ -34,9 +34,9 @@ weight_sync_method: ipc
 seed: 42
 rl:
   # GSPO: sequence-level importance clipping (vs DAPO's token-level).
-  # Same compute budget, optimizer, KL, sampling, adaptive sampling as the
-  # DAPO DDP config — only loss_type / adv_type differ for an apples-to-apples
-  # comparison. adv_type=grpo (z-scored) is what the GSPO paper uses.
+  # Same optimizer, KL, sampling, adaptive sampling as the DAPO colo config
+  # (run here as 2-GPU DDP); differs in loss_type, max_new (192 vs 256) and
+  # eval_n (500 vs full). adv_type stays rloo; the GSPO paper uses grpo (z-scored).
   loss_type: gspo
   adv_type: rloo
   batch_size: 1

@@ -10,7 +10,7 @@ Invariant: trainer-side tensor pointers must be stable across the run.
     via `+=` / `-=`, so the storage is the same object across steps.
   - Fused buffers (qkv, gate_up) are preallocated once via `allocate_fused_buffers`
     and reused; pointers stable.
-  - Live LoRA matrices (A, B) and full-FT live params likewise have stable storage.
+  - Full-FT live params likewise have stable storage (LoRA A/B are never shipped).
 
 Therefore IPC handles are taken once at init and reused for every per-step copy.
 """
@@ -127,9 +127,7 @@ def receiver_copy_loop(
 ) -> None:
     """vLLM-worker side: copy each aliased trainer tensor into vLLM's matching param.
 
-    Same-device GPU memcpy per spec. No NCCL, no wire transfer, no allocator
-    pressure beyond what `target.copy_(src)` does (zero — both are existing
-    allocations).
+    One same-device memcpy per spec — no NCCL, no allocation (both sides exist).
     """
     for spec in specs:
         canonical = strip_wrapper_prefixes(spec.name)

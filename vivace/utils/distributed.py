@@ -7,8 +7,8 @@ When these are absent (single-process dev), helpers return sensible defaults
 (rank=0, world_size=1) without touching torch.distributed.
 
 NCCL weight sync to the vLLM worker lives in `vivace/utils/weight_sync.py`
-and uses a separate `StatelessProcessGroup` rather than the default group
-here — see `docs/weight_sync_approaches.md` for why.
+and uses a separate `StatelessProcessGroup`: vLLM's EngineCore is a subprocess,
+not a torchrun rank, so each DDP rank pairs with its own worker over a 2-rank comm.
 """
 
 from __future__ import annotations

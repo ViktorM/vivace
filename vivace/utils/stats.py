@@ -3,8 +3,8 @@
 Used by the trainer to log per-step metrics and by experiment scripts
 to render side-by-side comparisons.
 
-Plotting uses matplotlib (no seaborn dependency). Plots are not shown
-automatically — call `plot_stats(stats, "label")` after training.
+Plotting uses matplotlib (no seaborn dependency). The trainer writes stats_*.pt and
+plot_*.png to run_dir at the end of a run; `python -m vivace.scripts.plot` re-renders them.
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ from typing import Iterable
 class TrainingStats:
     """All time-series metrics from a training run.
 
-    Each list grows by one entry per `log()` call. The trainer is expected
-    to call `log()` once per optimizer step.
+    Each list grows by one entry per `log()` call; the trainer calls it once per
+    training step (rollout + `optim_epochs` optimizer epochs), not per optimizer step.
     """
 
     method: str
@@ -45,9 +45,8 @@ class TrainingStats:
     cap_rates: list[float] = field(default_factory=list)        # fraction of rollouts hitting max_new_tokens — leading indicator of length-gaming
     advantage_std: list[float] = field(default_factory=list)    # ~0 means no learning signal (all samples equally good/bad)
     # --- performance (wall-clock + throughput) ---
-    # Populated by the trainer using vivace.utils.perf.Timer around each phase.
-    # Filling them is optional — plot_perf tolerates empty fields so old runs
-    # still plot fine.
+    # Filled by the trainer (Timer per phase); under DDP times are max over ranks,
+    # tokens/throughput summed. Optional — plot_perf tolerates empty fields.
     rollout_time: list[float] = field(default_factory=list)    # seconds in rollout_phase
     train_time: list[float] = field(default_factory=list)      # seconds in train_phase
     step_time: list[float] = field(default_factory=list)       # total wall-clock per step
@@ -163,7 +162,7 @@ def plot_perf(stats: TrainingStats, title: str = "") -> None:
     Panels:
         (0,0) rollout_time + train_time overlaid (phase breakdown)
         (0,1) step_time (total wall-clock per step)
-        (0,2) rollout_time as % of step_time (stacked view)
+        (0,2) rollout_time / step_time (0..1 ratio)
         (1,0) tokens_per_sec
         (1,1) samples_per_sec
         (1,2) cumulative tokens generated

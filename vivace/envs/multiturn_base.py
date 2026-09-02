@@ -21,7 +21,8 @@ deterministic tool-output tokens. The KEY distinction for RL:
   do NOT enter the loss.
 
 This mask plumbing is the core data-structural change. If you get the
-boundaries right, the existing CISPO/RLOO/PPO loss math works unchanged.
+boundaries right, the existing loss math works unchanged — `compute_loss`
+takes one `mask` for every `loss_type`.
 
 DESIGN DECISION: stateless re-prompt (Option A)
 ================================================
@@ -50,7 +51,7 @@ HINTS / GOTCHAS
   it returns. Don't try to detect calls mid-token — wait for the stop token.
 
 - `is_done` should check (a) was the LAST assistant turn final-answer-shaped
-  (e.g. contains `\boxed{...}`), AND (b) is the total trajectory token budget
+  (e.g. contains `\\boxed{...}`), AND (b) is the total trajectory token budget
   exhausted. Return True on either.
 
 - Tool outputs that are too long are a real footgun. Truncate or summarize
@@ -149,11 +150,8 @@ class MultiTurnEnv(Env):
 
     name: str = "multiturn-base"
 
-    # Stop strings that signal a tool call boundary. vLLM stops generation
-    # when it produces any of these. The rollout loop then asks
-    # `parse_tool_call` to interpret the buffer. Override per env.
-    #
-    # Example for python_exec: ["</python>"]
+    # vLLM `stop=` strings marking a tool-call boundary; the rollout loop then
+    # hands the buffer to `parse_tool_call`. Per env, e.g. ("</python>",).
     tool_stop_strings: tuple[str, ...] = ()
 
     @property
@@ -218,9 +216,9 @@ class MultiTurnEnv(Env):
 
         IMPLEMENTATION HINTS
         --------------------
-        - For math: final answer detection is just the same regex you use in
-          `format_prompt` / `reward_fn` — look for `\\boxed{...}` in the LAST
-          assistant turn's text. If present → done.
+        - For math: detect the marker `reward_fn` extracts — `<answer>...</answer>`
+          for the single-turn math envs, not `\\boxed{}` — in the LAST assistant
+          turn's text. If present → done.
         - Be careful with "is_done" being too lenient: if the model writes
           `\\boxed{...}` AND then keeps thinking, you probably still want to
           let it finish that turn but mark done after it. The simplest rule:
@@ -253,9 +251,8 @@ class MultiTurnEnv(Env):
 
     # ----- config knobs ------------------------------------------------------
 
-    # Per-turn assistant generation cap. Different from `max_total_tokens`:
-    # this is the per-llm.generate-call max, the other is the trajectory total.
-    # Default values; subclasses can override.
+    # Per-turn cap = max_tokens of one llm.generate call; max_total_tokens bounds
+    # the whole trajectory. Subclasses override.
     max_new_tokens_per_turn: int = 512
     max_total_tokens: int = 4096
     max_turns: int = 8                # hard limit on turn count regardless of tokens

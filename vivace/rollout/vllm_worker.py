@@ -2,7 +2,7 @@
 
 Two modes:
   - DISAGGREGATED: worker runs on dedicated GPUs; trainer pushes weights over NCCL.
-  - COLOCATED: worker and trainer share GPUs; sleep/wake_up frees KV cache between phases.
+  - COLOCATED: share GPUs; weights via CUDA IPC; level-1 sleep (weights→CPU, KV dropped) between phases.
 """
 
 from __future__ import annotations
@@ -101,11 +101,10 @@ def _receive_nccl_on_vllm_worker(worker_self, specs):
     comm = mr._weight_sync_comm
     assert comm is not None, "init_weight_sync must be called before update_weights"
 
-    # vLLM's RPC serializer may downgrade our ParamSpec dataclass to a plain
-    # dict when crossing the process boundary. Coerce back here.
+    # vLLM RPC may downgrade ParamSpec dataclass to dict — coerce back.
     specs = [s if isinstance(s, ParamSpec) else ParamSpec(**s) for s in specs]
 
-    # TODO: verify `mr.model` path if upgrading vLLM past 0.19.
+    # `mr.model` path holds through vLLM 0.22; re-check on upgrades.
     vllm_named = dict(mr.model.named_parameters())
 
     if not hasattr(mr, "_weight_sync_buffers"):
@@ -142,17 +141,11 @@ class VLLMRolloutWorker:
         slower but sometimes needed during dev when graphs and hot weight updates
         conflict. Trainer and rollout must share the same dtype (bf16 default).
         """
-        # vLLM spawns its own subprocess (EngineCore) that inherits
-        # CUDA_VISIBLE_DEVICES. Set it before LLM() and restore after so the
-        # trainer process still sees all GPUs.
-        #
-        # Composition with an outer CUDA_VISIBLE_DEVICES (set by torchrun launcher
-        # or the user when multiplexing several runs on one node): the child
-        # subprocess inherits whatever we put in os.environ and interprets it as
-        # **absolute** physical device indices — the outer mapping does NOT carry
-        # across the fork. So if outer = "4,5,6,7" and we naively set inner = "0",
-        # the child sees physical GPU 0, not physical 4. Translate gpu_ids
-        # (relative to the parent's visible set) into physical indices first.
+        # The EngineCore subprocess inherits CUDA_VISIBLE_DEVICES and reads it as
+        # PHYSICAL indices — the parent's mapping doesn't survive the fork: with an
+        # outer "4,5,6,7" (torchrun / multiplexed runs) a naive inner "0" is physical
+        # GPU 0, not 4. Translate gpu_ids to physical ids; set before LLM(), restore
+        # after so the trainer still sees all GPUs.
         import os
         gpu_ids = gpu_ids or [0]
         tp_size = len(gpu_ids)
@@ -165,12 +158,9 @@ class VLLMRolloutWorker:
             physical_ids = list(gpu_ids)
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(p) for p in physical_ids)
 
-        # Under torchrun, env vars like MASTER_ADDR/MASTER_PORT/RANK/WORLD_SIZE/
-        # LOCAL_RANK get set on the trainer process. The vLLM EngineCore
-        # subprocess inherits them and gets confused — it tries to bind/connect
-        # to a TCPStore at MASTER_ADDR:MASTER_PORT for its own internal setup,
-        # which has nothing to do with torchrun's rendezvous. Unset them while
-        # we spawn LLM(...), restore after.
+        # torchrun's RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT/... would be inherited by
+        # EngineCore, which then binds its own TCPStore at MASTER_ADDR:MASTER_PORT —
+        # torchrun's rendezvous. Pop while spawning LLM(...), restore after.
         _torchrun_env_keys = ("RANK", "LOCAL_RANK", "WORLD_SIZE",
                               "MASTER_ADDR", "MASTER_PORT", "GROUP_RANK",
                               "TORCHELASTIC_USE_AGENT_STORE",
@@ -190,20 +180,17 @@ class VLLMRolloutWorker:
         # VLLM_USE_FASTOKENS=0. (vLLM 0.22+ interface; needs the fastokens pkg.)
         os.environ.setdefault("VLLM_USE_FASTOKENS", "1")
 
-        # logprobs_mode="processed_logprobs": return log_softmax(logits/T) AFTER
-        # temperature + top_p/top_k. vLLM v1's default is "raw_logprobs" which
-        # ignores temperature — that breaks (3) since our compute_token_logprobs
-        # uses logits/T. With "processed_logprobs" the sampled-token logprob from
-        # vLLM matches our HF recompute within bf16 floor.
-        # max_model_len=None lets vLLM use the model's max_position_embeddings,
-        # which on Qwen3.5 / long-context models is huge and balloons KV cache size.
-        # Set it explicitly (prompt + max_new_tokens) to size KV cache appropriately.
-        # enable_sleep_mode routes vLLM's weight + KV allocations through
-        # CuMemAllocator so sleep()/wake_up() can actually unmap them. Without
-        # it (the default), sleep() walks an empty allocator and frees ZERO
-        # bytes — vLLM holds its full gpu_memory_utilization through the whole
-        # training phase. Colocated-only: it requires the default CUDA allocator
-        # (incompatible with expandable_segments, which disagg mode sets).
+        # logprobs_mode="processed_logprobs": log_softmax(logits/T) after temperature
+        # + top_p/top_k. vLLM v1's default "raw_logprobs" ignores temperature and
+        # would disagree with compute_token_logprobs (logits/T); processed matches
+        # the HF recompute within the bf16 floor.
+        # max_model_len=None → the model's max_position_embeddings, huge on Qwen3.5 /
+        # long-context models and it balloons the KV cache; set prompt + max_new_tokens.
+        # enable_sleep_mode routes weight + KV allocations through CuMemAllocator so
+        # sleep()/wake_up() can unmap them; without it sleep() walks an empty
+        # allocator and frees nothing — vLLM holds gpu_memory_utilization through the
+        # whole training phase. Colocated-only: needs the default CUDA allocator
+        # (expandable_segments, which disagg sets, breaks it).
         llm_kwargs = dict(
             model=model_name, tensor_parallel_size=tp_size,
             gpu_memory_utilization=gpu_memory_utilization, dtype=dtype,
@@ -283,8 +270,8 @@ class VLLMRolloutWorker:
                               (avoids re-tokenization boundary issues)
             temperature, top_p, top_k, max_tokens, n: standard sampling params
             logprobs: if set, return top-k log-probabilities per generated token.
-                      Needed for verify_weights_match and off-policy corrections.
-                      None = no logprobs returned (default, saves compute).
+                      Only verify_weights_match uses it; the trainer leaves it None
+                      (old_logp is the epoch-1 HF forward, see rollout_phase).
             seed: RNG seed for reproducibility. None = vLLM's default.
 
         Returns:
@@ -351,8 +338,8 @@ class VLLMRolloutWorker:
         """Release vLLM's GPU memory between rollouts (colocated mode).
 
         Level-1 sleep: weights offload to CPU, KV cache is discarded. The
-        CuMemAllocator keeps virtual addresses mapped-stable, so CUDA graphs
-        and the IPC/NCCL weight-sync specs survive the sleep/wake cycle.
+        CuMemAllocator keeps virtual addresses stable, so CUDA graphs and the
+        vLLM param tensors IPC/NCCL sync copies into survive the cycle.
         Idempotent — repeated calls are no-ops.
         """
         if self._asleep:

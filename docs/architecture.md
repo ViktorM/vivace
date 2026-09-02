@@ -6,14 +6,16 @@ to other open-source RL frameworks.
 ## Process model: single-controller + child subprocess
 
 Each torchrun trainer rank is a top-level Python process. It spawns a vLLM
-EngineCore as a child subprocess. The trainer ranks form the only `torch.distributed`
-group; vLLM subprocesses are not in it. They communicate to their parent rank
-via vLLM's queue-based `collective_rpc`, not through `dist.*`.
+EngineCore as a child subprocess (`spawn`, not fork: vLLM forces it once CUDA is
+initialized in the parent, which it is by the time the model is on the GPU). The
+trainer ranks form the only `torch.distributed` group; vLLM subprocesses are not
+in it. They communicate to their parent rank via vLLM's queue-based
+`collective_rpc`, not through `dist.*`.
 
 ```
 torchrun (--nproc_per_node=N)
-├── trainer rank 0  ──fork──→  EngineCore subprocess (rank 0's vLLM)
-├── trainer rank 1  ──fork──→  EngineCore subprocess (rank 1's vLLM)
+├── trainer rank 0  ──spawn──→  EngineCore subprocess (rank 0's vLLM)
+├── trainer rank 1  ──spawn──→  EngineCore subprocess (rank 1's vLLM)
 └── ...
 ```
 
@@ -26,25 +28,25 @@ In [`vllm_worker.py`](../vivace/rollout/vllm_worker.py):
 
 ```python
 old_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+# Child reads physical ids: translate gpu_ids through any outer mask.
+outer = list(map(int, old_visible.split(","))) if old_visible else None
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(outer[g] if outer else g) for g in gpu_ids)
+# Pop RANK/WORLD_SIZE/MASTER_*, or EngineCore joins torchrun's TCPStore.
+saved = {k: os.environ.pop(k) for k in _torchrun_env_keys if k in os.environ}
 
-# vLLM's LLM(...) spawns an EngineCore subprocess via Python multiprocessing.
-# The child inherits the env var above and sees only the GPUs we listed.
 self.llm = LLM(model=model_name, tensor_parallel_size=tp_size, ...)
 
-if old_visible is not None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = old_visible
+# ...restore CUDA_VISIBLE_DEVICES (or del) and saved
 ```
 
 For TP > 1, vLLM internally spawns additional worker processes within the
 EngineCore and forms its own NCCL group across them — independent of the
 trainer's process group.
-
 ## Comparison: how other frameworks spawn workers
 
 | framework | architecture | rollout backend | weight sync | async generation | notes |
 |---|---|---|---|---|---|
-| **vivace** | single-controller, vLLM as child subprocess | vLLM | NCCL / CUDA IPC / disk | no (sync per step) | minimal, single-process trainer |
+| **vivace** | single-controller, vLLM as child subprocess | vLLM | NCCL / CUDA IPC / disk | no (sync per step) | minimal; one trainer process per DDP rank, each owning its vLLM |
 | **TRL** ([huggingface/trl](https://github.com/huggingface/trl)) | single-controller, vLLM colocated or as separate server | vLLM | direct or HTTP | partial | mainstream HF integration; supports GRPO/DPO/PPO |
 | **OpenRLHF** ([OpenRLHF/OpenRLHF](https://github.com/OpenRLHF/OpenRLHF)) | Ray actors (trainer / rollout / ref / critic separate) | vLLM | NCCL via Ray | yes (async RLHF) | Ray + DeepSpeed; mature, popular for >70B |
 | **veRL / HybridFlow** ([verl-project/verl](https://github.com/verl-project/verl)) | Ray actors with named resource pools, hybrid controller | vLLM | NCCL | yes | ByteDance; powered DAPO. Resource pools per role |
@@ -134,8 +136,8 @@ Two paths considered, in increasing rewiring cost:
    the rollout doesn't re-prefill on every weight push. Verify cache lifecycle
    plays nicely with continuous LoRA weight updates.
 3. **IS-ratio drift at k=1.** With staleness, more tokens hit
-   `clip_cispo_high=5.0`. Add a `median_is_ratio` / `p99_is_ratio` metric
-   and watch the clip-fraction. If >5% of tokens get clipped, widen the cap.
+   `clip_cispo_high=5.0`. Add `median_is_ratio` / `p99_is_ratio` and watch
+   `clip_frac` (clipped IS weights). If >5% get clipped, widen the cap.
 4. **Disagg vs colo accuracy gap may persist.** Half the gap we measured at
    2+2 disagg sync (~30-40% slower convergence) is from gradient-variance
    in 2-way DDP all-reduce vs 4-way colo. Async doesn't fix that — it only

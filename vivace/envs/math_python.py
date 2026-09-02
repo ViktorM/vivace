@@ -20,19 +20,19 @@ The rollout loop:
   5. vLLM resumes with the new context
 
 The model is trained to use these tool calls when arithmetic / symbolic
-computation would be more reliable than chain-of-thought, then box the final
-answer in `\\boxed{...}` as in the single-turn MATH env.
+computation would be more reliable than chain-of-thought, then emit the final
+answer in `<answer>...</answer>` — the marker the single-turn MATH reward reads
+(a bare `\\boxed{}` reply scores 0).
 
 WHAT TO IMPLEMENT
 =================
 
 This file is a skeleton. The hot spots that need real code:
 
-1. `python_exec` — the actual sandbox. The skeleton uses a naive
-   `subprocess.run` placeholder; that's NOT safe for training (it'll happily
-   `rm -rf /` if the model emits that). Pick a real sandbox: nsjail, Docker
-   per-call, or a long-lived Jupyter kernel pool. See `docs/toolrl_design.md`
-   for the trade-offs.
+1. `python_exec` — the actual sandbox. The stub raises NotImplementedError; a
+   bare `subprocess.run` is NOT safe for training (it'll happily `rm -rf /` if
+   the model emits that). Pick a real sandbox: nsjail, Docker per-call, or a
+   long-lived Jupyter kernel pool. See `docs/toolrl_design.md` for the trade-offs.
 
 2. `MathPythonEnv.parse_tool_call` — robust `<python>` / `</python>` parser.
    The hint in the docstring is enough; just write it.
@@ -76,9 +76,9 @@ from vivace.envs.multiturn_base import MultiTurnEnv, Trajectory, ToolCall
 def python_exec(code: str, timeout: float = 5.0) -> str:
     """Run `code` in a sandboxed Python interpreter.
 
-    SECURITY: the implementation below is NOT a sandbox. It runs untrusted
-    model output with full file system access. DO NOT use this for any
-    real training run. Replace with one of:
+    SECURITY: whatever replaces the stub runs untrusted model output. A bare
+    `subprocess.run` has full filesystem access — never train against it.
+    Pick one of:
 
     - **nsjail**: lowest overhead, namespaces + seccomp isolation.
       ~20 ms startup per call. Suitable for training-rate (1000s of calls/min).
@@ -170,7 +170,7 @@ class MathPythonEnv(MultiTurnEnv):
         - Take the wrapped MATHEnv's prompt as a base.
         - Prepend a system instruction explaining the `<python>...</python>`
           syntax and that results come back wrapped in `<result>...</result>`.
-        - Final answer convention stays the same: `\\boxed{...}` at the end.
+        - Final answer marker: `<answer>...</answer>`, what the inner MATHEnv reward extracts.
         - Without this system message, the policy never emits tool calls
           (cold-start problem). You may want a short SFT warmup on a few
           curated tool-using examples to prime the behavior before RL —
@@ -193,9 +193,9 @@ class MathPythonEnv(MultiTurnEnv):
     def reward_fn(self) -> Callable[[str, Example], float]:
         """Same math_verify-based reward as MATHEnv.
 
-        The rollout loop passes ONLY the concatenated assistant text to
-        the reward function (NOT the tool outputs). So existing math_verify
-        logic that looks for `\\boxed{...}` works unchanged.
+        The rollout loop passes ONLY the concatenated assistant text (NOT the
+        tool outputs), so the inner reward works unchanged — it reads the
+        `<answer>` block, not `\\boxed{}`.
         """
         raise NotImplementedError("Return self._inner.reward_fn")
 

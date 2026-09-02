@@ -74,12 +74,13 @@ gsm8k pass@1 = 5.08%, pass@8 = 27.37% · math500 pass@1 = 4.40%, pass@8 = 24.20%
 
 2. GRPO trains normally at 1.5B (71.0% ± 1.5), matching the RLOO family
    throughout, after collapsing at 0.5B. The 0.5B mechanism: with base gsm8k
-   pass@8 at 0.53%, nearly every group of G rollouts converged to the same
-   (format-only) reward; the group std goes to ~0 and GRPO's std-normalized
-   advantage `(r − mean)/(std + adv_eps)` reaches O(10⁴) — the symmetric PPO
-   clip is on the ratio, not on `adv·ratio`, so nothing bounds it. At 1.5B
-   (pass@8 = 27%) groups carry real correctness variance and the pathway
-   never opens.
+   pass@8 at 0.53%, almost no group had a correctness split, so within-group
+   spread was format jitter (~1e-3). GRPO's z-scored advantage
+   `(r − mean)/(std + adv_eps)` is bounded (|adv| ≤ √(G−1)) but rescales that
+   jitter to unit magnitude, so noise groups drove the policy at full weight
+   onto the format plateau; RLOO's advantage scales with the raw spread
+   (`adv_type` swap alone: 1.1% → 44.0%). At 1.5B (pass@8 = 27%) groups
+   carry real correctness variance and the pathway never opens.
 
 3. The gain is capability creation rather than sampling-collapse: all RL runs reach ~71% on
    gsm8k vs base pass@8 = 27.4% — RL produces ~44pp more correct greedy
@@ -97,15 +98,15 @@ gsm8k pass@1 = 5.08%, pass@8 = 27.37% · math500 pass@1 = 4.40%, pass@8 = 24.20%
 
 ### Caveats
 
-- Single training env (gsm8k) — the algorithm comparison may separate more on
-  harder training (Math), which is the next run.
+- Single training env (gsm8k). The Math sweep below separates only GRPO
+  (−13pp); the RLOO family stays within 2.7pp.
 - 200 steps, LoRA r=16. Full-FT or longer training could spread the algos.
 - math500 is an *eval-only* generalization probe here, not a training target.
 - These are 1.5B numbers. The 0.5B pilots (algorithm choice separating by ~40pp, GRPO
   collapsing) and this run (algorithms converging) bracket the base model's
   capability threshold as the variable that decides whether algorithm choice
   matters; the Math run probes the same question through the training
-  distribution instead of the model.
+  distribution instead of the model — and drops GRPO 13pp (Math finding 4).
 
 ---
 
@@ -123,7 +124,7 @@ parallel math_verify). Wandb groups `gsm8k-v2-20260610_1029_{algo}`.
 ### Rollout top_p A/B (pre-registered decision)
 
 Training-rollout `top_p=0.95` deviates from the paper-standard 1.0, so the
-choice was A/B-tested before the sweep. DAPO × 3 seeds per arm, paired by seed
+choice was A/B-tested first. DAPO (ep=1) × 3 seeds per arm, paired by seed
 (groups `topp-ab-dapo-1.5b-gsm8k-20260610_0210_tp{0.95,1.0}`):
 
 | arm | final gsm8k | per-seed (7/13/42) |
@@ -150,11 +151,11 @@ Figure: `figures/topp_ab_dapo_1.5b_gsm8k.png`.
 
 ### Findings
 
-1. GSPO has the highest mean on both evals and the tightest gsm8k seed
-   spread (±0.39, the only algo under ±0.8). The top-3 (GSPO/CISPO/GRPO)
-   remain statistically inseparable on gsm8k; the resolved gap is top-3 vs
-   bottom-2 (~1.5pp). GSPO's mid-pack v1 rank sits within the same seed
-   noise, plus the v1 eval verifier issue on math500.
+1. GSPO has the highest gsm8k mean and the tightest seed spread (±0.39; GRPO
+   next at ±0.46); on math500 only DAPO ep=2 (37.6) edges it (36.9). The top-3
+   (GSPO/CISPO/GRPO) remain statistically inseparable on gsm8k; the resolved
+   gap is top-3 vs DAPO/Dr.GRPO (~1.5pp). GSPO's mid-pack v1 rank sits within
+   the same seed noise, plus the v1 eval verifier issue on math500.
 
 2. DAPO ran ep=1 in v1 while all other algos ran ep=2 — an `optim_epochs`
    value inherited from a 0.5B pilot cell in the seed-variance-dominated
@@ -164,12 +165,14 @@ Figure: `figures/topp_ab_dapo_1.5b_gsm8k.png`.
    optimization per batch improved transfer rather than in-domain accuracy. Configs
    and the generator now default DAPO to ep=2 (budget-matched).
 
-3. `clip_frac` is exactly 0 for DAPO and CISPO at every logged step — at ep≤2
-   the policy stays near on-policy, ratios ≈ 1, so DAPO's clip-higher and
-   CISPO's IS-clip never engage. At 200 steps / 192 tokens /
+3. Clipping is inert. DAPO ep=1's `clip_frac` ≡ 0 is structural (at
+   `optim_epochs=1` the ratio is exactly 1); at ep=2 DAPO's clip-higher
+   touches ≤1.2% of tokens/step (mean ~0.4%), CISPO's IS-clip ≤1e-4, GSPO 2
+   sequences in one seed. At 200 steps / 192 tokens /
    near-saturation-by-step-50, this benchmark measures recipe fit (LR, update
-   count), not the long-horizon failure modes those mechanisms target. Expect
-   more separation on Math (longer sequences) and on longer runs.
+   count), not the long-horizon failure modes those mechanisms target. Math
+   (768 tokens) changes nothing here (DAPO ≤0.5%, CISPO/GSPO 0) and separates
+   only GRPO (Math finding 4).
 
 4. Run-to-run nondeterminism is ~0.3pp at fixed seed (config-identical DAPO
    tp0.95/s13 runs: 71.3 A/B vs 71.0 v2) — vLLM batched generation is not
@@ -185,14 +188,15 @@ Figure: `figures/topp_ab_dapo_1.5b_gsm8k.png`.
 | GRPO | 26.5 | 19.1 | 1.39× |
 | Dr.GRPO | 25.6 | 17.6 | 1.46× |
 | GSPO | 26.3 | 18.8 | 1.40× |
-| DAPO | 22.0 | 15.0 | 1.47× |
+| DAPO (ep=1) | 22.0 | 15.0 | 1.47× |
 | CISPO | 26.1 | 19.0 | 1.38× |
 
 Per-step breakdown (`figures/v2_wallclock.png`): rollout time nearly halved
 (~2.8s → ~1.6s/step; real sleep mode + the larger 0.65 vLLM pool), train time
 −20% (no_sync + LoRA-only sync + fused AdamW), gsm8k full-split eval 27s →
-5.1s. No accuracy cost — v2 means match or beat v1 everywhere except DAPO
-(72.5→70.6, see caveats).
+5.1s. DAPO's shorter runs are ep=1 (one optimizer pass per batch). No accuracy
+cost for GRPO/GSPO/CISPO (+0.9/+1.1/+1.9pp); DAPO (72.5→70.6) and Dr.GRPO
+(71.4→70.3) dropped — see caveats.
 
 ### Caveats
 
@@ -255,24 +259,28 @@ numbers carry the two eval artifacts in finding 3.
      inside `<answer>` ending in `\boxed{N}` — which the gsm8k tag+float
      matcher scores 0 (CISPO seed-7: 0.0% in-run, 71.95% re-evaluated).
 
-   Both artifacts only suppress scores. Budget A/B on all 12 checkpoints:
+   Both only suppress scores. Budget A/B on the 12 non-GRPO checkpoints:
    512 vs 1024 differ by <0.2pp for three algos (+1.0 for DAPO), and eval
    wall-clock is identical (~20-25 s) since almost nothing reaches either cap.
 
-4. GRPO lands 13pp under the other four algorithms in-domain (40.9 vs ~54) and 12pp under on
-   transfer (56.9 vs ~68), the deficit reproducing on all three seeds
-   (39.4/39.4/43.8). The mechanism is the 0.5B collapse one level up: on
-   MATH, per-problem solve rates are low, many groups carry all-same rewards,
-   and GRPO's std-normalized advantage is pinned at ~1.008 every step —
-   near-zero-signal groups rescaled into full-scale gradient noise. Training
-   reward stalls (0.68→0.87 over 200 steps vs Dr.GRPO's 0.50→1.38), grad
-   norms run 3× higher, and response length shrinks (346→272) while the
-   RLOO-family models learn long-form solutions (330→477). gsm8k (pass@8
-   27%) sits above GRPO's operating threshold; MATH at 1.5B does not — the
-   threshold is a property of the training distribution as much as the
-   model. At these budgets, RLOO-style advantages (Dr.GRPO/GSPO/DAPO/CISPO)
-   are the safer default when the base's solve rate on the training
-   distribution is low.
+4. GRPO lands 13pp under the other four algorithms in-domain (40.9 vs ~54) and
+   12pp under on transfer (56.9 vs ~68), the deficit reproducing on all three
+   seeds (39.4/39.4/43.8). Training reward barely shows it (per-seed means
+   0.88-0.98 vs 1.03-1.13 for the RLOO family; per-step values swing ±0.5);
+   length and gradients do: every algo dips to ~215-380 tokens by step 50,
+   then the RLOO family grows back to 430-650 while GRPO ends at 272/263/461,
+   and GRPO's grad norm runs 3× Dr.GRPO's (0.09-0.10 vs 0.03; 1.2-1.7× the
+   others). Hypothesis, the 0.5B story one level up: on MATH nearly every
+   group has *some* spread (length/format) but not all have a solved/unsolved
+   split, and GRPO's per-group z-score weights both alike — `advantage_std`
+   sits at its ceiling 1.008 on nearly every step (min 0.80) vs Dr.GRPO's
+   0.48-1.35 tracking real spread. Confound: GRPO also runs
+   `kl_coef` 0.04 (Dr.GRPO 0, the rest 0.01); no 1.5B/MATH `adv_type`-only
+   isolation yet. gsm8k (pass@8 27%) sits above GRPO's operating threshold;
+   MATH at 1.5B does not — the threshold is a property of the training
+   distribution as much as the model. At these budgets, RLOO-style advantages
+   (Dr.GRPO/GSPO/DAPO/CISPO) are the safer default when the base's solve rate
+   on the training distribution is low.
 
 5. AIME is at the floor for 1.5B greedy decoding. Totals across 15 runs:
    aime24 14/450 (3.1%), aime25 4/450 (0.9%), aime26 7/450 (1.6%). aime24 is
@@ -295,9 +303,9 @@ numbers carry the two eval artifacts in finding 3.
 
 - **Configs** — `tools/gen_benchmark_configs.py` regenerates
   `vivace/configs/experiments/v1_1.5b/`.
-- **Runs** — `tools/run_2x4090_gsm8k_3seed.sh` (gsm8k) and
-  `tools/run_2x4090_math_3seed.sh` (Math); each iterates the 3 seeds over the
-  configs in `vivace/configs/experiments/v1_1.5b/`.
+- **Runs** — `tools/run_2x4090_gsm8k_3seed.sh` (gsm8k v1) and
+  `tools/run_2x4090_math_3seed.sh` (Math, minus GRPO); 3 seeds × the configs
+  in `vivace/configs/experiments/v1_1.5b/`.
 - **Aggregation** — `tools/aggregate_seeds.py` produces the mean ± std tables.
 - **Plots** — `tools/plot_benchmark.py`, `tools/plot_topp_ab.py`,
   `tools/plot_wallclock.py`.
@@ -307,7 +315,7 @@ numbers carry the two eval artifacts in finding 3.
 
 ## Pending
 
-- **GSPO fp32-epsilon re-test** before any GSPO-specific publication claim
-  (bf16 logprob noise ≈ paper epsilon invalidated the earlier tight-clip
-  pilot conclusion).
 - **Cluster** 3B/7B headline runs.
+- **GSPO clip band.** The bf16-noise premise for an fp32-epsilon re-test was
+  refuted (0.5B eps sweep 2e-3…0.2: 40-45%, flat within seed noise); the
+  3-seed 1e-2-vs-0.2 check is still unrun, so GSPO rows use clip 0.2.

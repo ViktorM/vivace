@@ -12,10 +12,9 @@ ToolRL with Option A, we issue MULTIPLE calls per prompt:
     turn 3:    llm.generate(prompt + turn1+result1 + turn2_text + <result>...</result>, stop=[</python>])
     ...
 
-Each call's input is the full prior trajectory. vLLM's prefix caching
-amortizes the re-prefill cost (the assistant tokens already exist in the
-KV cache from the previous call), but tool-output tokens are fresh and
-get re-prefilled each turn.
+Each call's input is the full prior trajectory. vLLM's prefix caching keeps
+the previous call's tokens warm, so each turn prefills only the tool-output
+tokens just inserted.
 
 The loop exits when:
   - `env.is_done(traj)` returns True (final answer reached or budget hit)
@@ -25,29 +24,29 @@ The loop exits when:
 OUTPUTS (must match single-turn shape)
 ======================================
 
-The downstream pipeline (trainer's `RolloutBatch` builder, loss math) expects
-the same fields it gets from `vllm_worker.generate`:
+The trainer's rollout_phase and the loss math expect the same fields they get
+from `vllm_worker.generate`:
 
-- `response_token_ids`: list[list[int]] — the assistant tokens, concatenated
-  across all turns. NOT the prompt. NOT tool outputs.
-- `response_mask`: list[list[int]] — 1 where the token is a model-generated
-  token, 0 where it's a tool-output token. Same total length as the
-  concatenated trajectory tokens (assistant + tool).
+- `response_token_ids`: list[list[int]] — assistant + tool tokens concatenated
+  in trajectory order. NOT the prompt.
+- `response_mask`: list[list[int]] — 1 for model-generated tokens, 0 for
+  tool-output tokens. Same length as `response_token_ids`.
 - `reward`: list[float] — terminal verifier reward per trajectory.
 - Optional: `step_rewards`: list[list[float]] — per-turn shaping rewards.
 
-NOTE: the loss math (`policy_gradient.compute_loss`) reads `response_mask`
-already. Tool-output tokens with mask=0 contribute zero gradient automatically.
-You do NOT need to touch the loss code — the mask plumbing is the whole job.
+NOTE: `compute_loss` already takes a per-token `mask`, so tool tokens with
+mask=0 contribute zero gradient with no loss-code change. The plumbing job is
+in the trainer: `mb["mask"]` today comes from `build_response_mask(...)` (a
+contiguous span) and must instead be this per-token mask, shifted by one.
 
 OPTION B (KV-cache continuation) NOTES
 =======================================
 
-Once Option A is validated, Option B is a drop-in: replace the
-`llm.generate(prompt + concat(turns), ...)` calls with vLLM session API
-that holds the KV cache open across turns. Same `Trajectory` data structure,
-same outputs to the trainer. The seam is here in this file; the loss math
-doesn't care.
+Once Option A is validated, Option B (see docs/toolrl_design.md) replaces the
+`llm.generate(prompt + concat(turns), ...)` calls with KV-cache continuation
+across turns. Not a drop-in: needs a prefix-extension or logits-processor
+hook, session lifecycle, and weight sync coordinated with the open session.
+Same `Trajectory`, same trainer outputs; the loss math doesn't care.
 
 CURRENT STATUS
 ==============
@@ -88,9 +87,8 @@ from vivace.envs.multiturn_base import MultiTurnEnv, ToolCall, Trajectory, Turn
 class MultiTurnRolloutOutput:
     """All data the trainer needs from one multi-turn rollout.
 
-    Mirrors the single-turn output shape. The trainer's RolloutBatch builder
-    consumes this and merges N of them into a batched RolloutBatch (B*G, S)
-    tensor.
+    Mirrors the single-turn output shape. The trainer's rollout_phase pads B*G
+    of these into [B*G, S] `full_ids` + mask micro-batches (not yet wired).
 
     Fields:
         prompt_token_ids:  prompt only (assistant context starts after this)
@@ -307,12 +305,10 @@ def rollout_multiturn(
       is too low for actual training. Don't try to make this generic
       across rollout backends until vLLM works end-to-end.
 
-    - **n>1 for matched-budget groups.** RLOO/CISPO advantage works per-prompt:
-      compute the leave-one-out baseline across the n trajectories for the
-      SAME prompt. The trainer's existing batching expects [B, G] shape; this
-      rollout function returns [G] for one B-element. The trainer's loop
-      already iterates B prompts; just plug the per-prompt n into env-level
-      group_size.
+    - **n>1 for matched-budget groups.** Group advantages (grpo / dr_grpo /
+      rloo) are per-prompt across the n trajectories of the SAME prompt. The
+      trainer batches [B, G]; this function returns [G] for one prompt, so
+      pass n = `cfg.rl.group_size` and let the trainer loop over B.
     """
     raise NotImplementedError(
         "Implement the multi-turn rollout loop. Pseudocode in the docstring."
@@ -320,9 +316,6 @@ def rollout_multiturn(
 
 
 def _summarize(text: str, max_chars: int = 80) -> str:
-    """First-line summary of a tool result, for logging / reward shaping.
-
-    Helper, no algorithmic content. Implement freely.
-    """
+    """First-line summary of a tool result, for logging / reward shaping."""
     text = text.strip().splitlines()[0] if text.strip() else "(empty)"
     return text[:max_chars] + ("..." if len(text) > max_chars else "")

@@ -1,6 +1,6 @@
-# CISPO math 1.5B disagg — current best (gsm8k 68.8 / math500 28.0 @ 500 steps,
-# peak math500 31.6 at step 250). Beats DAPO winner (67.2 / 27.8) on both axes.
-# Canonical clipped-IS CISPO + hybrid normalization + ep=4 + lr=2e-5.
+# CISPO math 1.5B disagg — canonical clipped-IS CISPO + hybrid normalization + ep=4 + lr=2e-5.
+# Pre-v1 result (gsm8k 68.8 / math500 28.0 @ 500 steps) was the eq. 7 mask recipe with
+# the pre-9f3027e math500 verifier (~10pp undercount); current numbers: docs/v1_results.md.
 model_name: Qwen/Qwen2.5-1.5B
 env_name: math
 eval_envs:

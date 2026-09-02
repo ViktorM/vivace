@@ -71,7 +71,7 @@ class ConsoleLogger:
     """Cheap step-rate console logger.
 
     Per-step print line:
-        [label] Step 0042 | loss=0.123 reward=1.456 kl=0.012 | 12s
+        [label] Step 0042 | loss=0.123 reward=1.456 kl=0.012 | 1234 tok/s 12.3s/step | 12s
     """
 
     def __init__(self, label: str, is_main: bool = True):

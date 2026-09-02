@@ -23,9 +23,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv if argv is not None else sys.argv[1:])
-    # TODO: once checkpointing.load_checkpoint exists, load the model +
-    # tokenizer here, build the env, then call vivace.eval.runner.evaluate_model.
-    # See docs/IMPLEMENTATION_NOTES.md.
+    # TODO: load `<run_dir>/final_model` (peft adapter + tokenizer, or a full HF
+    # checkpoint for full FT), build the env, call vivace.eval.runner.evaluate_model.
+    # Only periodic ckpt-<step> dirs wait on checkpointing.load_checkpoint.
     raise NotImplementedError(
         f"vivace-eval is a stub until checkpointing.load_checkpoint exists. "
         f"args: {vars(args)}"

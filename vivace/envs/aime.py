@@ -1,15 +1,15 @@
 """AIME 2024 / 2025 / 2026 evaluation environments.
 
 The American Invitational Mathematics Examination — 30 integer-answer
-problems per year (0-999). Pair with MATHEnv or NuminaMathEnv for training;
-training on AIME itself leaks the eval set.
+problems per year (0-999). Eval-only; pair with MATHEnv for training
+(training on AIME itself leaks the eval set).
 
   AIME2024Env  → Maxwell-Jia/AIME_2024              (30 problems, single split)
   AIME2025Env  → opencompass/AIME2025-I + -II       (15 + 15 = 30 problems)
   AIME2026Env  → MathArena/aime_2026                (30 problems, single split)
 
-The integer-answer shape means `math_reward_single`'s numeric fast-path always
-fires here — no sympy roundtrip per eval sample.
+Integer ground truths hit `_math_correct`'s numeric fast path when the model's
+<answer> is a bare numeral; `\\boxed{N}` inside the tag still goes to math_verify.
 """
 
 from __future__ import annotations

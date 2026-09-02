@@ -1,17 +1,15 @@
-"""Rule-based reward functions.
+"""Rule-based reward functions: GSM8K (numeric) and math (LaTeX-aware) families.
 
-Flat file (not a folder) until 3+ envs need their own families. Then
-this becomes `vivace/rewards/` with one file per family.
+Flat file until 3+ envs need their own families; then `vivace/rewards/`, one
+file per family.
 
-The format-style rewards (`strict_format`, `soft_format`, `xmlcount`)
-are dataset-agnostic and reusable across math/code envs that share the
-`<think>...</think><answer>...</answer>` convention. The
-`correctness` and `int_format` rewards are GSM8K-flavored numeric
-checks; copy them when adding a new math env that needs different
-parsing.
+Format rewards (`strict_format`, `soft_format`, `xmlcount`) are dataset-agnostic
+across envs on the `<think>...</think><answer>...</answer>` convention.
+`correctness` + `int_format` are GSM8K numeric checks; `math_correctness_reward`
+is the math_verify equivalent for Hendrycks MATH / MATH-500 / AIME.
 
-`gsm8k_reward_batch` is the top-level entry point that sums all five
-reward components for a batch of responses.
+Entry points: `gsm8k_reward_batch` (five components) and `math_reward_batch`
+(four, no `int`); both append `overlong` when the DAPO penalty is enabled.
 """
 
 from __future__ import annotations
@@ -33,8 +31,8 @@ class RewardConfig:
     strict_format_bonus: float = 0.5
     soft_format_bonus: float = 0.25
     xmlcount_max: float = 0.25
-    # DAPO §3.4 overlong soft penalty. Disabled by default (overlong_penalty=0.0);
-    # opt-in per recipe. buffer = the linear ramp zone before max_new_tokens.
+    # DAPO §3.4 overlong soft penalty; opt-in per recipe (0.0 = off).
+    # buffer = linear ramp zone before max_new_tokens.
     overlong_penalty: float = 0.0
     overlong_buffer_tokens: int = 256
 
@@ -208,16 +206,8 @@ def gsm8k_reward_single(
     response_token_count: int | None = None,
     max_new_tokens: int | None = None,
 ) -> float:
-    """Single-example variant. Useful from `Env.reward_fn`.
-
-    Takes the full Example so the reward function has access to the problem
-    statement, metadata, etc. Currently only uses example.answer for
-    correctness checking, but having the full Example available enables
-    future rewards like:
-      - bonus for attempting math operations with numbers from the problem
-      - penalty for answers that ignore stated constraints
-      - difficulty-weighted scoring via example.difficulty
-    """
+    """Single-example variant for `Env.reward_fn`. Takes the full Example (only
+    `.answer` is used today); rationale in `Env.reward_fn`."""
     tokens = [response_token_count] if response_token_count is not None else None
     return gsm8k_reward_batch(
         [response], [example.answer], DEFAULT_REWARD_CONFIG,
@@ -273,10 +263,9 @@ def _math_correct(gt: str, pred: str, tol: float = 1e-6) -> bool:
 
 
 # --- Parallel LaTeX verification ---------------------------------------------
-# math_verify is sympy-backed (~50-500 ms per LaTeX comparison); its own
-# parse/verify carry built-in 5 s signal timeouts, so a rare sympy hang is
-# already bounded per call. Batch paths fan the LaTeX comparisons out to a
-# small persistent process pool purely for parallelism; numeric pairs never
+# math_verify's parse/verify carry built-in 5 s signal timeouts, so a rare sympy
+# hang is already bounded per call. Batch paths fan LaTeX pairs out to a small
+# persistent fork pool (<=8 workers) purely for parallelism; numeric pairs never
 # leave the calling process.
 
 _VERIFY_POOL = None
@@ -313,8 +302,7 @@ def warm_verify_pool() -> None:
 
 def math_correct_batch(gts: list[str], preds: list[str]) -> list[bool]:
     """Vectorized `_math_correct`: numeric pairs short-circuit inline, LaTeX
-    pairs verify in parallel on the process pool (math_verify's built-in 5 s
-    timeouts bound each comparison inside the worker)."""
+    pairs verify in parallel on the process pool."""
     global _VERIFY_POOL
     out: list[bool] = [False] * len(gts)
     pool_idx: list[int] = []

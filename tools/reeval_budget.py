@@ -1,7 +1,7 @@
 """Re-evaluate saved LoRA checkpoints at different eval token budgets.
 
 Motivation: Math-trained models write long solutions; the gsm8k eval budget of
-256 truncated 35% of responses in the math sweep. This loads the base model
+256 capped 33-62% of responses in the math sweep. This loads the base model
 into vLLM ONCE (enable_lora) and sweeps adapters x budgets to pick a budget
 for the config update — no retraining, no trainer involved.
 

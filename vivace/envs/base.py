@@ -1,19 +1,20 @@
 """Env base interface.
 
-Every benchmark (GSM8K, MATH, DeepMath-103K, Omni-MATH, OpenEnv tasks, ...)
-implements this. The contract is deliberately narrow:
+Every benchmark (GSM8K, Hendrycks MATH, MATH-500, AIME, ...) implements this.
+The contract is deliberately narrow:
 
-    - sample_batch(n) -> list[Example]    # for training rollouts
-    - eval_set()      -> list[Example]    # the held-out set for evaluation
-    - format_prompt(example) -> str       # how to turn a problem into a model prompt
-    - reward_fn       -> callable         # rule-based reward (response, gt) -> float
+    - load_split("train"|"eval") -> list[Example]
+    - sample_batch(n, rng)       -> list[Example]   # default: uniform over train
+    - format_prompt(example)     -> str
+    - reward_fn                  -> (response, example, response_token_count=None,
+                                     max_new_tokens=None) -> float   # rule-based
+    - is_correct / is_correct_batch                 # binary verifier for eval metrics
+    - reward_breakdown           -> (totals, {component: per_response})  # wandb
 
-The Env does NOT do generation. That's the rollout worker's job. The Env only
-provides problems, formats prompts, and knows how to score answers.
+The Env does NOT generate — that's the rollout worker's job. It provides
+problems, formats prompts, and scores answers.
 
-ToolRL note: for tool-use benchmarks, extend this with a `step()` method like
-a gym env. Keep the base class minimal; add tool support as a subclass mixin
-or a separate `ToolEnv` interface later.
+Tool use: `MultiTurnEnv` (multiturn_base.py) extends this; skeleton only.
 """
 
 from __future__ import annotations
@@ -51,16 +52,14 @@ class Env(ABC):
     @property
     @abstractmethod
     def reward_fn(self) -> Callable[[str, Example], float]:
-        """Returns a function (response_text, example) -> float.
+        """Returns `(response_text, example, response_token_count=None, max_new_tokens=None) -> float`.
 
-        The reward function receives the full Example (not just the answer string)
-        so it has access to the problem statement, metadata, difficulty, etc.
-        This enables rewards that depend on more than answer correctness — e.g.
-        bonus for attempting relevant math operations, penalty for ignoring
-        problem constraints, or code envs that need the problem to run tests.
+        Takes the full Example (not just `.answer`) so rewards can read problem text,
+        metadata or difficulty. The length kwargs feed the DAPO overlong penalty; the
+        default `reward_breakdown` passes them, so a custom reward_fn must accept them.
 
-        This is the rule-based reward. For math: symbolic answer extraction + verify.
-        For code: run tests. For anything needing a model: not allowed here.
+        Rule-based only: math = answer extraction + verify, code = run tests.
+        Anything needing a model is not allowed here.
         """
         ...
 

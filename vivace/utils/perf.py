@@ -6,18 +6,12 @@ to populate rollout/train phase timings and throughput stats on
 
 WHY THE SYNC
 ------------
-`torch.cuda` kernels are asynchronous. If you just time `t0 = time.time();
-do_gpu_work(); dt = time.time() - t0`, you measure kernel LAUNCH time, not
-actual work — because the kernels are still running on the GPU when you
-read the clock. The timing comes out ridiculously small (microseconds for
-a forward pass) and is useless for comparing backends.
-
-`torch.cuda.synchronize()` blocks the CPU until all queued GPU work has
-finished. Calling it on enter AND exit pins the measurement to real work:
-start = "everything before now is done"; stop = "everything we did is done".
-
-The sync is a no-op when CUDA isn't available (CPU tests), so this Timer
-is safe to use unconditionally.
+CUDA kernels are asynchronous, so `t0 = time.time(); do_gpu_work(); dt = time.time() - t0`
+measures kernel LAUNCH time — microseconds for a forward pass — not the work.
+`torch.cuda.synchronize()` blocks until all queued GPU work has finished; syncing on
+enter AND exit pins the measurement: start = "everything before now is done",
+stop = "everything we did is done". The sync is skipped without CUDA (CPU tests),
+so the Timer is safe to use unconditionally.
 """
 
 from __future__ import annotations
