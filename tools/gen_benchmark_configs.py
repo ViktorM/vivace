@@ -1,23 +1,38 @@
-"""Generate the v1 benchmark configs (1.5B on 2x4090 colo).
+"""Generate the v1 benchmark configs (2x4090 colo, DDP).
 
 Two families:
   gsm8k  — full 5-algo comparison, max_new=192, eval {gsm8k, math500}
-  math   — top-3 algos, max_new=1024, eval {gsm8k, math500, aime24/25/26}
+  math   — 5 algos, max_new=768, eval {gsm8k, math500, aime24/25/26}
            (AIME eval at 4096 via per-env eval_max_new_tokens; vllm_max_model_len
            sized to fit the longest eval budget)
 
 Per-algo (lr, optim_epochs, kl) carried from the 0.5B pilot picks; these are the
-starting points to babysit at 1.5B (re-tune if a run collapses early).
+starting points to babysit at 1.5B+ (re-tune if a run collapses early).
 
-Run: .venv/bin/python tools/gen_benchmark_configs.py
-Writes to vivace/configs/experiments/v1_1.5b/.
+Run: .venv/bin/python tools/gen_benchmark_configs.py [--scale 1.5b|3b]
+Writes to vivace/configs/experiments/v1_<scale>/.
 """
 from __future__ import annotations
 
+import argparse
 import os
 
-OUT_DIR = "vivace/configs/experiments/v1_1.5b"
-MODEL = "Qwen/Qwen2.5-1.5B"
+# Per-scale memory knobs for 24GB colo. The model lives twice on each GPU while
+# vLLM is awake (trainer copy + vLLM copy), so the vLLM pool shrinks with scale.
+SCALES = {
+    "1.5b": dict(
+        model="Qwen/Qwen2.5-1.5B",
+        mem_util="0.65   # vLLM sleeps during training; 0.65 (not 0.7) leaves ~1GB margin for a desktop session on one GPU — 1.5B DDP-colo at 0.7 OOMs in merge_adapter when the display eats 2.4GB",
+        gsm_seqs="256   # Qwen2.5 KV is small; the old 32 cap serialized eval + rollout generation",
+        math_seqs="64    # ctx 4608 -> ~129MB KV per seq; 64 fits the 0.65 pool, vs 8 which ran rollouts in 8 serial waves",
+    ),
+    "3b": dict(
+        model="Qwen/Qwen2.5-3B",
+        mem_util="0.42   # 3B weights (5.8GB) sit in both the trainer and vLLM while awake; 0.5 OOMed at wake_up on the GPU that also holds the ~4GB desktop session",
+        gsm_seqs="64    # ~36KB KV/token at 3B; 64 seqs x 1536 ctx fits the ~4.5GB left in the 0.42 pool",
+        math_seqs="24    # ctx 4608 -> ~166MB KV per seq at 3B; 24 fits the 0.42 pool",
+    ),
+}
 
 # Per-algo rl-block fragments. lr/ep from 0.5B pilot bests; GRPO is the
 # negative baseline (its least-bad cell).
@@ -82,21 +97,22 @@ def rl_block(a: dict, lr: float, ep: int, max_new: int) -> str:
     return "\n".join(lines)
 
 
-def gsm8k_config(name: str, a: dict) -> str:
-    return f"""# v1 benchmark, 1.5B / gsm8k — {name.upper()} (full 5-algo comparison).
+def gsm8k_config(name: str, a: dict, scale: str) -> str:
+    s = SCALES[scale]
+    return f"""# v1 benchmark, {scale.upper()} / gsm8k — {name.upper()} (full 5-algo comparison).
 # max_new=192 (gsm8k responses never approach the cap); eval on gsm8k + math500.
-model_name: {MODEL}
+model_name: {s['model']}
 env_name: gsm8k
 algo_name: {name}
 mode: colocated
 trainer_gpus: [0, 1]
 rollout_gpus: [0, 1]
 use_vllm: true
-gpu_memory_utilization: 0.65   # vLLM sleeps during training; 0.65 (not 0.7) leaves ~1GB margin for a desktop session on one GPU — 1.5B DDP-colo at 0.7 OOMs in merge_adapter when the display eats 2.4GB
+gpu_memory_utilization: {s['mem_util']}
 enforce_eager: false
 compile_model: false
 vllm_max_model_len: 1536
-vllm_max_num_seqs: 256   # Qwen2.5 KV is small; the old 32 cap serialized eval + rollout generation
+vllm_max_num_seqs: {s['gsm_seqs']}
 use_lora: true
 lora_rank: 16
 lora_alpha: 32
@@ -112,7 +128,7 @@ eval_n: -1
 eval_batch_size: 32
 eval_use_vllm: true
 checkpoint_interval: 200
-run_dir: runs/v1_1.5b/{name}_1.5b_gsm8k
+run_dir: runs/v1_{scale}/{name}_{scale}_gsm8k
 weight_sync_method: ipc
 seed: 42
 eval_envs: [gsm8k, math500]
@@ -123,12 +139,15 @@ gradient_checkpointing: true
 """
 
 
-def math_config(name: str, a: dict) -> str:
-    return f"""# v1 benchmark, 1.5B / math — {name.upper()} (cluster preview + AIME generalization).
-# Train on Hendrycks MATH (max_new=1024, max_prompt=512). Eval on gsm8k + math500
+def math_config(name: str, a: dict, scale: str) -> str:
+    s = SCALES[scale]
+    return f"""# v1 benchmark, {scale.upper()} / math — {name.upper()} (cluster preview + AIME generalization).
+# Train on Hendrycks MATH (max_new=768, max_prompt=512). Eval on gsm8k + math500
 # + AIME 24/25/26. AIME eval at 4096 via per-env eval_max_new_tokens; the vLLM
 # engine is sized (vllm_max_model_len=4608) to fit prompt(512) + AIME gen(4096).
-model_name: {MODEL}
+# gsm8k eval at 1024, not 256: Math-trained models write long solutions and 33-62%
+# of responses were capped before the answer at 256 (v1_results.md, Math finding 3).
+model_name: {s['model']}
 env_name: math
 env_kwargs:
   corpus: hendrycks
@@ -137,15 +156,13 @@ mode: colocated
 trainer_gpus: [0, 1]
 rollout_gpus: [0, 1]
 use_vllm: true
-# Colocated 1.5B + long Math sequences (train 1536, eval AIME 4608) on 24GB:
-# vLLM sleeps (releases weights + KV) during the train phase, so the trainer gets
-# the whole card for the 1536-token backward and vLLM can hold 0.7*24GB while
-# generating. max_num_seqs=64 bounds eval KV at ctx 4608 (~129MB/seq).
-gpu_memory_utilization: 0.65   # vLLM sleeps during training; 0.65 (not 0.7) leaves ~1GB margin for a desktop session on one GPU — 1.5B DDP-colo at 0.7 OOMs in merge_adapter when the display eats 2.4GB
+# vLLM sleeps (weights + KV released) during the train phase, so the trainer gets
+# the whole card for the 1280-token backward.
+gpu_memory_utilization: {s['mem_util']}
 enforce_eager: false
 compile_model: false
 vllm_max_model_len: 4608
-vllm_max_num_seqs: 64    # ctx 4608 -> ~129MB KV per seq; 64 fits the 0.7 pool, vs 8 which ran rollouts in 8 serial waves
+vllm_max_num_seqs: {s['math_seqs']}
 use_lora: true
 lora_rank: 16
 lora_alpha: 32
@@ -162,11 +179,11 @@ eval_batch_size: 8
 eval_use_vllm: true
 max_prompt_tokens: 512
 checkpoint_interval: 200
-run_dir: runs/v1_1.5b/{name}_1.5b_math
+run_dir: runs/v1_{scale}/{name}_{scale}_math
 weight_sync_method: ipc
 seed: 42
 eval_envs: [gsm8k, math500, aime24, aime25, aime26]
-eval_max_new_tokens: [256, 1024, 4096, 4096, 4096]
+eval_max_new_tokens: [1024, 1024, 4096, 4096, 4096]
 rl:
 {rl_block(a, a["lr_math"], a["ep_math"], 768)}
 gradient_checkpointing: true
@@ -174,19 +191,23 @@ gradient_checkpointing: true
 
 
 def main() -> None:
-    os.makedirs(OUT_DIR, exist_ok=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--scale", choices=sorted(SCALES), default="1.5b")
+    scale = ap.parse_args().scale
+    out_dir = f"vivace/configs/experiments/v1_{scale}"
+    os.makedirs(out_dir, exist_ok=True)
     written = []
     for name, a in ALGOS.items():
-        p = os.path.join(OUT_DIR, f"{name}_1.5b_gsm8k.yaml")
+        p = os.path.join(out_dir, f"{name}_{scale}_gsm8k.yaml")
         with open(p, "w") as f:
-            f.write(gsm8k_config(name, a))
+            f.write(gsm8k_config(name, a, scale))
         written.append(p)
     for name in MATH_ALGOS:
-        p = os.path.join(OUT_DIR, f"{name}_1.5b_math.yaml")
+        p = os.path.join(out_dir, f"{name}_{scale}_math.yaml")
         with open(p, "w") as f:
-            f.write(math_config(name, ALGOS[name]))
+            f.write(math_config(name, ALGOS[name], scale))
         written.append(p)
-    print(f"Wrote {len(written)} configs to {OUT_DIR}/:")
+    print(f"Wrote {len(written)} configs to {out_dir}/:")
     for p in written:
         print(f"  {os.path.basename(p)}")
 
