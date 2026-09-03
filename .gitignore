@@ -46,3 +46,4 @@ docs/vllm_v1_migration.md
 docs/tmux_quickstart.md
 docs/v1_benchmark_plan.md
 .codex
+.wheels/

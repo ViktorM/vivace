@@ -6,15 +6,19 @@
 # vivace v0.4.3+ only supports drivers shipping CUDA 13 runtime.
 FROM nvidia/cuda:13.0.1-devel-ubuntu24.04
 
+ARG MAX_JOBS=8
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
-    MAX_JOBS=8 \
+    MAX_JOBS=${MAX_JOBS} \
     HF_HOME=/workspace/hf_cache \
     WANDB_DIR=/workspace/wandb
-# MAX_JOBS caps parallel nvcc jobs during the flash-attn compile inside `uv sync`.
+# MAX_JOBS caps parallel nvcc jobs in the flash-attn compile (30-50 GB RAM each); pass
+# --build-arg MAX_JOBS=4 on a host that shares RAM with a desktop session.
+# flash-attn 2.8.3 compiles for sm_80/90/100/120 by default (FLASH_ATTN_CUDA_ARCHS), so
+# one image serves A100 / H100 / H200 / B200 / RTX PRO 6000 Blackwell; torch and vLLM are prebuilt wheels.
 
 # OS deps. python3.12 ships with Ubuntu 24.04; we install via apt to skip
 # pyenv churn. git/openssh for repo sync, build-essential for the rare case
