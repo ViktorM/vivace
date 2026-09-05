@@ -1,5 +1,7 @@
 # Don't copy these into the image — they're large, unrelated, or local-only.
 .venv
+.venv-*
+.wheels
 # .git kept in the image (small overhead, ~10-100 MB) so `git pull` works
 # inside the container — lets us hot-patch trainer code on a running pod
 # without rebuilding the image. Previously excluded; that turned out to be

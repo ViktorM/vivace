@@ -42,8 +42,11 @@ WORKDIR /opt/vivace
 # itself until the source is copied below.
 COPY pyproject.toml uv.lock ./
 
-RUN uv venv --python python3.12 && \
-    uv sync --no-dev --frozen --no-install-project
+# The uv cache is a BuildKit cache mount so a lock change (transformers bump etc.)
+# reuses the compiled flash-attn wheel instead of recompiling it (~30 min).
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv --python python3.12 && \
+    UV_LINK_MODE=copy uv sync --no-dev --frozen --no-install-project
 
 # Belt-and-braces: force-install cuDNN explicitly. uv sometimes prunes
 # nvidia-cudnn-cu13 when cuda-toolkit is in the dependency tree, even when
@@ -56,7 +59,8 @@ COPY . .
 
 # Install the vivace package itself now that source + README are present.
 # Deps are already cached above, so this is a fast pip-install-style step.
-RUN uv sync --no-dev --frozen
+RUN --mount=type=cache,target=/root/.cache/uv \
+    UV_LINK_MODE=copy uv sync --no-dev --frozen
 
 # Register the bundled NVIDIA libs (libcudnn / libcublas / libnccl / etc.)
 # with the dynamic loader. The cu13 torch wheels ship these under

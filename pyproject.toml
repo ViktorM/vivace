@@ -9,10 +9,10 @@ license = { text = "MIT" }
 
 dependencies = [
     "torch>=2.13",             # vllm 0.28 pins torch 2.13.0; cu130 wheels via [tool.uv.sources]
-    "transformers>=4.58",      # 4.58+ adds qwen3_5; vllm 0.28 requires >=5.5.3 (locked 5.16.1)
+    "transformers>=5.16",      # release stack 5.16.1 (vllm 0.28 requires >=5.5.3)
     "datasets>=4.0",
     "accelerate>=1.13",
-    "peft>=0.19",              # LoRA
+    "peft>=0.20",              # LoRA; 0.20 tracks transformers 5.16's weight-conversion API
     "vllm>=0.28",              # rollout inference; the PyPI wheel is a CUDA 13 build (links libcudart.so.13)
     "flash-attn>=2.8",         # trainer attn_implementation="flash_attention_2"; varlen kernels skip the O(S²) score tensor
     "wandb>=0.25",
