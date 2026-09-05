@@ -7,11 +7,16 @@ Usage: .venv/bin/python tools/rescore_evals.py 'runs/v1_1.5b/*/'
 """
 import glob
 import json
+import os
 import sys
 
 from datasets import load_dataset
 
-from vivace.rewards import _math_correct, answer_match
+from vivace.envs.base import Example
+from vivace.envs.gsm8k import GSM8KEnv
+from vivace.rewards import _math_correct
+
+GSM8K = GSM8KEnv()   # gsm8k goes through the env's is_correct so the tool and the in-run eval agree
 
 
 def ext(t):
@@ -33,20 +38,20 @@ for rd in runs:
     name = rd.rstrip("/").split("/")[-1]
     row = [name]
     try:
-        d = json.load(open(rd + "eval_samples_final_gsm8k.json"))
+        d = json.load(open(os.path.join(rd, "eval_samples_final_gsm8k.json")))
         n = len(d["correct"]) + len(d["incorrect"])
         old = len(d["correct"])
         new = old
         for s in d["incorrect"]:
-            gt = gsm_gt.get(s["question"])
-            if gt and answer_match(gt, ext(s["response"])):
+            gt = s.get("ground_truth") or gsm_gt.get(s["question"])   # older dumps saved floats (30.0)
+            if gt is not None and GSM8K.is_correct(s["response"], Example(problem=s["question"], answer=str(gt), metadata={})):
                 new += 1
         # correct->incorrect flips can't happen: the matcher only loosens
         row += [f"{100*old/n:7.2f}", f"{100*new/n:7.2f}"]
     except FileNotFoundError:
         row += ["-", "-"]
     try:
-        d = json.load(open(rd + "eval_samples_final_math500.json"))
+        d = json.load(open(os.path.join(rd, "eval_samples_final_math500.json")))
         n = len(d["correct"]) + len(d["incorrect"])
         old = len(d["correct"])
         new = 0

@@ -158,3 +158,47 @@ def test_overlong_penalty_rejects_buffer_wider_than_budget():
     with pytest.raises(ValueError):
         overlong_penalty_reward([10], max_new_tokens=192, cfg=cfg)   # safe zone would be empty
     assert overlong_penalty_reward([100, 1024], max_new_tokens=1024, cfg=cfg) == [0.0, -1.0]
+
+
+def test_xmlcount_zero_weight_disables_junk_penalty():
+    from vivace.rewards import RewardConfig, xmlcount_reward
+    resp = "<think>\nx\n</think>\n<answer>\n4\n</answer>\n" + "junk " * 100
+    assert xmlcount_reward([resp])[0] < 0.25                                # default: trailing junk is penalised
+    assert xmlcount_reward([resp], RewardConfig(xmlcount_max=0.0)) == [0.0]  # switched off: nothing, not a penalty
+
+
+def test_strict_format_fires_without_trailing_newline():
+    from vivace.rewards import strict_format_reward
+    shaped = "<think>\nx\n</think>\n<answer>\n4\n</answer>"
+    assert strict_format_reward([shaped, shaped + "\n"]) == [0.5, 0.5]        # EOS strips the final \n
+    assert strict_format_reward(["<think>x</think><answer>4</answer>"]) == [0.0]
+
+
+def test_soft_format_is_not_anchored_to_position_zero():
+    from vivace.rewards import soft_format_reward
+    assert soft_format_reward(["Sure.\n<think>x</think>\n<answer>4</answer>"]) == [0.25]
+    assert soft_format_reward(["<think>x</think> no answer tag"]) == [0.0]
+
+
+def test_xmlcount_junk_penalty_is_capped_and_needs_the_closing_tag():
+    from vivace.rewards import xmlcount_reward
+    perfect = "<think>\nx\n</think>\n<answer>\n4\n</answer>"
+    assert xmlcount_reward([perfect]) == [0.25]                                 # no phantom -0.044
+    junk = xmlcount_reward([perfect + "\n" + "junk " * 2000])[0]
+    assert junk == 0.25 - 0.0625                                                # capped at one tag's credit
+    capped = "<think>\nx\n</think>\n<answer>\n" + "reasoning " * 800             # generation cap hit, no </answer>
+    assert xmlcount_reward([capped]) == [0.1875]                                # three tags, no length charge
+
+
+def test_gsm8k_is_correct_boxed_first():
+    from vivace.envs.base import Example
+    from vivace.envs.gsm8k import GSM8KEnv
+    env, ex = GSM8KEnv(), Example(problem="p", answer="42", metadata={})
+    assert env.is_correct("<think>x</think>\n<answer>\n42\n</answer>", ex)                       # gsm8k style
+    assert env.is_correct("<think>x</think>\n<answer>\nSo the total is \\boxed{42}.\n</answer>", ex)  # MATH style
+    assert env.is_correct("<answer>\nThus \\boxed{\\$42} dollars.\n</answer>", ex)                  # LaTeX in the box
+    assert not env.is_correct("<answer>\nFirst \\boxed{42}, finally \\boxed{41}.\n</answer>", ex)   # last box counts
+    assert not env.is_correct("<answer>\nThe answer is 42 dollars.\n</answer>", ex)                 # prose still misses
+    assert env.is_correct("<answer>\nSo \\boxed{\\frac{84}{2}}.\n</answer>", ex)                       # nested braces
+    assert not env.is_correct("<answer>\n\\boxed{42} then \\boxed{\\frac{82}{2}}.\n</answer>", ex)     # nested last box wins
+    assert env.is_correct("<answer>\n\\boxed{42}\n</answer>", Example(problem="p", answer=42.0, metadata={}))  # float GT (old dumps)

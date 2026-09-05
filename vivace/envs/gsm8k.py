@@ -11,9 +11,13 @@ from __future__ import annotations
 from typing import Callable
 
 from vivace.envs.base import Env, Example
+from vivace.envs.math import _extract_boxed
 from vivace.rewards import (
     DEFAULT_REWARD_CONFIG,
     RewardConfig,
+    _math_correct,
+    answer_match,
+    extract_answer,
     gsm8k_reward_batch,
     gsm8k_reward_single,
 )
@@ -86,6 +90,17 @@ class GSM8KEnv(Env):
 
     def format_prompt(self, example: Example) -> str:
         return make_prompt(example.problem)
+
+    def is_correct(self, response: str, example: Example) -> bool:
+        """Eval matcher, boxed-first. MATH-trained policies write the worked solution
+        inside <answer> and end with \\boxed{N}; the whole-block float coercion the
+        training reward uses scores those 0. Loosening-only: a bare number still
+        matches first, so gsm8k-trained results are unchanged."""
+        block = extract_answer(response)
+        if answer_match(example.answer, block):
+            return True
+        boxed = _extract_boxed(block)   # brace-balanced last \\boxed{}, shared with MATH
+        return boxed is not None and _math_correct(str(example.answer), boxed)
 
     @property
     def reward_fn(self) -> Callable:

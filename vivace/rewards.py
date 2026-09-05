@@ -109,8 +109,9 @@ def int_format_reward(
 def strict_format_reward(
     responses: list[str], cfg: RewardConfig = DEFAULT_REWARD_CONFIG
 ) -> list[float]:
-    """Bonus for the exact <think>\\n...\\n</think>\\n<answer>\\n...\\n</answer>\\n shape."""
-    pat = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>\n$"
+    """Bonus for the exact <think>\\n...\\n</think>\\n<answer>\\n...\\n</answer> shape.
+    The trailing newline is optional: generation ends at EOS, so it is usually absent."""
+    pat = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>\n?$"
     return [
         cfg.strict_format_bonus if re.match(pat, r, re.DOTALL) else 0.0 for r in responses
     ]
@@ -122,7 +123,7 @@ def soft_format_reward(
     """Bonus for any well-formed think+answer pair (whitespace tolerant)."""
     pat = r"<think>.*?</think>\s*<answer>.*?</answer>"
     return [
-        cfg.soft_format_bonus if re.match(pat, r, re.DOTALL) else 0.0 for r in responses
+        cfg.soft_format_bonus if re.search(pat, r, re.DOTALL) else 0.0 for r in responses
     ]
 
 
@@ -130,6 +131,8 @@ def xmlcount_reward(
     responses: list[str], cfg: RewardConfig = DEFAULT_REWARD_CONFIG
 ) -> list[float]:
     """Per-tag partial credit for well-placed open/close tags. Penalises trailing junk."""
+    if cfg.xmlcount_max <= 0.0:   # component switched off: no credit and no junk penalty
+        return [0.0] * len(responses)
     per_tag = cfg.xmlcount_max / 4.0
 
     def _score(t: str) -> float:
@@ -140,10 +143,12 @@ def xmlcount_reward(
             s += per_tag
         if t.count("\n<answer>\n") == 1:
             s += per_tag
-            s -= len(t.split("\n</answer>\n")[-1]) * 0.001
         if t.count("\n</answer>") == 1:
             s += per_tag
-            s -= (len(t.split("\n</answer>")[-1]) - 1) * 0.001
+            # Trailing junk after the closing tag: 0.001/char, capped at one tag's credit.
+            # No closing tag (capped response) charges nothing beyond the missing credit.
+            junk = len(t.split("\n</answer>", 1)[1].strip())
+            s -= min(junk * 0.001, per_tag)
         return s
 
     return [_score(r) for r in responses]
