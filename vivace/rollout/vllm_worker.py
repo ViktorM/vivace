@@ -84,7 +84,7 @@ def _apply_ipc_on_vllm_worker(worker_self):
     vllm_named = dict(vllm_model.named_parameters())
     receiver_copy_loop(aliased, vllm_named, specs)
     # Same-device memcpy may launch async; ensure all copies committed before
-    # the trainer's unmerge_adapter() runs (which mutates the source storage).
+    # the trainer refills the merged/fused buffers on the next sync.
     torch.cuda.synchronize()
     return True
 
@@ -303,24 +303,31 @@ class VLLMRolloutWorker:
         `sender_broadcast_loop` (see `Trainer._sync_weights_nccl`).
         """
         self.llm.collective_rpc(_receive_nccl_on_vllm_worker, args=(specs,))
+        # Cached KV blocks are hashed by tokens and LoRA id, never by weights: every
+        # block computed before this sync belongs to the previous policy. Drops the
+        # hash table only; the pool memory is reused.
+        self.llm.reset_prefix_cache()
 
     def init_ipc_sync(self, handles, specs) -> None:
         """One-shot: open trainer's CUDA IPC handles in the vLLM worker subprocess.
 
         Persistent: handles are kept on the model_runner and re-used by every
         `update_weights_via_ipc` call. Trainer must keep the underlying storages
-        alive (peft merge/unmerge is in-place; fused buffers are preallocated —
-        both invariants met by the trainer-side caller).
+        alive (merged and fused buffers are preallocated once by the trainer).
         """
         self.llm.collective_rpc(_init_ipc_on_vllm_worker, args=(handles, specs))
 
     def update_weights_via_ipc(self) -> None:
         """Per-step: copy aliased trainer tensors into vLLM's params (same-GPU).
 
-        Trainer must have filled fused buffers and done `torch.cuda.synchronize()`
-        before this call so that the bytes vLLM reads are the post-merge values.
+        Trainer must have filled the merged + fused buffers and done
+        `torch.cuda.synchronize()` before this call so that the bytes vLLM reads
+        are this step's policy.
         """
         self.llm.collective_rpc(_apply_ipc_on_vllm_worker)
+        # sleep() already clears the prefix cache in colocated mode; this keeps the
+        # invariant if a run ever keeps the engine awake between phases.
+        self.llm.reset_prefix_cache()
 
     def update_lora(self, adapter_path: str) -> None:
         """Register a new LoRA adapter for subsequent `generate` calls.

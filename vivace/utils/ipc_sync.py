@@ -6,8 +6,8 @@ saved per step at LoRA r=16 vs real disk) but still goes GPU → CPU → tmpfs �
 buffers, so per-step sync is a single same-device memcpy.
 
 Invariant: trainer-side tensor pointers must be stable across the run.
-  - peft `merge_adapter()` / `unmerge_adapter()` mutate base.weight.data in-place
-    via `+=` / `-=`, so the storage is the same object across steps.
+  - LoRA targets ship from the merged buffers (`allocate_merged_buffers`, filled
+    each sync by `fill_merged_buffers`); the base weights are never written.
   - Fused buffers (qkv, gate_up) are preallocated once via `allocate_fused_buffers`
     and reused; pointers stable.
   - Full-FT live params likewise have stable storage (LoRA A/B are never shipped).
@@ -21,9 +21,9 @@ import torch
 import torch.nn as nn
 
 from vivace.utils.weight_sync import (
-    canonical_named_parameters,
-    strip_wrapper_prefixes,
     ParamSpec,
+    strip_wrapper_prefixes,
+    sync_named_tensors,
 )
 
 
@@ -33,12 +33,14 @@ def pack_ipc_handles(
     fusion_map: dict | None,
     fused_buffers: dict | None,
     receiver_device_ordinal: int = 0,
+    merged: dict | None = None,
 ) -> list[dict]:
     """Trainer side: build a list of IPC-handle dicts aligned with `specs`.
 
     For fused specs (qkv_proj, gate_up_proj), the source tensor is the
     preallocated fused buffer (must be filled before each sync — see
-    `fill_fused_buffers`). For non-fused, the source is the live param `.data`.
+    `fill_fused_buffers`). For non-fused, the source is the merged buffer for a
+    LoRA target, else the live param `.data`.
 
     `receiver_device_ordinal` is what the vLLM EngineCore subprocess sees its
     GPU as. Since we set `CUDA_VISIBLE_DEVICES=<single_gpu>` for the EngineCore,
@@ -50,7 +52,7 @@ def pack_ipc_handles(
     Each dict carries enough info for the receiver to recreate a tensor that
     aliases this exact storage. Sent via vLLM's `collective_rpc` once at init.
     """
-    named = dict(canonical_named_parameters(model))
+    named = sync_named_tensors(model, merged)
     handles: list[dict] = []
     for spec in specs:
         if fusion_map and spec.name in fusion_map:
@@ -60,7 +62,7 @@ def pack_ipc_handles(
             tensor = fused_buffers[spec.name]
         else:
             assert spec.name in named, f"spec {spec.name!r} not in canonical named_parameters"
-            tensor = named[spec.name].data
+            tensor = named[spec.name]
 
         storage = tensor.untyped_storage()
         # `_share_cuda_()` returns an 8-tuple of CUDA IPC primitives that's
@@ -105,6 +107,7 @@ def fill_fused_buffers(
     specs: list[ParamSpec],
     fusion_map: dict | None,
     fused_buffers: dict | None,
+    merged: dict | None = None,
 ) -> None:
     """Trainer side: cat fused-spec components into preallocated buffers.
 
@@ -113,10 +116,10 @@ def fill_fused_buffers(
     """
     if not fusion_map or not fused_buffers:
         return
-    named = dict(canonical_named_parameters(model))
+    named = sync_named_tensors(model, merged)
     for spec in specs:
         if spec.name in fusion_map:
-            components = [named[n].data for n in fusion_map[spec.name]]
+            components = [named[n] for n in fusion_map[spec.name]]
             torch.cat(components, dim=0, out=fused_buffers[spec.name])
 
 

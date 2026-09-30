@@ -67,15 +67,63 @@ def canonical_named_parameters(model: nn.Module):
     `lora_A`/`lora_B`. `named_parameters()` then yields names like
     `...q_proj.base_layer.weight` for the base, plus the adapter params.
 
-    For NCCL sync after `merge_adapter()`:
+    For sync:
       - Strip `.base_layer.` so the name matches vLLM's plain HF naming.
-      - Drop adapter params — their effect is in base_layer.weight already.
+      - Drop adapter params — the merged buffers (`fill_merged_buffers`) carry
+        their effect under the base weight's canonical name.
     """
     base = unwrap_model(model)
     for name, p in base.named_parameters():
         if _is_lora_adapter_param(name):
             continue
         yield name.replace(".base_layer.", "."), p
+
+
+def lora_layers(model: nn.Module):
+    """Yield (canonical weight name, peft LoraLayer) for every LoRA-wrapped Linear."""
+    base = unwrap_model(model)
+    for name, mod in base.named_modules():
+        if hasattr(mod, "base_layer") and hasattr(mod, "lora_A") and hasattr(mod, "lora_B"):
+            yield f"{name}.weight", mod
+
+
+def allocate_merged_buffers(model: nn.Module) -> dict[str, torch.Tensor]:
+    """One persistent buffer per LoRA target (shape/dtype/device of base_layer.weight).
+    Allocated once: NCCL broadcasts from it, IPC aliases its storage."""
+    return {name: torch.empty_like(mod.base_layer.weight) for name, mod in lora_layers(model)}
+
+
+@torch.no_grad()
+def fill_merged_buffers(model: nn.Module, merged: dict[str, torch.Tensor]) -> None:
+    """merged[name] <- base + scale * B @ A, computed in fp32 and rounded once into the buffer.
+
+    The base weight is never written. peft's merge_adapter()/unmerge_adapter() do
+    `w += delta; w -= delta` in bf16, and the two roundings don't cancel: a growing
+    subset of the "frozen" base ends one ULP off after every sync, so the KL
+    reference drifts and the saved adapter no longer reproduces the trained policy.
+    """
+    for name, mod in lora_layers(model):
+        w = mod.base_layer.weight
+        acc = w.float()
+        for adapter in mod.active_adapters:
+            if adapter not in mod.lora_A:
+                continue
+            if getattr(mod, "use_dora", {}).get(adapter, False) or getattr(mod, "lora_bias", {}).get(adapter, False):
+                raise NotImplementedError(f"{name}: merged-buffer sync supports plain LoRA only (no DoRA / lora_bias)")
+            delta = mod.lora_B[adapter].weight.float() @ mod.lora_A[adapter].weight.float()
+            if getattr(mod, "fan_in_fan_out", False):
+                delta = delta.T
+            acc.add_(delta, alpha=mod.scaling[adapter])
+        merged[name].copy_(acc.to(w.dtype))
+
+
+def sync_named_tensors(model: nn.Module, merged: dict[str, torch.Tensor] | None = None) -> dict[str, torch.Tensor]:
+    """Canonical name -> tensor to ship: the merged buffer for a LoRA target when
+    `merged` is given, the live parameter's `.data` otherwise."""
+    named = {n: p.data for n, p in canonical_named_parameters(model)}
+    if merged:
+        named.update(merged)
+    return named
 
 
 class BufferPool:
@@ -121,9 +169,8 @@ def build_param_specs(model: nn.Module, filter_fn=None, fuse=True) -> list[Param
     makes the order deterministic.
 
     Names are canonical HF names (peft `.base_layer.` segments stripped, LoRA
-    adapter params skipped). For NCCL sync of LoRA models, callers must call
-    `merge_adapter()` before broadcasting so that the canonical-named tensors
-    contain the merged base+LoRA values.
+    adapter params skipped). For LoRA models the sender resolves those names to
+    the merged buffers (`sync_named_tensors`), never to the base weights.
     """
     named = dict(canonical_named_parameters(model))
 
@@ -226,28 +273,25 @@ def sender_broadcast_loop(
     comm,
     src_rank: int = 0,
     fusion_map=None,
-    fused_buffers=None
+    fused_buffers=None,
+    merged=None,
 ) -> None:
     """Trainer-side NCCL broadcast over `comm` (PyNcclCommunicator).
 
     Must run concurrently with the receiver's matching loop — `comm.broadcast`
     is a rendezvous. `specs` is the contract: sender + receiver iterate in the
-    same order, or they deadlock / misroute tensors.
+    same order, or they deadlock / misroute tensors. `merged` (LoRA) maps target
+    names to buffers filled by `fill_merged_buffers` before the call.
     """
-    # Canonical names match `specs` / `fusion_map`; for LoRA the caller has
-    # merge_adapter()'d, so these base tensors already hold merged base+LoRA.
-    named = dict(canonical_named_parameters(model))
+    named = sync_named_tensors(model, merged)   # .data views: torch.cat(out=) refuses autograd-tracked inputs
 
     for spec in specs:
         if fusion_map and spec.name in fusion_map:
-            # Fused spec: cat components into preallocated buffer.
-            # Use .data views — trainer params have requires_grad=True, and
-            # torch.cat(out=...) refuses autograd-tracked inputs.
-            components = [named[n].data for n in fusion_map[spec.name]]
+            components = [named[n] for n in fusion_map[spec.name]]
             torch.cat(components, dim=0, out=fused_buffers[spec.name])
             comm.broadcast(fused_buffers[spec.name], src=src_rank)
         else:
-            comm.broadcast(named[spec.name].data, src=src_rank)
+            comm.broadcast(named[spec.name], src=src_rank)
 
     with record_function("nccl_sender_sync"):
         torch.cuda.synchronize()

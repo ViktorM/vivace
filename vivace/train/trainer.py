@@ -42,7 +42,7 @@ from vivace.utils.stats import TrainingStats
 from vivace.utils.logging import ConsoleLogger, init_wandb, log_metrics, finish_wandb
 from vivace.utils.perf import Timer, throughput
 from vivace.utils.profiling import ProfilingConfig, create_profiler, export_and_summarize
-from vivace.utils.weight_sync import sender_broadcast_loop
+from vivace.utils.weight_sync import fill_merged_buffers, sender_broadcast_loop
 from vivace.utils.distributed import is_main_process, barrier, init_distributed, reduce_metrics
 from vivace.utils.checkpointing import save_checkpoint
 
@@ -484,7 +484,7 @@ class Trainer:
             )
 
         # Keep a handle to the peft (or bare HF) model so we can call peft methods
-        # like merge_adapter / unmerge_adapter / disable_adapter / save_pretrained
+        # like disable_adapter / save_pretrained
         # without hitting DDP's __getattr__ wall after wrapping.
         self._inner_model = self.model
 
@@ -619,10 +619,10 @@ class Trainer:
         self.profiling_cfg = ProfilingConfig(**(cfg.profiling or {}))
 
         # ----- Weight-sync param filter -----
-        # After merge_adapter(), LoRA changes ONLY the target-module weights —
-        # embeddings, norms, untargeted MLPs, and all biases are bit-identical
-        # to what vLLM loaded from disk at init. Sync only what moves (~6x less
-        # NCCL traffic / IPC copying at r=16 on qkvo). Full FT: no filter.
+        # LoRA changes ONLY the target-module weights — embeddings, norms,
+        # untargeted MLPs, and all biases are bit-identical to what vLLM loaded
+        # from disk at init. Sync only what moves (~6x less NCCL traffic / IPC
+        # copying at r=16 on qkvo). Full FT: no filter.
         self._sync_filter = None
         if cfg.use_lora:
             _targets = tuple(cfg.lora_target_modules)
@@ -653,7 +653,8 @@ class Trainer:
             from vllm.distributed.utils import StatelessProcessGroup
             from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
             from vivace.utils.weight_sync import (
-                allocate_fused_buffers, build_param_specs, validate_filter_coverage,
+                allocate_fused_buffers, allocate_merged_buffers, build_param_specs,
+                validate_filter_coverage,
             )
 
             host, port = "localhost", _find_free_port(rank_hint=local_rank)
@@ -698,19 +699,20 @@ class Trainer:
             if worker_err:
                 raise worker_err[0]
 
-            # Build broadcast specs from the (peft-wrapped) model. For LoRA, the
-            # `merge_adapter` call in `_sync_weights_nccl` folds B@A into base before
-            # broadcast and `unmerge_adapter` undoes it after, so vLLM (enable_lora=False
-            # on this path) receives the full merged weights via these specs. Full FT
-            # path ignores merge/unmerge and broadcasts the live trainable params.
+            # Build broadcast specs from the (peft-wrapped) model. For LoRA, each sync
+            # fills the merged buffers (base + B@A, base untouched) and broadcasts those
+            # under the base weights' canonical names, so vLLM (enable_lora=False on this
+            # path) receives the full policy. Full FT broadcasts the live params.
             specs, fusion_map = build_param_specs(self.model, filter_fn=self._sync_filter, fuse=True)
             if self._sync_filter is not None:
                 validate_filter_coverage(specs, fusion_map, cfg.lora_target_modules)
             fused_buffers = allocate_fused_buffers(self.model, specs, self.device)
+            merged = allocate_merged_buffers(self.model) if cfg.use_lora else None
             self._nccl_sync_state = {
                 "specs": specs,
                 "fusion_map": fusion_map,
                 "fused_buffers": fused_buffers,
+                "merged": merged,
                 "comm": trainer_comm,
                 "pg": pg,
             }
@@ -736,7 +738,8 @@ class Trainer:
                     "For disaggregated, use 'nccl' (faster) or 'disk'."
                 )
             from vivace.utils.weight_sync import (
-                allocate_fused_buffers, build_param_specs, validate_filter_coverage,
+                allocate_fused_buffers, allocate_merged_buffers, build_param_specs,
+                validate_filter_coverage,
             )
             from vivace.utils.ipc_sync import pack_ipc_handles
 
@@ -744,15 +747,17 @@ class Trainer:
             if self._sync_filter is not None:
                 validate_filter_coverage(specs, fusion_map, cfg.lora_target_modules)
             fused_buffers = allocate_fused_buffers(self.model, specs, self.device)
-            # Build IPC handles ONCE: storages are stable across the run because
-            # peft merge/unmerge mutate base.weight.data in place and fused buffers
-            # are preallocated. vLLM keeps these handles open for the whole run.
-            handles = pack_ipc_handles(self.model, specs, fusion_map, fused_buffers)
+            merged = allocate_merged_buffers(self.model) if cfg.use_lora else None
+            # Build IPC handles ONCE: the merged and fused buffers are preallocated,
+            # so their storages are stable across the run. vLLM keeps these handles
+            # open for the whole run.
+            handles = pack_ipc_handles(self.model, specs, fusion_map, fused_buffers, merged=merged)
             self.rollout_worker.init_ipc_sync(handles, specs)
             self._ipc_sync_state = {
                 "specs": specs,
                 "fusion_map": fusion_map,
                 "fused_buffers": fused_buffers,
+                "merged": merged,
             }
             print(f"[trainer init] IPC weight sync ready: {len(specs)} params")
 
@@ -1282,40 +1287,36 @@ class Trainer:
             "the weight_sync_method='nccl' setup block"
         )
 
-        # For LoRA: fold B @ A into base so `named_parameters()` yields the full
-        # current policy. Must unmerge in `finally` — if broadcast raises and we
-        # skip unmerge, the next training step treats merged weights as base
-        # and applies the adapter a second time on top.
-        if self.cfg.use_lora:
-            self._inner_model.merge_adapter()
-        try:
-            def _trigger_receiver():
-                self.rollout_worker.update_weights(state["specs"])
+        # LoRA: base + B@A goes into the merged buffers (fp32 math, one rounding);
+        # the base weights are never touched, so there is nothing to undo.
+        if state["merged"] is not None:
+            fill_merged_buffers(self.model, state["merged"])
 
-            receiver_thread = threading.Thread(target=_trigger_receiver, daemon=True)
-            receiver_thread.start()
+        def _trigger_receiver():
+            self.rollout_worker.update_weights(state["specs"])
 
-            sender_broadcast_loop(
-                self.model,
-                state["specs"],
-                comm=state["comm"],
-                src_rank=0,
-                fusion_map=state["fusion_map"],
-                fused_buffers=state["fused_buffers"],
-            )
-            receiver_thread.join()
-        finally:
-            if self.cfg.use_lora:
-                self._inner_model.unmerge_adapter()
+        receiver_thread = threading.Thread(target=_trigger_receiver, daemon=True)
+        receiver_thread.start()
+
+        sender_broadcast_loop(
+            self.model,
+            state["specs"],
+            comm=state["comm"],
+            src_rank=0,
+            fusion_map=state["fusion_map"],
+            fused_buffers=state["fused_buffers"],
+            merged=state["merged"],
+        )
+        receiver_thread.join()
 
     def _sync_weights_ipc(self) -> None:
         """Same-GPU CUDA IPC weight sync. Trainer fills stable buffers; vLLM's
         worker copies from aliased views via collective_rpc.
 
         Init in `__init__` builds + pushes IPC handles once (storages stable).
-        Per step: merge → fill fused buffers → trainer-side cuda.synchronize →
-        vLLM copy_ via aliased views (worker-side cuda.synchronize too) →
-        unmerge in `finally`.
+        Per step: fill merged buffers → fill fused buffers → trainer-side
+        cuda.synchronize → vLLM copy_ via aliased views (worker-side
+        cuda.synchronize too).
         """
         from vivace.utils.ipc_sync import fill_fused_buffers
 
@@ -1325,21 +1326,17 @@ class Trainer:
             "the weight_sync_method='ipc' setup block"
         )
 
-        if self.cfg.use_lora:
-            self._inner_model.merge_adapter()
-        try:
-            # Trainer-side: fill fused buffers; non-fused params are already
-            # aliased directly via IPC, no copy needed on this side.
-            fill_fused_buffers(
-                self.model, state["specs"], state["fusion_map"], state["fused_buffers"]
-            )
-            # Make sure the merge_adapter writes + fused-buffer cats are
-            # globally visible before vLLM reads them through its alias.
-            torch.cuda.synchronize()
-            self.rollout_worker.update_weights_via_ipc()
-        finally:
-            if self.cfg.use_lora:
-                self._inner_model.unmerge_adapter()
+        if state["merged"] is not None:
+            fill_merged_buffers(self.model, state["merged"])
+        # Fused specs are cat'd from the merged/live tensors; non-fused specs are
+        # aliased directly (merged buffer or live param), no copy on this side.
+        fill_fused_buffers(
+            self.model, state["specs"], state["fusion_map"], state["fused_buffers"],
+            merged=state["merged"],
+        )
+        # Make the buffer writes globally visible before vLLM reads them through its alias.
+        torch.cuda.synchronize()
+        self.rollout_worker.update_weights_via_ipc()
 
     def train(self) -> None:
         """Main training loop: optional SFT warmup, baseline eval, N steps of
